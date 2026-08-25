@@ -1,1 +1,1 @@
-# winwidget.ru_infra
+# Winwidget - infra
