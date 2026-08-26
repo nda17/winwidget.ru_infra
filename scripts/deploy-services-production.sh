@@ -1234,8 +1234,18 @@ try {
 		restoreWorker.stop_grace_period !== '1m30s' ||
 		restoreWorker.restart !== 'unless-stopped'
 	) fail();
-} catch {
-	process.stderr.write('Production Compose failed the Operations restore-worker contract.\n');
+} catch (error) {
+	const locations = [
+		...(error instanceof Error ? error.stack ?? '' : '').matchAll(
+			/\[eval\]:(\d+):(\d+)/g
+		)
+	];
+	const location = locations[1]
+		? `${locations[1][1]}:${locations[1][2]}`
+		: 'unknown';
+	process.stderr.write(
+		`Production Compose failed the Operations restore-worker contract (${location}).\n`
+	);
 	process.exit(1);
 }
 COMPOSE_CONTRACT
@@ -2171,7 +2181,7 @@ verify_control_plane_convergence() {
 		die 'Control-plane convergence projection mode is invalid.'
 
 	operations_result="$(
-		compose_all run --rm --no-deps \
+		compose_all run --rm --no-deps --interactive \
 			--env "EXPECTED_CONTROL_PLANE_SHA256=$expected_sha256" \
 			--env "REQUIRE_CURRENT_CONTROL_PLANE_PROJECTION=$require_current_projection" \
 			operations-api node - <<'VERIFY_OPERATIONS_CONTROL_PLANE'
@@ -2331,7 +2341,7 @@ VERIFY_OPERATIONS_CONTROL_PLANE
 		"$source_revision" == "$expected_source_revision" ]] ||
 		die 'Operations bootstrap source revision differs from the terminal marker.'
 
-	compose_all run --rm --no-deps \
+	compose_all run --rm --no-deps --interactive \
 		--env "EXPECTED_CONTROL_PLANE_EVENT_ID=$event_id" \
 		--env "EXPECTED_CONTROL_PLANE_ROUTE_THREAD_ID=$route_thread_id" \
 		--env "EXPECTED_CONTROL_PLANE_CHANGED_AT=$changed_at" \
@@ -2793,7 +2803,7 @@ verify_retired_core_public_routes_absent() {
 }
 
 verify_telegram_proxy_health() {
-	compose_all run --rm --no-deps operations-worker node - \
+	compose_all run --rm --no-deps --interactive operations-worker node - \
 		<<'VERIFY_TELEGRAM_PROXY_HEALTH' >/dev/null
 (async () => {
 	const response = await fetch(
