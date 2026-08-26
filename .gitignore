@@ -1,0 +1,16 @@
+.DS_Store
+*.log
+
+# Local credentials and production configuration never belong in Git.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+known_hosts
+.ssh/
+
+# Local tool output.
+.idea/
+.vscode/
+artifacts/

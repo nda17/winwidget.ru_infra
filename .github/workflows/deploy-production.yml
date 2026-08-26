@@ -1,0 +1,106 @@
+name: Deploy production services
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Forward deployment mode
+        required: true
+        type: choice
+        options:
+          - deploy
+          - cutover
+      services_revision:
+        description: Immutable lowercase 40-hex winwidget.ru_services commit
+        required: true
+        type: string
+      operations_snapshot_sha256:
+        description: Required only for cutover; SHA-256 of Operations data snapshot
+        required: false
+        type: string
+      operations_control_plane_snapshot_sha256:
+        description: Required only for cutover; SHA-256 of Operations control-plane snapshot
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winwidget-production-services
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy immutable services revision
+    if: github.ref_type == 'branch' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: production
+
+    steps:
+      - name: Check out infrastructure controller
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Deploy through pinned SSH transport
+        shell: bash
+        env:
+          INFRA_REVISION: ${{ github.sha }}
+          DEPLOY_MODE: ${{ inputs.mode }}
+          SERVICES_REVISION: ${{ inputs.services_revision }}
+          OPERATIONS_SNAPSHOT_SHA256: ${{ inputs.operations_snapshot_sha256 }}
+          OPERATIONS_CONTROL_PLANE_SNAPSHOT_SHA256: ${{ inputs.operations_control_plane_snapshot_sha256 }}
+          PRODUCTION_SSH_HOST: ${{ secrets.BACKEND_PRODUCTION_SSH_HOST }}
+          PRODUCTION_SSH_PORT: ${{ secrets.BACKEND_PRODUCTION_SSH_PORT }}
+          PRODUCTION_SSH_USER: ${{ secrets.BACKEND_PRODUCTION_SSH_USER }}
+          PRODUCTION_SSH_PRIVATE_KEY: ${{ secrets.BACKEND_PRODUCTION_SSH_PRIVATE_KEY }}
+          PRODUCTION_SSH_KNOWN_HOSTS: ${{ secrets.BACKEND_PRODUCTION_SSH_KNOWN_HOSTS }}
+          EXPECTED_PRODUCTION_ENV_SHA256: ${{ secrets.BACKEND_PRODUCTION_ENV_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          required_values=(
+            PRODUCTION_SSH_HOST
+            PRODUCTION_SSH_PORT
+            PRODUCTION_SSH_USER
+            PRODUCTION_SSH_PRIVATE_KEY
+            PRODUCTION_SSH_KNOWN_HOSTS
+            EXPECTED_PRODUCTION_ENV_SHA256
+          )
+          for variable_name in "${required_values[@]}"; do
+            if [[ -z "${!variable_name:-}" ]]; then
+              echo "Required production secret is missing: $variable_name" >&2
+              exit 1
+            fi
+          done
+
+          credential_directory="$RUNNER_TEMP/winwidget-production-ssh"
+          identity_file="$credential_directory/id_ed25519"
+          known_hosts_file="$credential_directory/known_hosts"
+          install -m 700 -d "$credential_directory"
+          trap 'find "$credential_directory" -type f -delete; rmdir "$credential_directory"' EXIT
+
+          printf '%s\n' "$PRODUCTION_SSH_PRIVATE_KEY" >"$identity_file"
+          printf '%s\n' "$PRODUCTION_SSH_KNOWN_HOSTS" >"$known_hosts_file"
+          chmod 600 "$identity_file" "$known_hosts_file"
+
+          export PRODUCTION_SSH_IDENTITY_FILE="$identity_file"
+          export PRODUCTION_SSH_KNOWN_HOSTS_FILE="$known_hosts_file"
+
+          case "$DEPLOY_MODE" in
+            deploy) controller_mode='--deploy' ;;
+            cutover) controller_mode='--cutover' ;;
+            *)
+              echo 'Unsupported deployment mode.' >&2
+              exit 1
+              ;;
+          esac
+
+          bash scripts/deploy-services-production.sh \
+            "$controller_mode" \
+            "$SERVICES_REVISION"
