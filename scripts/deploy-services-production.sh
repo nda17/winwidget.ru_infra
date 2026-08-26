@@ -1751,8 +1751,34 @@ const auditQueueNames = auditSources.flatMap(source => [
 	constants.getOperationsAuditRetryQueue(source),
 	constants.getOperationsAuditDeadLetterQueue(source)
 ]);
-const exactQueuePattern = names =>
-	`^(?:${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$`;
+const exactQueuePattern = names => {
+	const root = { terminal: false, children: new Map() };
+	for (const name of [...names].sort()) {
+		let node = root;
+		for (const character of name) {
+			if (!node.children.has(character)) {
+				node.children.set(character, { terminal: false, children: new Map() });
+			}
+			node = node.children.get(character);
+		}
+		node.terminal = true;
+	}
+	const regexMetaCharacters = new Set([
+		'\\', '^', '$', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|'
+	]);
+	const emit = node => {
+		const branches = [...node.children].map(
+			([character, child]) =>
+				`${regexMetaCharacters.has(character) ? `\\${character}` : character}${emit(child)}`
+		);
+		if (node.terminal) branches.push('');
+		if (branches.length === 1) return branches[0];
+		return `(?:${branches.join('|')})`;
+	};
+	const pattern = `^${emit(root)}$`;
+	if (Buffer.byteLength(pattern, 'utf8') > 1024) fail();
+	return pattern;
+};
 let notificationTopology;
 try {
 	notificationTopology = JSON.parse(value('NOTIFICATION_TOPOLOGY_CONTRACT'));
