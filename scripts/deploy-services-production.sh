@@ -822,7 +822,7 @@ if [[ ! -e "$operations_restore_storage" &&
 	install -d -o 1001 -g 1001 -m 0700 "$operations_restore_storage"
 fi
 [[ -d "$operations_restore_storage" && ! -L "$operations_restore_storage" &&
-	"$(realpath -e "$operations_restore_storage")" ==
+	"$(realpath -e "$operations_restore_storage")" == \
 		"$operations_restore_storage" &&
 	"$(stat -c '%u:%g:%a' "$operations_restore_storage")" == '1001:1001:700' ]] ||
 	die 'Operations restore storage must be canonical UID/GID 1001 mode 0700.'
@@ -2409,9 +2409,9 @@ terminal_marker_event_id=''
 validate_terminal_cutover_marker() {
 	local -a marker_lines=()
 	[[ -f "$terminal_cutover_marker" && ! -L "$terminal_cutover_marker" &&
-		"$(realpath -e "$terminal_cutover_marker")" ==
+		"$(realpath -e "$terminal_cutover_marker")" == \
 			"$terminal_cutover_marker" &&
-		"$(stat -c '%u:%g:%a:%h' "$terminal_cutover_marker")" ==
+		"$(stat -c '%u:%g:%a:%h' "$terminal_cutover_marker")" == \
 			'0:0:600:1' ]] || return 1
 	mapfile -t marker_lines <"$terminal_cutover_marker"
 	[[ "${#marker_lines[@]}" == '7' &&
@@ -2431,7 +2431,7 @@ validate_terminal_cutover_marker() {
 	[[ "${marker_lines[5]}" =~ ^bootstrap_event_id=([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$ ]] ||
 		return 1
 	terminal_marker_event_id="${BASH_REMATCH[1]}"
-	[[ "${marker_lines[6]}" ==
+	[[ "${marker_lines[6]}" == \
 		'core_system_identifier=7668360958158979115' ]] || return 1
 }
 
@@ -2494,7 +2494,7 @@ cleanup_terminal_snapshot_artifacts() {
 			[[ -f "$entry_path" && ! -L "$entry_path" &&
 				"$(realpath -e "$entry_path")" == "$entry_path" &&
 				"$(stat -c '%u:%g:%a:%h' "$entry_path")" == '0:0:600:1' &&
-				"$(sha256sum "$entry_path" | awk '{print $1}')" ==
+				"$(sha256sum "$entry_path" | awk '{print $1}')" == \
 					"$expected_snapshot_sha256" ]] ||
 				die 'Protected cutover snapshot differs from the terminal marker.'
 		done < <(find "$cutover_input_directory" -xdev -mindepth 1 -maxdepth 1 -print0)
@@ -2513,11 +2513,11 @@ cleanup_terminal_snapshot_artifacts() {
 		-L "$legacy_operations_snapshot_root" ]]; then
 		[[ -d "$legacy_operations_snapshot_root" &&
 			! -L "$legacy_operations_snapshot_root" &&
-			"$(realpath -e "$legacy_operations_snapshot_root")" ==
+			"$(realpath -e "$legacy_operations_snapshot_root")" == \
 				"$legacy_operations_snapshot_root" &&
-			"$(stat -c '%u:%g:%a' "$legacy_operations_snapshot_root")" ==
+			"$(stat -c '%u:%g:%a' "$legacy_operations_snapshot_root")" == \
 				'0:1001:770' &&
-			"$(stat -c '%d' "$legacy_operations_snapshot_root")" ==
+			"$(stat -c '%d' "$legacy_operations_snapshot_root")" == \
 				"$(stat -c '%d' "$deploy_state_directory")" ]] ||
 			die 'Legacy Operations snapshot root differs from the live reviewed contract.'
 		while IFS= read -r -d '' entry_path; do
@@ -2525,11 +2525,11 @@ cleanup_terminal_snapshot_artifacts() {
 			[[ "$snapshot_name" =~ ^operations-[0-9a-f]{40}\.json$ &&
 				-f "$entry_path" && ! -L "$entry_path" &&
 				"$(realpath -e "$entry_path")" == "$entry_path" &&
-				"$(stat -c '%u:%g:%a:%h' "$entry_path")" ==
+				"$(stat -c '%u:%g:%a:%h' "$entry_path")" == \
 					'1001:1001:600:1' &&
-				"$(stat -c '%d' "$entry_path")" ==
+				"$(stat -c '%d' "$entry_path")" == \
 					"$(stat -c '%d' "$legacy_operations_snapshot_root")" &&
-				"$(sha256sum "$entry_path" | awk '{print $1}')" ==
+				"$(sha256sum "$entry_path" | awk '{print $1}')" == \
 					"$terminal_marker_operations_sha256" ]] ||
 				die 'Legacy Operations snapshot differs from the terminal marker.'
 		done < <(find "$legacy_operations_snapshot_root" -xdev -mindepth 1 -maxdepth 1 -print0)
@@ -2709,7 +2709,7 @@ operations_status_pattern='^\{"phase":"ACTIVE","sourceRevision":"([0-9a-f]{40})"
 	die 'Operations ownership does not match the exact ACTIVE snapshot contract.'
 operations_status_source_revision="${BASH_REMATCH[1]}"
 [[ -z "$expected_operations_source_revision" ||
-	"$operations_status_source_revision" ==
+	"$operations_status_source_revision" == \
 		"$expected_operations_source_revision" ]] ||
 	die 'Operations ownership source revision differs from the terminal marker.'
 
@@ -2832,7 +2832,7 @@ install_and_verify_backend_nginx() {
 		if ! {
 			printf '%s' "$backend_nginx_base64" |
 				base64 --decode >"$nginx_candidate" &&
-			[[ "$(sha256sum "$nginx_candidate" | awk '{print $1}')" ==
+			[[ "$(sha256sum "$nginx_candidate" | awk '{print $1}')" == \
 				"$backend_nginx_sha256" ]] &&
 			chown 0:0 "$nginx_candidate" &&
 			chmod 644 "$nginx_candidate" &&
@@ -2871,7 +2871,7 @@ install_and_verify_backend_nginx() {
 				die 'Backend Nginx reload rollback failed.'
 			die 'Apps-only backend Nginx reload failed and was rolled back.'
 		fi
-		if [[ "$(sha256sum "$nginx_target" | awk '{print $1}')" !=
+		if [[ "$(sha256sum "$nginx_target" | awk '{print $1}')" != \
 			"$backend_nginx_sha256" ||
 			"$(stat -c '%u:%g:%a:%h' "$nginx_target")" != '0:0:644:1' ]] ||
 			! nginx -t >/dev/null 2>&1; then
@@ -2884,7 +2884,7 @@ install_and_verify_backend_nginx() {
 		rm -f -- "$nginx_backup"
 		sync -f "$nginx_available_dir"
 	fi
-	[[ "$(sha256sum "$nginx_target" | awk '{print $1}')" ==
+	[[ "$(sha256sum "$nginx_target" | awk '{print $1}')" == \
 		"$backend_nginx_sha256" &&
 		"$(stat -c '%u:%g:%a:%h' "$nginx_target")" == '0:0:644:1' ]] ||
 		die 'Live backend Nginx config does not match the tracked apps-only artifact.'
@@ -2909,7 +2909,7 @@ verify_telegram_proxy_health ||
 if [[ "$deploy_mode" == 'cutover' ]]; then
 	verify_control_plane_convergence \
 		"$control_plane_snapshot_sha256" '' '' true
-	[[ "$operations_status_source_revision" ==
+	[[ "$operations_status_source_revision" == \
 		"$verified_control_plane_source_revision" ]] ||
 		die 'Operations and control-plane snapshots have different source revisions.'
 	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
@@ -3200,9 +3200,9 @@ if [[ "$deploy_mode" == 'cutover' ]]; then
 	if [[ -e "$legacy_restore_root" || -L "$legacy_restore_root" ]]; then
 		[[ -d "$legacy_restore_root" && ! -L "$legacy_restore_root" &&
 			"$(realpath -e "$legacy_restore_root")" == "$legacy_restore_root" &&
-			"$(stat -c '%u:%g:%a' "$legacy_restore_root")" ==
+			"$(stat -c '%u:%g:%a' "$legacy_restore_root")" == \
 				'1001:1001:700' &&
-			"$(stat -c '%d' "$legacy_restore_root")" ==
+			"$(stat -c '%d' "$legacy_restore_root")" == \
 				"$(stat -c '%d' "$deploy_state_directory")" ]] ||
 			die 'Legacy restore root metadata differs from the live reviewed contract.'
 		legacy_restore_directories=(
@@ -3232,7 +3232,7 @@ if [[ "$deploy_mode" == 'cutover' ]]; then
 			[[ -d "$entry_path" && ! -L "$entry_path" &&
 				"$(realpath -e "$entry_path")" == "$entry_path" &&
 				"$(stat -c '%u:%g' "$entry_path")" == '1001:1001' &&
-				"$(stat -c '%d' "$entry_path")" ==
+				"$(stat -c '%d' "$entry_path")" == \
 					"$(stat -c '%d' "$legacy_restore_root")" ]] ||
 				die "Legacy restore directory target is unsafe: $entry_name"
 			find "$entry_path" -xdev -depth -delete
@@ -3243,7 +3243,7 @@ if [[ "$deploy_mode" == 'cutover' ]]; then
 			[[ -f "$entry_path" && ! -L "$entry_path" &&
 				"$(realpath -e "$entry_path")" == "$entry_path" &&
 				"$(stat -c '%u:%g' "$entry_path")" == '1001:1001' &&
-				"$(stat -c '%d' "$entry_path")" ==
+				"$(stat -c '%d' "$entry_path")" == \
 					"$(stat -c '%d' "$legacy_restore_root")" ]] ||
 				die "Legacy restore file target is unsafe: $entry_name"
 			rm -f -- "$entry_path"
@@ -3274,7 +3274,7 @@ if [[ "$deploy_mode" == 'cutover' ]]; then
 			[[ -d "$entry_path" && ! -L "$entry_path" &&
 				"$(realpath -e "$entry_path")" == "$entry_path" &&
 				"$(stat -c '%u:%g' "$entry_path")" == '0:0' &&
-				"$(stat -c '%d' "$entry_path")" ==
+				"$(stat -c '%d' "$entry_path")" == \
 					"$legacy_restore_staging_device" ]] ||
 				die "Legacy restore staging target is unsafe: $entry_name"
 			find "$entry_path" -xdev -depth -delete
