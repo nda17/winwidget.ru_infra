@@ -1068,8 +1068,8 @@ compose_contract_validator=''
 read -r -d '' compose_contract_validator <<'COMPOSE_CONTRACT' || true
 const fs = require('node:fs');
 
-function fail() {
-	throw new Error('invalid production Compose contract');
+function fail(reason = 'invalid production Compose contract') {
+	throw new Error(reason);
 }
 
 function sorted(values) {
@@ -1205,7 +1205,14 @@ try {
 				restoreMounts[0].type !== 'bind' ||
 				restoreMounts[0].source !== restoreStorage ||
 				restoreMounts[0].target !== restoreStorage
-			) fail();
+			) {
+				fail(
+					`restore mount ${name}: mounts=${mounts.length}, matches=${restoreMounts.length}, ` +
+					`type=${restoreMounts[0]?.type ?? 'missing'}, ` +
+					`sourceMatch=${restoreMounts[0]?.source === restoreStorage}, ` +
+					`targetMatch=${restoreMounts[0]?.target === restoreStorage}`
+				);
+			}
 		} else if (restoreMounts.length !== 0) fail();
 	}
 
@@ -1243,8 +1250,9 @@ try {
 	const location = locations[1]
 		? `${locations[1][1]}:${locations[1][2]}`
 		: 'unknown';
+	const reason = error instanceof Error ? error.message : 'unknown';
 	process.stderr.write(
-		`Production Compose failed the Operations restore-worker contract (${location}).\n`
+		`Production Compose failed the Operations restore-worker contract (${location}; ${reason}).\n`
 	);
 	process.exit(1);
 }
