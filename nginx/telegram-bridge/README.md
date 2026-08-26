@@ -1,35 +1,37 @@
 # Telegram bridge
 
-The foreign VPS at the reviewed public bridge address carries both WinWidget
-Telegram directions:
+Зарубежный VPS по проверенному публичному адресу bridge обслуживает оба
+направления Telegram-трафика WinWidget:
 
 ```text
 Telegram -> tg.winwidget.ru -> https://api.winwidget.ru
 Backend services -> https://tg.winwidget.ru/telegram-api -> api.telegram.org
 ```
 
-`tg.winwidget.ru.conf` is installed as
-`/etc/nginx/sites-available/tg.winwidget.ru`. It terminates TLS and exposes
-only the exact Auth, Info, Support and webhook-health routes plus the allowlisted
-Bot API methods used by WinWidget. Request paths under `/telegram-api/*`
-contain bot tokens, so access and error request logging must remain disabled.
+Файл `tg.winwidget.ru.conf` устанавливается как
+`/etc/nginx/sites-available/tg.winwidget.ru`. Он завершает TLS и открывает только
+точные маршруты Auth, Info, Support и webhook-health, а также методы Bot API из
+allowlist, используемые WinWidget. Пути запросов `/telegram-api/*` содержат
+токены ботов, поэтому логирование доступа и ошибочных запросов должно оставаться
+отключённым.
 
-The apps-only backend pins the bridge for Notification Delivery, Identity API,
-Support API/worker and Operations API/worker. All Telegram notifications,
-backups, daily summaries, authentication and operator chat use this path.
+Backend без Core закрепляет bridge для Notification Delivery, Identity API,
+Support API/worker и Operations API/worker. Через этот путь проходят все
+Telegram-уведомления, backup, ежедневные сводки, аутентификация и чат с
+оператором.
 
-`telegram-api-stream.conf` remains installed as
-`/etc/nginx/modules-enabled/99-winwidget-telegram-api-stream.conf`. Public
-`8443/tcp` is intentionally available to any client as a raw TLS passthrough;
-it is not restricted to the WinWidget backend. The resolver is IPv4-only
-because the bridge has no working outbound IPv6 route.
+Файл `telegram-api-stream.conf` по-прежнему устанавливается как
+`/etc/nginx/modules-enabled/99-winwidget-telegram-api-stream.conf`. Публичный
+`8443/tcp` намеренно доступен любому клиенту как raw TLS passthrough; он не
+ограничен backend WinWidget. Resolver использует только IPv4, потому что у
+bridge нет работающего исходящего IPv6-маршрута.
 
-## Release
+## Релиз
 
-1. Install both files atomically with owner `root:root`, mode `0644`.
-2. Run `nginx -t` and reload Nginx.
-3. Keep public `443/tcp` and `8443/tcp` open.
-4. Verify the token-free endpoint:
+1. Атомарно установите оба файла с владельцем `root:root` и режимом `0644`.
+2. Выполните `nginx -t` и перезагрузите Nginx.
+3. Оставьте публичные порты `443/tcp` и `8443/tcp` открытыми.
+4. Проверьте endpoint, не содержащий токенов:
 
 ```bash
 curl --noproxy '*' --resolve tg.winwidget.ru:443:BRIDGE_IP \
@@ -38,18 +40,19 @@ curl --noproxy '*' --resolve tg.winwidget.ru:443:BRIDGE_IP \
   https://tg.winwidget.ru/telegram-api-health
 ```
 
-The response must be non-5xx and include
-`X-WinWidget-Telegram-Proxy: active`. Missing marker, timeout or TLS failure
-blocks the backend release.
+Ответ не должен иметь статус 5xx и должен содержать
+`X-WinWidget-Telegram-Proxy: active`. Отсутствие маркера, timeout или ошибка TLS
+блокируют релиз backend.
 
-The backend env uses
-`TELEGRAM_API_BASE_URL=https://tg.winwidget.ru/telegram-api` and the reviewed
-bridge IP. After a change, verify one Telegram message, one current backup
-document, Daily Summary and the Support operator-chat flow. Do not mass-retry
-stale DLQ messages.
+Backend env использует
+`TELEGRAM_API_BASE_URL=https://tg.winwidget.ru/telegram-api` и проверенный IP
+bridge. После изменения проверьте одно Telegram-сообщение, один актуальный
+документ backup, Daily Summary и сценарий чата с оператором Support. Не
+запускайте массовый retry устаревших сообщений DLQ.
 
-## Security
+## Безопасность
 
-Never enable request-line logging for `/telegram-api/*`; Telegram bot tokens
-are part of the URL. The proxy validates TLS separately on both legs. Stream
-logs contain only connection metadata, not HTTP paths or payloads.
+Никогда не включайте логирование request line для `/telegram-api/*`: токены
+Telegram-ботов являются частью URL. Proxy отдельно проверяет TLS на обоих
+участках. Stream-логи содержат только метаданные соединений, без HTTP-путей и
+payload.
