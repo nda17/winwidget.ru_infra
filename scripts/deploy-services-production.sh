@@ -561,6 +561,10 @@ const fallbacks = new Map([
 ]);
 const overrides = new Map();
 const explicitlyOptionalEmptyValues = new Set(['widgets:S3_KEY_PREFIX']);
+overrides.set(
+	'operations:DATABASE_RESTORE_STORAGE_DIR',
+	'/var/lib/winwidget-operations/restores'
+);
 for (const app of apps) {
 	overrides.set(`${app}:APP_REVISION`, revision);
 	overrides.set(`${app}:NODE_ENV`, 'production');
