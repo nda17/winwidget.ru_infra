@@ -2128,8 +2128,30 @@ const removeRetiredReportingBinding = async () => {
 		if (JSON.stringify(normalizedTopics) !== JSON.stringify(wantedTopics)) fail();
 		await connect(user.username, user.password, `winwidget-infra-${user.username}-check`);
 	}
-})().catch(() => {
-	process.stderr.write('RabbitMQ service identity or topology provisioning failed.\n');
+})().catch(error => {
+	const locations = [
+		...(error instanceof Error ? error.stack ?? '' : '').matchAll(
+			/\[stdin\]:(\d+):(\d+)/g
+		)
+	];
+	const location = locations[1]
+		? `${locations[1][1]}:${locations[1][2]}`
+		: locations[0]
+			? `${locations[0][1]}:${locations[0][2]}`
+			: 'unknown';
+	const name =
+		error instanceof Error && /^[A-Za-z0-9_-]+$/.test(error.name)
+			? error.name
+			: 'unknown';
+	const rawCode = error && typeof error === 'object' ? error.code : undefined;
+	const code =
+		(typeof rawCode === 'string' || typeof rawCode === 'number') &&
+		/^[A-Za-z0-9_-]+$/.test(String(rawCode))
+			? String(rawCode)
+			: 'unknown';
+	process.stderr.write(
+		`RabbitMQ service identity or topology provisioning failed (${location}; ${name}; ${code}).\n`
+	);
 	process.exit(1);
 });
 PROVISION_RABBITMQ
