@@ -442,6 +442,7 @@ cleanup_service_env_staging() {
 trap cleanup_service_env_staging EXIT
 
 docker run --rm \
+	--interactive \
 	--network none \
 	--read-only \
 	--cap-drop ALL \
@@ -830,6 +831,7 @@ fi
 	"$(stat -c '%u:%g:%a' "$operations_restore_storage")" == '1001:1001:700' ]] ||
 	die 'Operations restore storage must be canonical UID/GID 1001 mode 0700.'
 docker run --rm \
+	--interactive \
 	--network none \
 	--read-only \
 	--tmpfs /tmp:rw,noexec,nosuid,nodev,size=8m \
@@ -861,6 +863,7 @@ const { open, unlink } = require('node:fs/promises');
 RESTORE_STORAGE_PROBE
 
 docker run --rm \
+	--interactive \
 	--network none \
 	--read-only \
 	--cap-drop ALL \
@@ -1385,6 +1388,7 @@ fi
 
 notification_topology_contract="$(
 	docker run --rm \
+		--interactive \
 		--network none \
 		--read-only \
 		--tmpfs /tmp:rw,noexec,nosuid,nodev,size=8m \
@@ -1449,6 +1453,7 @@ NOTIFICATION_TOPOLOGY
 
 reporting_topology_contract="$(
 	docker run --rm \
+		--interactive \
 		--network none \
 		--read-only \
 		--tmpfs /tmp:rw,noexec,nosuid,nodev,size=8m \
@@ -1510,6 +1515,7 @@ REPORTING_TOPOLOGY
 
 rabbitmq_expected_user_names="$(
 	docker run --rm \
+		--interactive \
 		--network none \
 		--read-only \
 		--cap-drop ALL \
@@ -1549,6 +1555,7 @@ RABBITMQ_EXPECTED_USERS
 	die 'RabbitMQ user inventory contract is empty.'
 
 docker run --rm \
+	--interactive \
 	--network host \
 	--read-only \
 	--tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
