@@ -2194,9 +2194,69 @@ const removeRetiredReportingBinding = async () => {
 });
 PROVISION_RABBITMQ
 
+recover_failed_reporting_terminal_migration() {
+	local migration_name='20260826020000_remove_core_runtime_dependencies'
+	local postgres_container_id failed_state remaining_failed_state
+	postgres_container_id="$(find_project_service_container reporting-postgres)"
+	[[ -n "$postgres_container_id" ]] || return 1
+	if ! failed_state="$(
+		docker exec "$postgres_container_id" sh -ec '
+			exec psql \
+				--username "$POSTGRES_USER" \
+				--dbname "$POSTGRES_DB" \
+				--no-psqlrc \
+				--tuples-only \
+				--no-align \
+				--set ON_ERROR_STOP=1 \
+				--command "
+					SELECT migration_name || '\''|'\'' || applied_steps_count::text
+					FROM reporting.\"_prisma_migrations\"
+					WHERE finished_at IS NULL
+						AND rolled_back_at IS NULL
+					ORDER BY started_at;
+				"
+		' 2>/dev/null
+	)"; then
+		return 1
+	fi
+	[[ "$failed_state" == "$migration_name|0" ]] || return 1
+	compose_all run --rm --no-deps reporting-migrate \
+		migrate resolve \
+		--rolled-back "$migration_name" \
+		--schema prisma/schema.prisma >/dev/null 2>&1 ||
+		die 'Cannot mark the exact unapplied Reporting terminal migration as rolled back.'
+	remaining_failed_state="$(
+		docker exec "$postgres_container_id" sh -ec '
+			exec psql \
+				--username "$POSTGRES_USER" \
+				--dbname "$POSTGRES_DB" \
+				--no-psqlrc \
+				--tuples-only \
+				--no-align \
+				--set ON_ERROR_STOP=1 \
+				--command "
+					SELECT migration_name
+					FROM reporting.\"_prisma_migrations\"
+					WHERE finished_at IS NULL
+						AND rolled_back_at IS NULL
+					ORDER BY started_at;
+				"
+		' 2>/dev/null
+	)" || die 'Cannot verify the Reporting migration recovery state.'
+	[[ -z "$remaining_failed_state" ]] ||
+		die 'Reporting still has an unresolved failed migration after recovery.'
+}
+
 for migration_service in "${migration_services[@]}"; do
 	if ! compose_all run --rm --no-deps "$migration_service" >/dev/null 2>&1; then
-		die "Production migration failed: $migration_service"
+		if [[ "$deploy_mode" == 'cutover' &&
+			"$migration_service" == 'reporting-migrate' ]] &&
+			recover_failed_reporting_terminal_migration; then
+			compose_all run --rm --no-deps "$migration_service" >/dev/null 2>&1 ||
+				die "Production migration failed after exact recovery: $migration_service"
+		else
+			die "Production migration failed: $migration_service"
+		fi
 	fi
 done
 
