@@ -1719,7 +1719,12 @@ const request = async (path, options = {}, expected = [200, 201, 204]) => {
 		redirect: 'error',
 		signal: AbortSignal.timeout(10_000)
 	});
-	if (!expected.includes(response.status)) fail();
+	if (!expected.includes(response.status)) {
+		const error = new Error('RabbitMQ Management API contract failed');
+		error.code = `HTTP_${response.status}`;
+		error.context = `${options.method ?? 'GET'}:${path}`;
+		throw error;
+	}
 	if ([201, 204, 404].includes(response.status)) return null;
 	return response.json();
 };
@@ -2149,8 +2154,15 @@ const removeRetiredReportingBinding = async () => {
 		/^[A-Za-z0-9_-]+$/.test(String(rawCode))
 			? String(rawCode)
 			: 'unknown';
+	const rawContext =
+		error && typeof error === 'object' ? error.context : undefined;
+	const context =
+		typeof rawContext === 'string' &&
+		/^[A-Z]+:\/api\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$/.test(rawContext)
+			? rawContext
+			: 'unknown';
 	process.stderr.write(
-		`RabbitMQ service identity or topology provisioning failed (${location}; ${name}; ${code}).\n`
+		`RabbitMQ service identity or topology provisioning failed (${location}; ${name}; ${code}; ${context}).\n`
 	);
 	process.exit(1);
 });
