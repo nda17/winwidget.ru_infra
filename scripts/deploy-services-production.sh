@@ -627,9 +627,12 @@ compose_env_arguments=(--env-file "$env_file")
 for app_name in "${required_apps[@]}"; do
 	staged_env="$service_env_staging/$app_name.env.production"
 	target_env="$services_repository/apps/$app_name/.env.production"
-	[[ -f "$staged_env" && ! -L "$staged_env" &&
-		"$(stat -c '%u:%g:%a:%h' "$staged_env")" == '0:0:600:1' ]] ||
-		die 'A materialized service env is missing or unsafe.'
+	if [[ ! -f "$staged_env" || -L "$staged_env" ]]; then
+		die "A materialized service env is missing or unsafe: $app_name (type)."
+	fi
+	staged_env_metadata="$(stat -c '%u:%g:%a:%h' "$staged_env")"
+	[[ "$staged_env_metadata" == '0:0:600:1' ]] ||
+		die "A materialized service env is missing or unsafe: $app_name (metadata $staged_env_metadata)."
 	[[ ! -L "$target_env" && (! -e "$target_env" || -f "$target_env") ]] ||
 		die 'A service production env target is unsafe.'
 	temporary_env="$services_repository/apps/$app_name/.env.production.tmp.$$"
