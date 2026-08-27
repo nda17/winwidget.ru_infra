@@ -80,7 +80,7 @@ jobs:
             'utf8'
           );
           const readme = fs.readFileSync('README.md', 'utf8');
-          const runbook = fs.readFileSync('docs/runbook.md', 'utf8');
+          const runbook = fs.readFileSync('DOCUMENTATION/runbook.md', 'utf8');
           const backendNginx = fs.readFileSync('nginx/backend-api.conf', 'utf8');
           const frontendNginx = fs.readFileSync('nginx/frontend.conf', 'utf8');
           const telegramBridgeNginx = fs.readFileSync(
@@ -89,6 +89,10 @@ jobs:
           );
           const telegramStreamNginx = fs.readFileSync(
             'nginx/telegram-bridge/telegram-api-stream.conf',
+            'utf8'
+          );
+          const telegramBridgeReadme = fs.readFileSync(
+            'nginx/telegram-bridge/README.md',
             'utf8'
           );
 
@@ -639,66 +643,270 @@ jobs:
             fail('frontend Nginx is not the exact frontend-only contract');
           }
 
-          const incomingWebhookRoutes = [
-            '/api/v1/telegram-auth/webhook',
-            '/api/v1/telegram-bot/webhook',
-            '/api/v1/telegram-bot/support-webhook'
-          ];
-          for (const route of incomingWebhookRoutes) {
+          const extractNginxBlock = (source, marker, label) => {
+            const start = source.indexOf(marker);
             if (
-              (telegramBridgeNginx.match(
-                new RegExp(`location = ${route.replaceAll('/', '\\/')} \\{`, 'g')
-              ) ?? []).length !== 1
+              start < 0 ||
+              source.indexOf(marker, start + marker.length) >= 0
             ) {
-              fail(`Telegram bridge route is not exact: ${route}`);
+              fail(`Telegram Nginx block is missing or duplicated: ${label}`);
             }
-          }
-          if (
-            (telegramBridgeNginx.match(
-              /proxy_pass https:\/\/winwidget_api_origin;/g
-            ) ?? []).length !== incomingWebhookRoutes.length ||
-            (telegramBridgeNginx.match(/proxy_ssl_name api\.winwidget\.ru;/g) ?? [])
-              .length !== incomingWebhookRoutes.length ||
-            /proxy_ssl_verify\s+off;|webhook-health/.test(telegramBridgeNginx)
-          ) {
-            fail('Telegram incoming webhook proxy contract is unsafe');
-          }
-          const tlsServerStart = telegramBridgeNginx.lastIndexOf(
-            'server_name tg.winwidget.ru;'
+            const openingBrace = source.indexOf('{', start);
+            if (openingBrace < 0) fail(`Telegram Nginx block is invalid: ${label}`);
+            let depth = 0;
+            for (let index = openingBrace; index < source.length; index += 1) {
+              if (source[index] === '{') depth += 1;
+              if (source[index] === '}') {
+                depth -= 1;
+                if (depth === 0) return source.slice(start, index + 1);
+              }
+            }
+            fail(`Telegram Nginx block is not closed: ${label}`);
+          };
+
+          const telegramTlsServer = extractNginxBlock(
+            telegramBridgeNginx,
+            'server {\n\tlisten 443 ssl http2;',
+            'Telegram TLS server'
           );
-          const firstTlsLocation = telegramBridgeNginx.indexOf(
-            'location = /telegram-api-health',
-            tlsServerStart
+          const firstTlsLocation = telegramTlsServer.indexOf(
+            'location = /telegram-api-health'
           );
-          const inheritedTlsContract = telegramBridgeNginx.slice(
-            tlsServerStart,
-            firstTlsLocation
-          );
-          for (const directive of [
+          const inheritedTlsContract = telegramTlsServer.slice(0, firstTlsLocation);
+          const inheritedTlsDirectives = [
             'proxy_ssl_verify on;',
             'proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;',
             'proxy_ssl_verify_depth 3;'
-          ]) {
+          ];
+          if (
+            firstTlsLocation <= 0 ||
+            exactCount(
+              telegramTlsServer,
+              /set \$telegram_api_origin_url https:\/\/api\.telegram\.org;/g
+            ) !== 1 ||
+            exactCount(
+              telegramTlsServer,
+              /^\s*set \$telegram_api_origin_url\s+[^;]+;$/gm
+            ) !== 1 ||
+            /webhook-health/.test(telegramBridgeNginx)
+          ) {
+            fail('Telegram HTTPS server boundary is unsafe');
+          }
+          for (const directive of inheritedTlsDirectives) {
             requireText(
               inheritedTlsContract,
               directive,
               `Telegram inherited upstream TLS directive is missing: ${directive}`
             );
           }
-          for (const directive of [
-            'listen 8443;',
-            'listen [::]:8443;',
-            'default api.telegram.org:443;',
-            'proxy_pass $telegram_api_upstream;'
+
+          const proxySslVerifyValues = [
+            ...telegramTlsServer.matchAll(/^\s*proxy_ssl_verify\s+([^;]+);$/gm)
+          ].map(match => match[1].trim());
+          const proxySslCaValues = [
+            ...telegramTlsServer.matchAll(
+              /^\s*proxy_ssl_trusted_certificate\s+([^;]+);$/gm
+            )
+          ].map(match => match[1].trim());
+          const proxySslDepthValues = [
+            ...telegramTlsServer.matchAll(
+              /^\s*proxy_ssl_verify_depth\s+([^;]+);$/gm
+            )
+          ].map(match => match[1].trim());
+          const proxySslSniValues = [
+            ...telegramTlsServer.matchAll(
+              /^\s*proxy_ssl_server_name\s+([^;]+);$/gm
+            )
+          ].map(match => match[1].trim());
+          const proxySslNameValues = [
+            ...telegramTlsServer.matchAll(/^\s*proxy_ssl_name\s+([^;]+);$/gm)
+          ].map(match => match[1].trim());
+          if (
+            proxySslVerifyValues.length !== 4 ||
+            proxySslVerifyValues.some(value => value !== 'on') ||
+            proxySslCaValues.length !== 4 ||
+            proxySslCaValues.some(
+              value => value !== '/etc/ssl/certs/ca-certificates.crt'
+            ) ||
+            proxySslDepthValues.length !== 4 ||
+            proxySslDepthValues.some(value => value !== '3') ||
+            proxySslSniValues.length !== 6 ||
+            proxySslSniValues.some(value => value !== 'on') ||
+            proxySslNameValues.filter(value => value === 'api.telegram.org')
+              .length !== 3 ||
+            proxySslNameValues.filter(value => value === 'api.winwidget.ru')
+              .length !== 3 ||
+            proxySslNameValues.length !== 6
+          ) {
+            fail('Telegram HTTPS TLS verification directives are not exact');
+          }
+
+          const telegramHttpsLocations = [
+            {
+              label: 'Telegram API health',
+              marker: 'location = /telegram-api-health {',
+              proxyPass: '$telegram_api_origin_url',
+              sslName: 'api.telegram.org'
+            },
+            {
+              label: 'Telegram Bot API methods',
+              marker: 'location ~ ^/telegram-api/(bot[0-9]+',
+              proxyPass: '$telegram_api_origin_url',
+              sslName: 'api.telegram.org'
+            },
+            {
+              label: 'Telegram Bot API files',
+              marker: 'location ~ ^/telegram-api/file/(bot[0-9]+',
+              proxyPass: '$telegram_api_origin_url',
+              sslName: 'api.telegram.org'
+            },
+            {
+              label: 'Telegram Auth webhook',
+              marker: 'location = /api/v1/telegram-auth/webhook {',
+              proxyPass: 'https://winwidget_api_origin',
+              sslName: 'api.winwidget.ru'
+            },
+            {
+              label: 'Telegram Info webhook',
+              marker: 'location = /api/v1/telegram-bot/webhook {',
+              proxyPass: 'https://winwidget_api_origin',
+              sslName: 'api.winwidget.ru'
+            },
+            {
+              label: 'Telegram Support webhook',
+              marker: 'location = /api/v1/telegram-bot/support-webhook {',
+              proxyPass: 'https://winwidget_api_origin',
+              sslName: 'api.winwidget.ru'
+            }
+          ];
+          for (const location of telegramHttpsLocations) {
+            const block = extractNginxBlock(
+              telegramTlsServer,
+              location.marker,
+              location.label
+            );
+            const effectiveTlsContract = `${inheritedTlsContract}\n${block}`;
+            const locationProxyPasses = [
+              ...block.matchAll(/^\s*proxy_pass\s+([^;]+);$/gm)
+            ].map(match => match[1].trim());
+            const locationSniValues = [
+              ...block.matchAll(/^\s*proxy_ssl_server_name\s+([^;]+);$/gm)
+            ].map(match => match[1].trim());
+            const locationSslNames = [
+              ...block.matchAll(/^\s*proxy_ssl_name\s+([^;]+);$/gm)
+            ].map(match => match[1].trim());
+            if (
+              JSON.stringify(locationProxyPasses) !==
+                JSON.stringify([location.proxyPass]) ||
+              JSON.stringify(locationSniValues) !== JSON.stringify(['on']) ||
+              JSON.stringify(locationSslNames) !==
+                JSON.stringify([location.sslName])
+            ) {
+              fail(`Telegram HTTPS location TLS contract is unsafe: ${location.label}`);
+            }
+            for (const directive of inheritedTlsDirectives) {
+              requireText(
+                effectiveTlsContract,
+                directive,
+                `Telegram HTTPS location does not verify upstream TLS: ${location.label}`
+              );
+            }
+          }
+
+          const streamListeners = [
+            ...telegramStreamNginx.matchAll(/^\s*listen\s+(.+?);$/gm)
+          ]
+            .map(match => match[1])
+            .sort();
+          const streamProxyPasses = [
+            ...telegramStreamNginx.matchAll(/^\s*proxy_pass\s+(.+?);$/gm)
+          ].map(match => match[1]);
+          const streamMap = extractNginxBlock(
+            telegramStreamNginx,
+            'map $remote_addr $telegram_api_upstream {',
+            'Telegram stream constant upstream map'
+          );
+          const streamMapDirectives = streamMap
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line && !line.startsWith('#'));
+          const streamResolvers = [
+            ...telegramStreamNginx.matchAll(/^\s*resolver\s+(.+?);$/gm)
+          ].map(match => match[1]);
+          const streamResolverTimeouts = [
+            ...telegramStreamNginx.matchAll(
+              /^\s*resolver_timeout\s+(.+?);$/gm
+            )
+          ].map(match => match[1]);
+          const streamVariables = [
+            ...new Set(
+              [...telegramStreamNginx.matchAll(/\$[A-Za-z_][A-Za-z0-9_]*/g)].map(
+                match => match[0]
+              )
+            )
+          ].sort();
+          if (
+            exactCount(telegramStreamNginx, /^stream\s*\{$/gm) !== 1 ||
+            exactCount(telegramStreamNginx, /^\s*server\s*\{$/gm) !== 1 ||
+            exactCount(telegramStreamNginx, /^\s*map\s+/gm) !== 1 ||
+            exactCount(
+              telegramStreamNginx,
+              /^\s*map \$remote_addr \$telegram_api_upstream \{$/gm
+            ) !== 1 ||
+            JSON.stringify(streamMapDirectives) !==
+              JSON.stringify([
+                'map $remote_addr $telegram_api_upstream {',
+                'default api.telegram.org:443;',
+                '}'
+              ]) ||
+            JSON.stringify(streamListeners) !==
+              JSON.stringify(['8443', '[::]:8443']) ||
+            JSON.stringify(streamProxyPasses) !==
+              JSON.stringify(['$telegram_api_upstream']) ||
+            JSON.stringify(streamResolvers) !==
+              JSON.stringify(['1.1.1.1 8.8.8.8 ipv6=off valid=5m']) ||
+            JSON.stringify(streamResolverTimeouts) !==
+              JSON.stringify(['5s']) ||
+            JSON.stringify(streamVariables) !==
+              JSON.stringify([
+                '$binary_remote_addr',
+                '$bytes_received',
+                '$bytes_sent',
+                '$protocol',
+                '$remote_addr',
+                '$session_time',
+                '$status',
+                '$telegram_api_upstream',
+                '$time_local'
+              ]) ||
+            /^\s*(?:include|upstream|set)\b/m.test(telegramStreamNginx) ||
+            /^\s*proxy_pass\s+\$(?!telegram_api_upstream;)/m.test(
+              telegramStreamNginx
+            ) ||
+            /^\s*proxy_ssl(?:\s|_)|^\s*(?:ssl_preread|ssl_certificate|ssl_certificate_key|proxy_protocol)\b|^\s*listen\s+[^;]*\b(?:ssl|proxy_protocol)\b/m.test(
+              telegramStreamNginx
+            ) ||
+            /\ballow\s|\bdeny\s/.test(telegramStreamNginx)
+          ) {
+            fail('Telegram public 8443 relay is not a fixed raw TCP passthrough');
+          }
+          for (const evidence of [
+            'всегда направлен только на `api.telegram.org:443`',
+            'Постоянный `map` не зависит от клиента',
+            'resolver использует только',
+            'IPv4',
+            'На `8443` Nginx не',
+            'клиент обязан передавать SNI `api.telegram.org`',
+            'end to end проверять TLS-сертификат `api.telegram.org`'
           ]) {
             requireText(
-              telegramStreamNginx,
-              directive,
-              `Telegram public TLS relay directive is missing: ${directive}`
+              telegramBridgeReadme,
+              evidence,
+              `Telegram bridge README TLS contract is missing: ${evidence}`
             );
           }
-          if (/\ballow\s|\bdeny\s/.test(telegramStreamNginx)) {
-            fail('Telegram public TLS relay must not be source restricted');
+          if (telegramBridgeReadme.includes('Proxy отдельно проверяет TLS на обоих')) {
+            fail('Telegram bridge README overstates raw passthrough TLS verification');
           }
           for (const evidence of [
             'steady-state',

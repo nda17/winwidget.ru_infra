@@ -204,5 +204,5 @@ git diff --check
 
 ## Документация
 
-- [Единый production runbook](docs/runbook.md)
-- [Документация сервисов и технический backlog](https://github.com/nda17/winwidget.ru_services/tree/prod/docs)
+- [Единый production runbook](DOCUMENTATION/runbook.md)
+- [Документация сервисов и технический backlog](https://github.com/nda17/winwidget.ru_services/tree/prod/DOCUMENTATION)

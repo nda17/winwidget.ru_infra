@@ -22,8 +22,10 @@ Telegram-уведомления, backup, ежедневные сводки, ау
 Файл `telegram-api-stream.conf` по-прежнему устанавливается как
 `/etc/nginx/modules-enabled/99-winwidget-telegram-api-stream.conf`. Публичный
 `8443/tcp` намеренно доступен любому клиенту как raw TLS passthrough; он не
-ограничен backend WinWidget. Resolver использует только IPv4, потому что у
-bridge нет работающего исходящего IPv6-маршрута.
+ограничен backend WinWidget и всегда направлен только на `api.telegram.org:443`.
+Постоянный `map` не зависит от клиента, а runtime resolver использует только
+IPv4, потому что у bridge нет работающего исходящего IPv6-маршрута. Выбрать
+другой upstream через данные клиента нельзя.
 
 ## Релиз
 
@@ -52,6 +54,8 @@ bridge. После изменения проверьте одно Telegram-со�
 ## Безопасность
 
 Никогда не включайте логирование request line для `/telegram-api/*`: токены
-Telegram-ботов являются частью URL. Proxy отдельно проверяет TLS на обоих
-участках. Stream-логи содержат только метаданные соединений, без HTTP-путей и
-payload.
+Telegram-ботов являются частью URL. HTTPS reverse proxy завершает клиентский TLS
+и отдельно проверяет сертификаты своих HTTPS upstream. На `8443` Nginx не
+завершает и не проверяет TLS: клиент обязан передавать SNI `api.telegram.org` и
+end to end проверять TLS-сертификат `api.telegram.org`. Stream-логи содержат
+только метаданные соединений, без HTTP-путей и payload.
