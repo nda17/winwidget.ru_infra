@@ -4,7 +4,7 @@
 источником истины является репозиторий `winwidget.ru_infra`:
 
 - `README.md` — краткий обзор инфраструктуры;
-- `DOCUMENTATION/runbook.md` — текущие эксплуатационные контракты и checklist;
+- `docs/runbook.md` — текущие эксплуатационные контракты и checklist;
 - `.github/workflows/deploy-production.yml` — production workflow;
 - `scripts/deploy-services-production.sh` — routine backend deploy;
 - `winwidget.ru_services/deploy/docker-compose.prod.yml` — канонический
@@ -56,7 +56,7 @@ Telegram bridge VPS
 
 1. Определить владельца данных, API и событий.
 2. Прочитать README сервиса и
-   [технический backlog](https://github.com/nda17/winwidget.ru_services/blob/prod/DOCUMENTATION/backlog.md).
+   [технический backlog](https://github.com/nda17/winwidget.ru_services/blob/prod/docs/backlog.md).
 3. Зафиксировать узкий scope и требования совместимости.
 4. Внести минимальные изменения в owner service.
 5. Обновить unit/integration/contract tests.
@@ -281,7 +281,7 @@ trailing slash или дополнительным suffix отклоняются
   он не запускается через обычный API runtime или RabbitMQ consumer.
 
 Незавершённые ограничения restore и перехода к object storage/PITR находятся в
-[`backlog.md`](https://github.com/nda17/winwidget.ru_services/blob/prod/DOCUMENTATION/backlog.md).
+[`backlog.md`](https://github.com/nda17/winwidget.ru_services/blob/prod/docs/backlog.md).
 
 ## Telegram
 

@@ -80,7 +80,7 @@ jobs:
             'utf8'
           );
           const readme = fs.readFileSync('README.md', 'utf8');
-          const runbook = fs.readFileSync('DOCUMENTATION/runbook.md', 'utf8');
+          const runbook = fs.readFileSync('docs/runbook.md', 'utf8');
           const backendNginx = fs.readFileSync('nginx/backend-api.conf', 'utf8');
           const frontendNginx = fs.readFileSync('nginx/frontend.conf', 'utf8');
           const telegramBridgeNginx = fs.readFileSync(
