@@ -1306,33 +1306,317 @@ if ! compose_all config --format json 2>/dev/null |
 fi
 unset compose_contract_validator
 
+# BEGIN WINWIDGET_DOCKER_CLEANUP
+inspect_validated_project_container() {
+	local container_id="$1" inspection
+	local inspected_id raw_name state running paused restarting dead
+	local project_name service_name container_number oneoff config_hash extra_field
+	local container_name expected_hyphen_name expected_underscore_name
+	[[ "$container_id" =~ ^[0-9a-f]{64}$ ]] ||
+		die 'Compose container ID is not an exact full Docker ID.'
+	inspection="$(
+		docker container inspect --format \
+			'{{.Id}}|{{.Name}}|{{.State.Status}}|{{.State.Running}}|{{.State.Paused}}|{{.State.Restarting}}|{{.State.Dead}}|{{ index .Config.Labels "com.docker.compose.project" }}|{{ index .Config.Labels "com.docker.compose.service" }}|{{ index .Config.Labels "com.docker.compose.container-number" }}|{{ index .Config.Labels "com.docker.compose.oneoff" }}|{{ index .Config.Labels "com.docker.compose.config-hash" }}' \
+			"$container_id"
+	)" || die 'Cannot inspect an exact production Compose container.'
+	IFS='|' read -r inspected_id raw_name state running paused restarting dead \
+		project_name service_name container_number oneoff config_hash extra_field \
+		<<<"$inspection"
+	[[ "$inspected_id" == "$container_id" &&
+		"$raw_name" =~ ^/[A-Za-z0-9][A-Za-z0-9_.-]*$ &&
+		"$project_name" == "$COMPOSE_PROJECT_NAME" &&
+		"$service_name" =~ ^[a-z0-9][a-z0-9-]*$ &&
+		"$container_number" =~ ^[1-9][0-9]*$ &&
+		"$oneoff" =~ ^(True|False)$ &&
+		"$config_hash" =~ ^[0-9a-f]{64}$ && -z "$extra_field" ]] ||
+		die 'Production Compose container identity or labels are ambiguous.'
+
+	container_name="${raw_name#/}"
+	expected_hyphen_name="${COMPOSE_PROJECT_NAME}-${service_name}-${container_number}"
+	expected_underscore_name="${COMPOSE_PROJECT_NAME}_${service_name}_${container_number}"
+	if [[ "$oneoff" == 'False' ]]; then
+		[[ "$container_name" == "$expected_hyphen_name" ||
+			"$container_name" == "$expected_underscore_name" ]] ||
+			die 'Compose container name does not match its exact labels.'
+	else
+		[[ "$container_name" =~ ^${COMPOSE_PROJECT_NAME}-${service_name}-run-[a-z0-9]+$ ||
+			"$container_name" =~ ^${COMPOSE_PROJECT_NAME}_${service_name}_run_[a-z0-9]+$ ]] ||
+			die 'Compose one-off container name does not match its exact labels.'
+	fi
+
+	case "$state" in
+		running)
+			[[ "$running" == 'true' && "$paused" == 'false' &&
+				"$restarting" == 'false' && "$dead" == 'false' ]] ||
+				die 'Running Compose container state is internally inconsistent.'
+			;;
+		created | exited)
+			[[ "$running" == 'false' && "$paused" == 'false' &&
+				"$restarting" == 'false' && "$dead" == 'false' ]] ||
+				die 'Stopped Compose container state is internally inconsistent.'
+			;;
+		dead)
+			[[ "$running" == 'false' && "$paused" == 'false' &&
+				"$restarting" == 'false' && "$dead" == 'true' ]] ||
+				die 'Dead Compose container state is internally inconsistent.'
+			;;
+		*)
+			die 'Compose container is paused, restarting, removing or in an unknown state.'
+			;;
+	esac
+
+	printf '%s|%s|%s|%s|%s|%s|%s\n' \
+		"$container_id" "$container_name" "$state" "$service_name" \
+		"$container_number" "$oneoff" "$config_hash"
+}
+
+collect_validated_project_container_inventory() {
+	local container_ids container_id
+	container_ids="$(
+		docker ps -aq --no-trunc \
+			--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" |
+			LC_ALL=C sort
+	)" || die 'Cannot read the exact production Compose container inventory.'
+	[[ -n "$container_ids" ]] ||
+		die 'Production Compose container inventory is empty.'
+	while IFS= read -r container_id; do
+		[[ -n "$container_id" ]] || continue
+		inspect_validated_project_container "$container_id"
+	done <<<"$container_ids"
+}
+
 verify_exact_project_container_inventory() {
-	local inventory container_id project_name service_name state extra_field
+	local inventory container_id container_name state service_name
+	local container_number oneoff config_hash extra_field
 	local expected_services actual_services
 	local -a observed_services=()
 	expected_services="$({
 		printf '%s\n' "${infrastructure_services[@]}"
 		printf '%s\n' "${runtime_services[@]}"
 	} | LC_ALL=C sort)"
-	inventory="$(
-		docker ps -a --no-trunc \
-			--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
-			--format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}|{{.State}}'
-	)" || die 'Cannot read the exact production Compose container inventory.'
-	[[ -n "$inventory" ]] ||
-		die 'Production Compose container inventory is empty.'
-	while IFS='|' read -r container_id project_name service_name state extra_field; do
+	inventory="$(collect_validated_project_container_inventory)" ||
+		die 'Cannot validate the production Compose container inventory.'
+	while IFS='|' read -r container_id container_name state service_name \
+		container_number oneoff config_hash extra_field; do
 		[[ "$container_id" =~ ^[0-9a-f]{64}$ &&
-			"$project_name" == "$COMPOSE_PROJECT_NAME" &&
+			"$container_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ &&
 			"$service_name" =~ ^[a-z0-9][a-z0-9-]*$ &&
-			"$state" == 'running' && -z "$extra_field" ]] ||
-			die 'Production Compose container inventory contains an invalid entry.'
-		observed_services+=("$service_name")
+			"$container_number" =~ ^[1-9][0-9]*$ &&
+			"$oneoff" =~ ^(True|False)$ &&
+			"$config_hash" =~ ^[0-9a-f]{64}$ && -z "$extra_field" ]] ||
+			die 'Validated Compose container inventory contains an invalid entry.'
+		if [[ "$state" == 'running' ]]; then
+			observed_services+=("$service_name")
+		fi
 	done <<<"$inventory"
 	actual_services="$(printf '%s\n' "${observed_services[@]}" | LC_ALL=C sort)"
 	[[ "$actual_services" == "$expected_services" ]] ||
-		die 'Live Compose project service inventory differs from the exact manifest contract.'
+		die 'Live running Compose service inventory differs from the exact manifest contract.'
 }
+
+capture_running_container_ids() {
+	local running_ids container_id
+	running_ids="$(docker ps --no-trunc --format '{{.ID}}' | LC_ALL=C sort)" ||
+		die 'Cannot capture the global running Docker container inventory.'
+	[[ -n "$running_ids" ]] ||
+		die 'Global running Docker container inventory is empty.'
+	while IFS= read -r container_id; do
+		[[ "$container_id" =~ ^[0-9a-f]{64}$ ]] ||
+			die 'Global running Docker container inventory is ambiguous.'
+	done <<<"$running_ids"
+	printf '%s\n' "$running_ids"
+}
+
+capture_container_image_bindings() {
+	local container_ids container_id binding inspected_id image_id extra_field
+	local -a bindings=()
+	container_ids="$(docker ps -aq --no-trunc | LC_ALL=C sort)" ||
+		die 'Cannot capture the global Docker container inventory.'
+	[[ -n "$container_ids" ]] ||
+		die 'Global Docker container inventory is empty.'
+	while IFS= read -r container_id; do
+		[[ "$container_id" =~ ^[0-9a-f]{64}$ ]] ||
+			die 'Global Docker container inventory contains an invalid ID.'
+		binding="$(
+			docker container inspect --format '{{.Id}}|{{.Image}}' "$container_id"
+		)" || die 'Cannot inspect a protected Docker container image binding.'
+		IFS='|' read -r inspected_id image_id extra_field <<<"$binding"
+		[[ "$inspected_id" == "$container_id" &&
+			"$image_id" =~ ^sha256:[0-9a-f]{64}$ && -z "$extra_field" ]] ||
+			die 'Docker container image binding is ambiguous.'
+		bindings+=("$inspected_id|$image_id")
+	done <<<"$container_ids"
+	printf '%s\n' "${bindings[@]}" | LC_ALL=C sort
+}
+
+collect_obsolete_winwidget_image_references() {
+	local protected_bindings="$1" image_inventory repository tag image_id
+	local _digest extra_field image_reference seen_references=$'\n'
+	local -a candidates=()
+	image_inventory="$(
+		docker image ls --no-trunc \
+			--format '{{.Repository}}|{{.Tag}}|{{.ID}}|{{.Digest}}'
+	)" || die 'Cannot inspect the Docker image inventory.'
+	while IFS='|' read -r repository tag image_id _digest extra_field; do
+		[[ -z "$extra_field" ]] ||
+			die 'Docker image inventory contains an ambiguous entry.'
+		[[ "$repository" == winwidget-* ]] || continue
+		[[ "$repository" =~ ^winwidget-[a-z0-9][a-z0-9._-]*$ &&
+			"$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ &&
+			"$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+			die 'A WinWidget image reference is not safe for exact cleanup.'
+		image_reference="$repository:$tag"
+		[[ "$seen_references" != *$'\n'"$image_reference"$'\n'* ]] ||
+			die 'A WinWidget image reference is duplicated in Docker inventory.'
+		seen_references+="$image_reference"$'\n'
+		if ! awk -F'|' -v expected_image="$image_id" \
+			'$2 == expected_image { found = 1 } END { exit(found ? 0 : 1) }' \
+			<<<"$protected_bindings"; then
+			candidates+=("$image_reference|$image_id")
+		fi
+	done <<<"$image_inventory"
+	if ((${#candidates[@]})); then
+		printf '%s\n' "${candidates[@]}" | LC_ALL=C sort
+	fi
+}
+
+verify_project_has_no_stopped_containers() {
+	local inventory container_id container_name state service_name
+	local container_number oneoff config_hash extra_field
+	inventory="$(collect_validated_project_container_inventory)" ||
+		die 'Cannot validate Compose inventory after exact cleanup.'
+	while IFS='|' read -r container_id container_name state service_name \
+		container_number oneoff config_hash extra_field; do
+		[[ "$state" == 'running' && -z "$extra_field" ]] ||
+			die 'A stopped Compose project container remains after exact cleanup.'
+	done <<<"$inventory"
+}
+
+cleanup_obsolete_winwidget_docker_resources() {
+	local running_ids_before running_ids_current running_ids_after
+	local project_inventory expected_record current_record
+	local container_id container_name state service_name container_number oneoff
+	local config_hash extra_field container_candidate_count=0
+	local protected_bindings_before protected_bindings_current protected_bindings_after
+	local image_candidates image_reference image_id resolved_image_id
+	local image_candidate_count=0 remaining_candidates
+	local -a container_candidates=()
+	local -a obsolete_image_candidates=()
+
+	running_ids_before="$(capture_running_container_ids)" ||
+		die 'Cannot preserve the running Docker container set before cleanup.'
+	project_inventory="$(collect_validated_project_container_inventory)" ||
+		die 'Cannot inspect exact stopped Compose cleanup candidates.'
+	while IFS='|' read -r container_id container_name state service_name \
+		container_number oneoff config_hash extra_field; do
+		[[ -z "$extra_field" ]] ||
+			die 'Stopped Compose cleanup candidate is ambiguous.'
+		if [[ "$state" != 'running' ]]; then
+			container_candidates+=(
+				"$container_id|$container_name|$state|$service_name|$container_number|$oneoff|$config_hash"
+			)
+		fi
+	done <<<"$project_inventory"
+
+	if ((${#container_candidates[@]})); then
+		for expected_record in "${container_candidates[@]}"; do
+			IFS='|' read -r container_id container_name state service_name \
+				container_number oneoff config_hash extra_field <<<"$expected_record"
+			[[ "$state" =~ ^(created|exited|dead)$ && -z "$extra_field" ]] ||
+				die 'Stopped Compose cleanup target changed classification.'
+			running_ids_current="$(capture_running_container_ids)" ||
+				die 'Cannot recheck running containers before exact container removal.'
+			[[ "$running_ids_current" == "$running_ids_before" ]] ||
+				die 'Running Docker container set changed during stopped-container cleanup.'
+			current_record="$(inspect_validated_project_container "$container_id")" ||
+				die 'Cannot revalidate an exact stopped Compose cleanup target.'
+			[[ "$current_record" == "$expected_record" ]] ||
+				die 'Stopped Compose cleanup target changed after inventory capture.'
+			docker container rm -- "$container_id" >/dev/null ||
+				die 'Exact stopped Compose container removal failed.'
+			if docker container inspect "$container_id" >/dev/null 2>&1; then
+				die 'Exact stopped Compose container still exists after removal.'
+			fi
+			container_candidate_count=$((container_candidate_count + 1))
+		done
+	fi
+
+	running_ids_current="$(capture_running_container_ids)" ||
+		die 'Cannot recheck running containers after stopped-container cleanup.'
+	[[ "$running_ids_current" == "$running_ids_before" ]] ||
+		die 'Running Docker container set changed after stopped-container cleanup.'
+	verify_project_has_no_stopped_containers
+	verify_exact_project_container_inventory
+
+	protected_bindings_before="$(capture_container_image_bindings)" ||
+		die 'Cannot preserve container image bindings before image cleanup.'
+	image_candidates="$(
+		collect_obsolete_winwidget_image_references "$protected_bindings_before"
+	)" || die 'Cannot classify unused WinWidget image references.'
+	if [[ -n "$image_candidates" ]]; then
+		while IFS= read -r expected_record; do
+			[[ -n "$expected_record" ]] || continue
+			obsolete_image_candidates+=("$expected_record")
+		done <<<"$image_candidates"
+	fi
+
+	if ((${#obsolete_image_candidates[@]})); then
+		for expected_record in "${obsolete_image_candidates[@]}"; do
+			IFS='|' read -r image_reference image_id extra_field <<<"$expected_record"
+			[[ "$image_reference" =~ ^winwidget-[a-z0-9][a-z0-9._-]*:[A-Za-z0-9_][A-Za-z0-9_.-]*$ &&
+				"$image_id" =~ ^sha256:[0-9a-f]{64}$ && -z "$extra_field" ]] ||
+				die 'Unused WinWidget image cleanup target is ambiguous.'
+			protected_bindings_current="$(capture_container_image_bindings)" ||
+				die 'Cannot recheck protected image bindings before exact image removal.'
+			[[ "$protected_bindings_current" == "$protected_bindings_before" ]] ||
+				die 'Docker container image bindings changed during image cleanup.'
+			resolved_image_id="$(
+				docker image inspect --format '{{.Id}}' "$image_reference"
+			)" || die 'Unused WinWidget image reference disappeared before cleanup.'
+			[[ "$resolved_image_id" == "$image_id" ]] ||
+				die 'Unused WinWidget image reference changed after inventory capture.'
+			if awk -F'|' -v expected_image="$image_id" \
+				'$2 == expected_image { found = 1 } END { exit(found ? 0 : 1) }' \
+				<<<"$protected_bindings_current"; then
+				die 'A cleanup image became attached to a Docker container.'
+			fi
+			running_ids_current="$(capture_running_container_ids)" ||
+				die 'Cannot recheck running containers before exact image removal.'
+			[[ "$running_ids_current" == "$running_ids_before" ]] ||
+				die 'Running Docker container set changed before exact image removal.'
+			docker image rm --no-prune -- "$image_reference" >/dev/null ||
+				die 'Exact unused WinWidget image reference removal failed.'
+			running_ids_current="$(capture_running_container_ids)" ||
+				die 'Cannot recheck running containers after exact image removal.'
+			[[ "$running_ids_current" == "$running_ids_before" ]] ||
+				die 'Running Docker container set changed after exact image removal.'
+			if docker image inspect "$image_reference" >/dev/null 2>&1; then
+				die 'Unused WinWidget image reference still exists after removal.'
+			fi
+			image_candidate_count=$((image_candidate_count + 1))
+		done
+	fi
+
+	protected_bindings_after="$(capture_container_image_bindings)" ||
+		die 'Cannot verify container image bindings after image cleanup.'
+	[[ "$protected_bindings_after" == "$protected_bindings_before" ]] ||
+		die 'Docker container image bindings changed after image cleanup.'
+	remaining_candidates="$(
+		collect_obsolete_winwidget_image_references "$protected_bindings_after"
+	)" || die 'Cannot verify the final WinWidget image inventory.'
+	[[ -z "$remaining_candidates" ]] ||
+		die 'An unused tagged WinWidget image remains after exact cleanup.'
+	running_ids_after="$(capture_running_container_ids)" ||
+		die 'Cannot verify running containers after Docker cleanup.'
+	[[ "$running_ids_after" == "$running_ids_before" ]] ||
+		die 'Running Docker container set changed during exact Docker cleanup.'
+	verify_project_has_no_stopped_containers
+	verify_exact_project_container_inventory
+
+	printf 'Exact WinWidget Docker cleanup completed: stopped_containers=%s image_references=%s\n' \
+		"$container_candidate_count" "$image_candidate_count"
+}
+# END WINWIDGET_DOCKER_CLEANUP
 
 verify_operations_database_boundary() {
 	compose_all run --rm --no-deps --interactive \
@@ -1497,23 +1781,6 @@ docker_volume_exists() {
 	volume_inventory="$(docker volume ls --format '{{.Name}}')" ||
 		die 'Cannot read Docker volume inventory.'
 	grep -Fqx -- "$volume_name" <<<"$volume_inventory"
-}
-
-find_project_service_container() {
-	local service_name="$1" container_ids
-	container_ids="$(
-		docker ps -aq \
-			--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
-			--filter "label=com.docker.compose.service=$service_name"
-	)" || die "Cannot read exact project service inventory: $service_name"
-	[[ "$container_ids" != *$'\n'* ]] ||
-		die "Multiple containers found for exact project service: $service_name"
-	if [[ -n "$container_ids" ]]; then
-		[[ "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}|{{ index .Config.Labels "com.docker.compose.service" }}' "$container_ids")" == \
-			"$COMPOSE_PROJECT_NAME|$service_name" ]] ||
-			die "Container labels differ from exact cleanup target: $service_name"
-	fi
-	printf '%s' "$container_ids"
 }
 
 notification_topology_contract="$(
@@ -2430,24 +2697,28 @@ const sleep = milliseconds =>
 VERIFY_CURRENT_REPORTING_ROUTING
 }
 
-verify_steady_state() {
+verify_steady_state_phase() {
+	local phase="$1"
 	local rabbitmq_container_id queue_name actual_rabbitmq_user_names
-	local remaining_legacy_queues listener_inventory retired_service entry_path
-	local retired_container_id core_container_id
+	local remaining_legacy_queues listener_inventory entry_path core_container_id
 	local -a legacy_queue_names=()
 	local -a legacy_rabbitmq_users=(
 		winwidget-publisher
 		winwidget-integration
 		winwidget-maintenance
 	)
-	local -a retired_compose_services=(
-		api
-		outbox-publisher
-		integration-worker
-		maintenance-worker
-		database-restore-worker
-		migrate
-	)
+	[[ "$phase" == 'pre_cleanup' || "$phase" == 'post_cleanup' ]] ||
+		die 'Unknown steady-state verification phase.'
+
+	# In both phases every project container must first pass exact Compose
+	# identity/state validation and the running services must match the manifest.
+	# Pre-cleanup may therefore contain only strictly validated stopped targets.
+	verify_exact_project_container_inventory
+	if [[ "$phase" == 'post_cleanup' ]]; then
+		# Together with the exact running manifest this also proves that no retired
+		# project service remains in either running or stopped state.
+		verify_project_has_no_stopped_containers
+	fi
 	verify_current_reporting_routing_projection
 	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
 	[[ -n "$rabbitmq_container_id" && "$rabbitmq_container_id" != *$'\n'* ]] ||
@@ -2508,12 +2779,6 @@ verify_steady_state() {
 			die "Legacy RabbitMQ user remains in steady state: $legacy_user"
 		fi
 	done
-	for retired_service in "${retired_compose_services[@]}"; do
-		retired_container_id="$(find_project_service_container "$retired_service")"
-		[[ -z "$retired_container_id" ]] ||
-			die "Retired Compose container remains in steady state: $retired_service"
-	done
-
 	core_container_id="$(
 		find_exact_named_container winwidget-core-postgres-temporary
 	)"
@@ -2542,7 +2807,6 @@ verify_steady_state() {
 		<<<"$listener_inventory"; then
 		die 'A listener remains on the retired Core port 4200.'
 	fi
-	verify_exact_project_container_inventory
 }
 
 compose_all up -d --no-build --force-recreate "${runtime_without_gateway[@]}"
@@ -2755,7 +3019,9 @@ done
 [[ "$(service_env_manifest_sha256)" == "$service_env_manifest_sha256_before" ]] ||
 	die 'A service-owned production env changed during deployment.'
 
-verify_steady_state
+verify_steady_state_phase pre_cleanup
+cleanup_obsolete_winwidget_docker_resources
+verify_steady_state_phase post_cleanup
 wait_for_healthy_services "${runtime_services[@]}"
 verify_telegram_proxy_health ||
 	die 'Pinned Telegram proxy health check failed after steady-state verification.'

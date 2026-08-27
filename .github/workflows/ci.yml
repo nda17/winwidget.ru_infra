@@ -64,6 +64,10 @@ jobs:
             puts workflow.fetch("jobs").fetch("deploy").fetch("steps").last.fetch("run")
           ' | shellcheck -s bash -
 
+      - name: Verify exact production Docker cleanup contract
+        shell: bash
+        run: node scripts/test-production-docker-cleanup-contract.mjs
+
       - name: Verify steady-state-only contracts
         shell: bash
         run: |
@@ -170,11 +174,11 @@ jobs:
               `retired runtime dependency: ${retiredRuntimeDependency}`
             );
           }
-          if (/\bphase\b/i.test(script)) {
+          if (/\b(?:ownership|cutover)[_-]?phase\b/i.test(script)) {
             fail('routine controller must not depend on an ownership phase');
           }
           if (/\bdocker\s+(?:rm|volume\s+rm)\b/.test(script)) {
-            fail('routine controller must not delete Docker resources');
+            fail('routine controller contains a broad Docker removal');
           }
           if (/\brm\s+-rf\b/.test(script) || script.includes('.deleteQueue(')) {
             fail('routine controller contains a broad or queue deletion');
@@ -182,8 +186,8 @@ jobs:
 
           requireText(
             script,
-            'verify_steady_state()',
-            'steady-state verifier is missing'
+            'verify_steady_state_phase()',
+            'phased steady-state verifier is missing'
           );
           for (const evidence of [
             'verify_operations_database_boundary()',
@@ -195,7 +199,17 @@ jobs:
             "identityRows[0].databaseUser !== 'winwidget_operations_runtime'",
             "identityRows[0].schemaName !== 'operations'",
             "rows[0].serviceName !== 'operations-service'",
-            'Live Compose project service inventory differs from the exact manifest contract',
+            'Live running Compose service inventory differs from the exact manifest contract',
+            'cleanup_obsolete_winwidget_docker_resources()',
+            'verify_steady_state_phase pre_cleanup',
+            'verify_steady_state_phase post_cleanup',
+            'verify_project_has_no_stopped_containers',
+            'Running Docker container set changed before exact image removal',
+            'Running Docker container set changed after exact image removal',
+            'docker image rm --no-prune -- "$image_reference"',
+            'Running Docker container set changed during exact Docker cleanup',
+            'Docker container image bindings changed after image cleanup',
+            'An unused tagged WinWidget image remains after exact cleanup',
             'Legacy RabbitMQ queue remains in steady state',
             'Legacy RabbitMQ user remains in steady state',
             'Temporary Core PostgreSQL container remains in steady state',
@@ -222,7 +236,7 @@ jobs:
             databaseBoundaryStart,
             infrastructureStart
           );
-          const steadyStart = script.indexOf('verify_steady_state()');
+          const steadyStart = script.indexOf('verify_steady_state_phase()');
           const convergenceStart = script.indexOf(
             'verify_current_reporting_routing_projection()'
           );
@@ -290,8 +304,48 @@ jobs:
           ) {
             fail('steady-state preflight or post-migration identity order is invalid');
           }
+          const cleanupCall = script.indexOf(
+            '\ncleanup_obsolete_winwidget_docker_resources\n'
+          );
+          const preCleanupSteadyStateCall = script.lastIndexOf(
+            '\nverify_steady_state_phase pre_cleanup\n',
+            cleanupCall
+          );
+          const postCleanupSteadyStateCall = script.indexOf(
+            '\nverify_steady_state_phase post_cleanup\n',
+            cleanupCall
+          );
+          if (
+            preCleanupSteadyStateCall < runtimeRolloutStart ||
+            cleanupCall <= preCleanupSteadyStateCall ||
+            postCleanupSteadyStateCall <= cleanupCall
+          ) {
+            fail('destructive cleanup is not enclosed by complete steady-state gates');
+          }
 
           rejectText(workflow, 'mode:', 'deploy workflow still exposes a mode');
+          rejectText(
+            workflow,
+            'workflow_dispatch:',
+            'deploy workflow still exposes a manual trigger'
+          );
+          for (const evidence of [
+            'workflow_call:',
+            "github.repository == 'nda17/winwidget.ru_services'",
+            "github.event_name == 'push'",
+            "github.ref == 'refs/heads/prod'",
+            'inputs.services_revision == github.sha',
+            'repository: ${{ job.workflow_repository }}',
+            'ref: ${{ job.workflow_sha }}',
+            'CONTROLLER_REVISION: ${{ job.workflow_sha }}',
+            'SERVICES_REVISION: ${{ inputs.services_revision }}'
+          ]) {
+            requireText(
+              workflow,
+              evidence,
+              `immutable reusable deploy evidence is missing: ${evidence}`
+            );
+          }
           requireText(
             workflow,
             'bash scripts/deploy-services-production.sh "$SERVICES_REVISION"',
@@ -910,8 +964,8 @@ jobs:
           }
           for (const evidence of [
             'steady-state',
-            'одну опциональную группу',
-            'без изменения frontend Nginx',
+            'Backend release-job не передаёт frontend SSH credentials',
+            'явно пропускает установку frontend Nginx',
             'read-only DB boundary preflight',
             'Compose inventory',
             'routing projection'

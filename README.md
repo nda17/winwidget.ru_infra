@@ -13,15 +13,18 @@ Production-секреты и файлы `.env.production` никогда не х
 
 ## Контракт production-деплоя
 
-Единственная точка входа — запускаемый вручную workflow
-[`deploy-production.yml`](.github/workflows/deploy-production.yml).
-Ревизией самого workflow служит неизменяемая 40-символьная hex-ревизия infra.
-Workflow также принимает неизменяемый 40-символьный commit в нижнем регистре из
-`winwidget.ru_services` и по SSH, с закреплённым ключом хоста, запускает
+Единственная точка входа — reusable workflow
+[`deploy-production.yml`](.github/workflows/deploy-production.yml), закреплённый
+в вызывающем workflow неизменяемым 40-символьным SHA infra. Его вызывает только
+release-job репозитория `nda17/winwidget.ru_services` после push точного commit
+в `prod` и успешного завершения lifecycle gate и всей матрицы сервисов. Ручного
+`workflow_dispatch` и ввода произвольного SHA нет.
+
+Called workflow fail closed проверяет canonical caller, событие `push`, ветку
+`refs/heads/prod` и равенство `services_revision == github.sha`. Собственный
+infra controller он получает по `job.workflow_repository` и
+`job.workflow_sha`, после чего по SSH с закреплённым ключом хоста запускает
 [`deploy-services-production.sh`](scripts/deploy-services-production.sh).
-Production-job выполняется только при запуске workflow из канонической ветки
-`master`; теги и другие ветки отклоняются до предоставления секретов
-окружения.
 
 Отдельный workflow [`Verify infrastructure`](.github/workflows/ci.yml)
 запускается на каждый push и pull request. Он не использует production secrets
@@ -43,33 +46,29 @@ users. После migrations и до rollout он требует единств�
 
 ## Production-окружение GitHub
 
-Создайте защищённое GitHub Environment с именем `production`. Назначьте нужных
-reviewer-ов и ограничьте круг пользователей, которые могут запускать workflow.
-Настройте следующие секреты:
+В репозитории `winwidget.ru_services` настройте следующие repository-level
+Actions secrets. Release-job передаёт их reusable workflow под его внутренними
+именами. Caller/event/ref/SHA gates допускают только автоматический выпуск после
+зелёного push в `prod`; ручного production job и отдельного источника секретов
+в infra-репозитории нет.
 
-| Секрет                                | Назначение                                                                                                        |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `BACKEND_PRODUCTION_SSH_HOST`         | Имя хоста или IPv4-адрес backend VPS                                                                              |
-| `BACKEND_PRODUCTION_SSH_PORT`         | SSH-порт                                                                                                          |
-| `BACKEND_PRODUCTION_SSH_USER`         | Отдельный пользователь деплоя; текущему контроллеру требуется root                                                |
-| `BACKEND_PRODUCTION_SSH_PRIVATE_KEY`  | Незашифрованный ключ деплоя, ограниченный этим VPS                                                                |
-| `BACKEND_PRODUCTION_SSH_KNOWN_HOSTS`  | Заранее проверенная закреплённая строка ключа хоста; никогда не создавайте её через `ssh-keyscan` внутри workflow |
-| `FRONTEND_PRODUCTION_SSH_HOST`        | Опционально: имя хоста или IPv4-адрес frontend VPS                                                                |
-| `FRONTEND_PRODUCTION_SSH_PORT`        | Опционально: SSH-порт frontend VPS                                                                                |
-| `FRONTEND_PRODUCTION_SSH_USER`        | Опционально: отдельный root-пользователь деплоя frontend Nginx                                                    |
-| `FRONTEND_PRODUCTION_SSH_PRIVATE_KEY` | Опционально: незашифрованный ключ, ограниченный frontend VPS                                                      |
-| `FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS` | Опционально: заранее проверенная закреплённая строка ключа frontend VPS                                           |
-| `BACKEND_PRODUCTION_ENV_SHA256`       | SHA-256 побайтово идентичного канонического backend-файла `.env.production`                                       |
+| Секрет                               | Назначение                                                                                                        |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `PRODUCTION_SSH_HOST`                | Имя хоста или IPv4-адрес backend VPS                                                                              |
+| `PRODUCTION_SSH_PORT`                | SSH-порт                                                                                                          |
+| `PRODUCTION_SSH_USER`                | Отдельный пользователь деплоя; текущему контроллеру требуется root                                                |
+| `PRODUCTION_SSH_PRIVATE_KEY`         | Незашифрованный ключ деплоя, ограниченный этим VPS                                                                |
+| `BACKEND_PRODUCTION_SSH_KNOWN_HOSTS` | Заранее проверенная закреплённая строка ключа хоста; никогда не создавайте её через `ssh-keyscan` внутри workflow |
+| `BACKEND_PRODUCTION_ENV_SHA256`      | SHA-256 побайтово идентичного канонического backend-файла `.env.production`                                       |
 
 Ключ деплоя нельзя повторно использовать для доступа к GitHub-репозиторию.
 Checkout на VPS использует отдельный заранее установленный read-only deploy
 key.
 
-Пять `FRONTEND_*` secrets образуют одну опциональную группу: при отсутствии
-всей группы backend-деплой выполняется без изменения frontend Nginx; частичная
-группа отклоняется. Это позволяет не копировать frontend credentials в infra
-только ради backend-релиза. Frontend image по-прежнему выпускается собственным
-workflow репозитория `winwidget.ru_client`.
+Backend release-job не передаёт frontend SSH credentials. Поэтому reusable
+workflow явно пропускает установку frontend Nginx, а frontend image и его Nginx
+выпускаются собственным workflow репозитория `winwidget.ru_client` после push в
+`prod`.
 
 При изменении production env сначала соблюдайте правило двусторонней
 синхронизации: сравните локальный файл с файлом на VPS, обновите канонический
@@ -152,8 +151,10 @@ Compose-манифест из этого неизменяемого катало
 
 ## Обычный деплой
 
-Запустите workflow `Deploy production services` и вставьте SHA зелёного commit
-сервисов. Далее контроллер:
+Отправьте выпускаемый commit в `winwidget.ru_services/prod`. После зелёных
+lifecycle gate и полной матрицы сервисов release-job автоматически вызывает
+закреплённый immutable SHA reusable workflow infra и передаёт ровно
+`github.sha`; ручной запуск или ввод SHA не используется. Далее контроллер:
 
 1. захватывает фиксированный production-lock;
 2. до начала работы проверяет канонический env;
@@ -169,8 +170,9 @@ Compose-манифест из этого неизменяемого катало
    upstream и усиленную защиту Operations restore-worker;
 8. запускает девять сервисов PostgreSQL и RabbitMQ, затем до изменения
    RabbitMQ users/permissions и до миграций read-only проверяет имя Operations
-   DB, schema/role boundaries, текущие critical tables, точный live Compose
-   inventory и точный текущий RabbitMQ user inventory;
+   DB, schema/role boundaries, текущие critical tables, точный набор работающих
+   Compose services, безопасную идентичность остановленных cleanup-кандидатов
+   и точный текущий RabbitMQ user inventory;
 9. создаёт точные принадлежащие сервисам identities/permissions RabbitMQ и
    выполняет все девять миграций, после чего до rollout проверяет единственный
    текущий `operations.service_identity`;
@@ -179,15 +181,31 @@ Compose-манифест из этого неизменяемого катало
     последним запускает Gateway;
 11. проверяет health контейнеров, точные ID образов, локальную readiness,
     публичную ревизию деплоя Gateway, согласованность текущего Telegram routing
-    Operations с Reporting projection, точный набор live Compose containers,
-    отсутствие retired Core routes, queues, users, контейнеров, volume,
-    артефактов и listener `:4200`, а также неизменность hash env.
-12. при настроенной полной группе `FRONTEND_*` устанавливает и проверяет tracked
+    Operations с Reporting projection и неизменность hash env;
+12. до любой очистки выполняет полный недеструктивный steady-state gate:
+    повторно проверяет routing, legacy queues/users, точный RabbitMQ user
+    inventory, временные Core container/volume/артефакты, listener `:4200` и
+    точный набор работающих сервисов. Допускаются только остановленные
+    Compose-кандидаты с уже строго проверенными labels/name/state;
+13. только после зелёного pre-cleanup gate удаляет остановленные контейнеры с точно
+    совпавшими Compose labels/name проекта `winwidget`, сохраняя и сравнивая
+    полный набор ID работающих контейнеров до/после. Затем удаляет только теги
+    локальных семейств `winwidget-*`, чей image ID не привязан ни к одному
+    оставшемуся контейнеру. Перед и сразу после каждого `image rm --no-prune`
+    повторно сравнивает running IDs, а также все container/image bindings;
+14. повторяет полный steady-state gate и требует отсутствия любых retired или
+    остановленных project containers, legacy routes/queues/users, временных
+    Core container/volume/артефактов и listener `:4200`;
+15. при настроенной полной группе `FRONTEND_*` устанавливает и проверяет tracked
     frontend Nginx на отдельном VPS и подтверждает доступность
     `https://winwidget.ru/`; без группы явно пропускает только этот шаг.
 
-Контроллер не использует `latest`, `--remove-orphans`, широкую очистку Docker
-или восстановление канонического production env из примеров.
+Контроллер не использует `latest`, `--remove-orphans`, `prune`, принудительное
+удаление, очистку volumes/networks/build cache или восстановление канонического
+production env из примеров. Контейнеры других Compose projects, любой
+`running`/`restarting`/`paused` container, образы с хотя бы одним container
+binding и неатрибутируемые `<none>` images не являются cleanup-target;
+`--no-prune` обязателен для каждого точного удаления image reference.
 
 ## Локальная статическая проверка
 

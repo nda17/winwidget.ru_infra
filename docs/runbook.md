@@ -66,6 +66,13 @@ Telegram bridge VPS
    остался важный риск.
 8. Создать commit, дождаться green CI exact SHA и только затем выпускать.
 
+Backend production выпускается только цепочкой `push` exact commit в
+`winwidget.ru_services/prod` → зелёные lifecycle gate и полная service matrix →
+release-job, вызывающий `winwidget.ru_infra/.github/workflows/deploy-production.yml`
+по заранее проверенному immutable infra SHA. `workflow_dispatch`, ручной ввод
+services SHA и прямой запуск controller с рабочей машины не являются release
+path.
+
 Минимальный набор проверок выбирается пропорционально риску:
 
 - форматирование и lint изменённых файлов;
@@ -123,18 +130,17 @@ Production backend release задаётся двумя immutable SHA:
 ### Backend services
 
 1. Проверить CI exact services/infra revisions.
-2. Проверить production deploy lock и отсутствие другого активного rollout.
-3. Сравнить локальный и VPS production env без вывода значений секретов.
-4. Запустить только канонический infra workflow/script.
-5. Дождаться migrations и rollout exact application revisions.
-6. Выполнить полный checklist ниже.
+2. Отправить exact services commit в `winwidget.ru_services/prod`.
+3. Дождаться lifecycle gate, полной service matrix и автоматически вызванного
+   reusable infra workflow.
+4. Дождаться migrations и rollout exact application revisions.
+5. Выполнить полный checklist ниже.
 
 Исполняемая реализация —
-`winwidget.ru_infra/scripts/deploy-services-production.sh`. Если GitHub Actions
-временно недоступен, ручной fallback выполняется тем же каноническим script с
-теми же exact revisions, production lock, env checks и post-deploy gates. Ad
-hoc Compose поверх production запрещён. После восстановления Actions состояние
-обязательно сверяется новым routine deploy.
+`winwidget.ru_infra/scripts/deploy-services-production.sh`, но её запускает
+только закреплённый reusable workflow после зелёного push в `prod`. При
+недоступности GitHub Actions выпуск ожидает восстановления CI/CD: прямой запуск
+controller с рабочей машины и ad hoc Compose поверх production запрещены.
 
 Обычный deploy не удаляет и не пересоздаёт внешние PostgreSQL volumes.
 PostgreSQL-контейнеры и RabbitMQ обычно остаются запущенными, но Compose может
@@ -308,7 +314,9 @@ frontend Nginx, но не устанавливает bridge-конфигурац
 
 ### До запуска
 
-- [ ] Выбраны exact services и infra revisions с зелёным required CI.
+- [ ] Exact services revision является `github.sha` push-события в `prod`, вся
+      service matrix зелёная, а reusable infra workflow закреплён по exact
+      revision с зелёным required CI.
 - [ ] Выпускаемые рабочие деревья чистые.
 - [ ] Изменения DB имеют service-owned migration и при необходимости проверены
       на чистой PostgreSQL 18.
@@ -329,14 +337,17 @@ frontend Nginx, но не устанавливает bridge-конфигурац
 - [ ] Зафиксирована current Gateway/public revision.
 - [ ] До любых RabbitMQ mutations и миграций read-only preflight подтвердил
       имя Operations DB, schema/role boundaries, текущие critical tables,
-      точный live Compose inventory и текущий RabbitMQ user inventory.
-- [ ] Negative invariants verifier подтверждает отсутствие legacy Core
-      containers, listener `:4200`, users, queues и fallback routes.
+      точный набор running Compose services, идентичность остановленных
+      project cleanup-кандидатов и текущий RabbitMQ user inventory.
+- [ ] Остановленные containers других Compose projects не включены в target;
+      `paused`, `restarting`, `removing` и неоднозначные labels/name блокируют
+      cleanup fail closed.
 
 ### Выполнение backend deploy
 
-- [ ] Используется только канонический infra workflow/script, services checkout
-      соответствует exact revision.
+- [ ] Release-job после зелёной service matrix вызвал только закреплённый по SHA
+      reusable infra workflow; canonical caller/event/ref/input gates зелёные,
+      services checkout соответствует exact `github.sha`.
 - [ ] Migration jobs используют отдельные migration credentials; runtime не
       получает admin/backup credentials.
 - [ ] После migrations и до rollout подтверждён единственный
@@ -347,13 +358,29 @@ frontend Nginx, но не устанавливает bridge-конфигурац
       config drift данные остаются во внешнем volume.
 - [ ] Nginx configuration проходит syntax check до reload.
 - [ ] RabbitMQ topology создаётся только из текущих service-owned contracts.
+- [ ] После health/public revision, Telegram proxy и env-integrity gates, но до
+      cleanup полностью прошёл недеструктивный steady-state gate: routing,
+      legacy queues/users, exact RabbitMQ users, временные Core
+      container/volume/артефакты, listener `:4200` и exact running services.
+      Остановленные project containers уже прошли строгую проверку
+      labels/name/state.
+- [ ] Удалены только stopped containers точного Compose project `winwidget` и
+      только неиспользуемые теги семейств `winwidget-*`; image ID каждого
+      оставшегося container не изменился. Перед и сразу после каждого
+      `docker image rm --no-prune` running ID set совпал с baseline.
+- [ ] Volumes, networks, BuildKit/build cache, images других семейств и
+      `<none>` images не очищались; `prune`, `--force` и `--remove-orphans` не
+      использовались.
 
 ### Проверка после backend deploy
 
 - [ ] Local Gateway readiness возвращает `200`.
 - [ ] Public deployment endpoint возвращает `200` и exact services revision.
 - [ ] Каждый ожидаемый container healthy и использует exact image/revision;
-      лишних runtime containers нет.
+      лишних runtime и остановленных project containers нет.
+- [ ] После cleanup повторно полностью прошёл steady-state gate; отсутствуют
+      retired/stopped project containers и все проверяемые legacy/Core
+      invariants остаются истинными.
 - [ ] Текущее значение Telegram operational alerts в Operations совпадает с
       Reporting projection, а активный RabbitMQ binding единственный.
 - [ ] Negative invariants про `:4200`, legacy users/queues и fallback routes

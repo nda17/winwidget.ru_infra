@@ -1,12 +1,35 @@
 name: Deploy production services
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       services_revision:
         description: Immutable lowercase 40-hex winwidget.ru_services commit
         required: true
         type: string
+    secrets:
+      BACKEND_PRODUCTION_SSH_HOST:
+        required: true
+      BACKEND_PRODUCTION_SSH_PORT:
+        required: true
+      BACKEND_PRODUCTION_SSH_USER:
+        required: true
+      BACKEND_PRODUCTION_SSH_PRIVATE_KEY:
+        required: true
+      BACKEND_PRODUCTION_SSH_KNOWN_HOSTS:
+        required: true
+      BACKEND_PRODUCTION_ENV_SHA256:
+        required: true
+      FRONTEND_PRODUCTION_SSH_HOST:
+        required: false
+      FRONTEND_PRODUCTION_SSH_PORT:
+        required: false
+      FRONTEND_PRODUCTION_SSH_USER:
+        required: false
+      FRONTEND_PRODUCTION_SSH_PRIVATE_KEY:
+        required: false
+      FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS:
+        required: false
 
 permissions:
   contents: read
@@ -18,23 +41,40 @@ concurrency:
 jobs:
   deploy:
     name: Deploy immutable services revision
-    if: github.ref_type == 'branch' && github.ref == 'refs/heads/master'
+    if: >-
+      github.repository == 'nda17/winwidget.ru_services' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/prod' &&
+      inputs.services_revision == github.sha
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    environment: production
 
     steps:
       - name: Check out infrastructure controller
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.sha }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Verify immutable release identities
+        shell: bash
+        env:
+          CONTROLLER_REPOSITORY: ${{ job.workflow_repository }}
+          CONTROLLER_REVISION: ${{ job.workflow_sha }}
+          SERVICES_REVISION: ${{ inputs.services_revision }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROLLER_REPOSITORY" == 'nda17/winwidget.ru_infra' ]]
+          [[ "$CONTROLLER_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SERVICES_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$CONTROLLER_REVISION"
 
       - name: Deploy through pinned SSH transport
         shell: bash
         env:
-          INFRA_REVISION: ${{ github.sha }}
+          INFRA_REVISION: ${{ job.workflow_sha }}
           SERVICES_REVISION: ${{ inputs.services_revision }}
           PRODUCTION_SSH_HOST: ${{ secrets.BACKEND_PRODUCTION_SSH_HOST }}
           PRODUCTION_SSH_PORT: ${{ secrets.BACKEND_PRODUCTION_SSH_PORT }}
