@@ -335,10 +335,10 @@ jobs:
             "github.event_name == 'push'",
             "github.ref == 'refs/heads/prod'",
             'inputs.services_revision == github.sha',
-            'repository: ${{ job.workflow_repository }}',
-            'ref: ${{ job.workflow_sha }}',
-            'CONTROLLER_REVISION: ${{ job.workflow_sha }}',
-            'SERVICES_REVISION: ${{ inputs.services_revision }}'
+            'repository: $' + '{{ job.workflow_repository }}',
+            'ref: $' + '{{ job.workflow_sha }}',
+            'CONTROLLER_REVISION: $' + '{{ job.workflow_sha }}',
+            'SERVICES_REVISION: $' + '{{ inputs.services_revision }}'
           ]) {
             requireText(
               workflow,
