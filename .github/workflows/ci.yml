@@ -1,0 +1,761 @@
+name: Verify infrastructure
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winwidget-infra-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify steady-state infrastructure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out exact infrastructure revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify shell syntax and static analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v shellcheck >/dev/null
+          bash -n scripts/deploy-services-production.sh
+          shellcheck -x scripts/deploy-services-production.sh
+          sed -n "/<<'REMOTE_CONTROLLER'$/,/^REMOTE_CONTROLLER$/p" \
+            scripts/deploy-services-production.sh | sed '1d;$d' | bash -n
+          sed -n "/<<'REMOTE_CONTROLLER'$/,/^REMOTE_CONTROLLER$/p" \
+            scripts/deploy-services-production.sh | sed '1d;$d' | \
+            shellcheck -s bash -
+          sed -n "/<<'FRONTEND_CONTROLLER'$/,/^FRONTEND_CONTROLLER$/p" \
+            scripts/deploy-services-production.sh | sed '1d;$d' | bash -n
+          sed -n "/<<'FRONTEND_CONTROLLER'$/,/^FRONTEND_CONTROLLER$/p" \
+            scripts/deploy-services-production.sh | sed '1d;$d' | \
+            shellcheck -s bash -
+
+      - name: Verify workflow syntax and embedded shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -e '
+            require "yaml"
+            Dir[".github/workflows/*.yml"].sort.each do |path|
+              YAML.load_file(path)
+            end
+          '
+          ruby -e '
+            require "yaml"
+            workflow = YAML.load_file(".github/workflows/deploy-production.yml")
+            puts workflow.fetch("jobs").fetch("deploy").fetch("steps").last.fetch("run")
+          ' | bash -n
+          ruby -e '
+            require "yaml"
+            workflow = YAML.load_file(".github/workflows/deploy-production.yml")
+            puts workflow.fetch("jobs").fetch("deploy").fetch("steps").last.fetch("run")
+          ' | shellcheck -s bash -
+
+      - name: Verify steady-state-only contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const script = fs.readFileSync(
+            'scripts/deploy-services-production.sh',
+            'utf8'
+          );
+          const workflow = fs.readFileSync(
+            '.github/workflows/deploy-production.yml',
+            'utf8'
+          );
+          const readme = fs.readFileSync('README.md', 'utf8');
+          const runbook = fs.readFileSync('docs/runbook.md', 'utf8');
+          const backendNginx = fs.readFileSync('nginx/backend-api.conf', 'utf8');
+          const frontendNginx = fs.readFileSync('nginx/frontend.conf', 'utf8');
+          const telegramBridgeNginx = fs.readFileSync(
+            'nginx/telegram-bridge/tg.winwidget.ru.conf',
+            'utf8'
+          );
+          const telegramStreamNginx = fs.readFileSync(
+            'nginx/telegram-bridge/telegram-api-stream.conf',
+            'utf8'
+          );
+
+          const fail = message => {
+            throw new Error(message);
+          };
+          const requireText = (source, value, message) => {
+            if (!source.includes(value)) fail(message);
+          };
+          const rejectText = (source, value, message) => {
+            if (source.includes(value)) fail(message);
+          };
+
+          for (const label of [
+            'MATERIALIZE_SERVICE_ENVS',
+            'RESTORE_STORAGE_PROBE',
+            'ENV_CONTRACT',
+            'COMPOSE_CONTRACT',
+            'NOTIFICATION_TOPOLOGY',
+            'REPORTING_TOPOLOGY',
+            'RABBITMQ_EXPECTED_USERS',
+            'PROVISION_RABBITMQ',
+            'VERIFY_OPERATIONS_DATABASE_BOUNDARY',
+            'VERIFY_OPERATIONS_SERVICE_IDENTITY',
+            'VERIFY_CURRENT_OPERATIONS_ROUTING',
+            'VERIFY_CURRENT_REPORTING_ROUTING',
+            'VERIFY_TELEGRAM_PROXY_HEALTH'
+          ]) {
+            const pattern = new RegExp(
+              `<<-?['"]?${label}['"]?[^\\n]*\\n([\\s\\S]*?)\\n${label}(?:\\n|$)`
+            );
+            const match = script.match(pattern);
+            if (!match) fail(`missing JavaScript heredoc: ${label}`);
+            try {
+              new Function(match[1]);
+            } catch {
+              fail(`invalid JavaScript heredoc: ${label}`);
+            }
+          }
+
+          for (const retired of [
+            'DEPLOY_MODE',
+            'OPERATIONS_SNAPSHOT_SHA256',
+            'OPERATIONS_CONTROL_PLANE_SNAPSHOT_SHA256',
+            'controller_mode=',
+            'deploy_mode=',
+            'run_operations_cli()',
+            'run_operations_cli_with_file()',
+            'recover_failed_reporting_terminal_migration()',
+            'stop_project_service_if_present()',
+            'dist/src/cutover/',
+            'control-plane-bootstrap.js',
+            'operations.snapshot.json',
+            'operations-control-plane.snapshot.json'
+          ]) {
+            rejectText(script, retired, `retired controller token: ${retired}`);
+            rejectText(workflow, retired, `retired workflow token: ${retired}`);
+            rejectText(readme, retired, `retired README token: ${retired}`);
+            rejectText(runbook, retired, `retired runbook token: ${retired}`);
+          }
+          for (const retiredRuntimeDependency of [
+            '/health/ownership',
+            'ownership_generation',
+            'ownershipGeneration',
+            'source_database_id',
+            'sourceDatabaseId',
+            'source_revision',
+            'sourceRevision',
+            'source_sha256',
+            'sourceSha256'
+          ]) {
+            rejectText(
+              script,
+              retiredRuntimeDependency,
+              `retired runtime dependency: ${retiredRuntimeDependency}`
+            );
+          }
+          if (/\bphase\b/i.test(script)) {
+            fail('routine controller must not depend on an ownership phase');
+          }
+          if (/\bdocker\s+(?:rm|volume\s+rm)\b/.test(script)) {
+            fail('routine controller must not delete Docker resources');
+          }
+          if (/\brm\s+-rf\b/.test(script) || script.includes('.deleteQueue(')) {
+            fail('routine controller contains a broad or queue deletion');
+          }
+
+          requireText(
+            script,
+            'verify_steady_state()',
+            'steady-state verifier is missing'
+          );
+          for (const evidence of [
+            'verify_operations_database_boundary()',
+            'verify_operations_service_identity()',
+            'verify_current_reporting_routing_projection()',
+            'verify_exact_project_container_inventory()',
+            'verify_current_rabbitmq_user_inventory()',
+            "identityRows[0].databaseName !== 'winwidget_operations'",
+            "identityRows[0].databaseUser !== 'winwidget_operations_runtime'",
+            "identityRows[0].schemaName !== 'operations'",
+            "rows[0].serviceName !== 'operations-service'",
+            'Live Compose project service inventory differs from the exact manifest contract',
+            'Legacy RabbitMQ queue remains in steady state',
+            'Legacy RabbitMQ user remains in steady state',
+            'Temporary Core PostgreSQL container remains in steady state',
+            'Temporary Core PostgreSQL volume remains in steady state',
+            'A listener remains on the retired Core port 4200',
+            'A retired Core public route remains reachable through backend Nginx'
+          ]) {
+            requireText(script, evidence, `steady-state evidence is missing: ${evidence}`);
+          }
+
+          const databaseBoundaryStart = script.indexOf(
+            'verify_operations_database_boundary()'
+          );
+          const infrastructureStart = script.indexOf(
+            'compose_all up -d --no-build "${infrastructure_services[@]}"'
+          );
+          if (
+            databaseBoundaryStart < 0 ||
+            infrastructureStart <= databaseBoundaryStart
+          ) {
+            fail('Operations database boundary verifier is misplaced');
+          }
+          const databaseBoundary = script.slice(
+            databaseBoundaryStart,
+            infrastructureStart
+          );
+          const steadyStart = script.indexOf('verify_steady_state()');
+          const convergenceStart = script.indexOf(
+            'verify_current_reporting_routing_projection()'
+          );
+          if (convergenceStart < 0 || steadyStart <= convergenceStart) {
+            fail('current control-plane verifier boundary is invalid');
+          }
+          const convergence = script.slice(convergenceStart, steadyStart);
+          const serviceIdentityStart = script.indexOf(
+            'verify_operations_service_identity()'
+          );
+          const serviceIdentityCall = script.indexOf(
+            '\nverify_operations_service_identity\n'
+          );
+          if (
+            serviceIdentityStart < 0 ||
+            serviceIdentityCall <= serviceIdentityStart ||
+            convergenceStart <= serviceIdentityCall
+          ) {
+            fail('Operations service identity verifier boundary is invalid');
+          }
+          const serviceIdentity = script.slice(
+            serviceIdentityStart,
+            serviceIdentityCall
+          );
+          for (const [name, verifier] of [
+            ['Operations database boundary', databaseBoundary],
+            ['Operations service identity', serviceIdentity],
+            ['current routing projection', convergence]
+          ]) {
+            if (
+              /\.(?:create|createMany|update|updateMany|upsert|delete|deleteMany|executeRaw|queryRawUnsafe)\b/.test(
+                verifier
+              ) ||
+              /method:\s*['"](?:POST|PUT|PATCH|DELETE)['"]/.test(verifier)
+            ) {
+              fail(`${name} verifier is not read-only`);
+            }
+          }
+          const databasePreflightCall = script.indexOf(
+            '\nverify_operations_database_boundary\n'
+          );
+          const containerPreflightCall = script.indexOf(
+            '\nverify_exact_project_container_inventory\n'
+          );
+          const rabbitPreflightCall = script.indexOf(
+            '\nverify_current_rabbitmq_user_inventory\n'
+          );
+          const provisioningStart = script.indexOf("<<'PROVISION_RABBITMQ'");
+          const migrationsStart = script.indexOf(
+            'for migration_service in "${migration_services[@]}"; do'
+          );
+          const runtimeRolloutStart = script.indexOf(
+            'compose_all up -d --no-build --force-recreate "${runtime_without_gateway[@]}"'
+          );
+          if (
+            databasePreflightCall < infrastructureStart ||
+            containerPreflightCall < infrastructureStart ||
+            rabbitPreflightCall < infrastructureStart ||
+            provisioningStart <= databasePreflightCall ||
+            provisioningStart <= containerPreflightCall ||
+            provisioningStart <= rabbitPreflightCall ||
+            migrationsStart <= provisioningStart ||
+            serviceIdentityCall <= migrationsStart ||
+            runtimeRolloutStart <= serviceIdentityCall
+          ) {
+            fail('steady-state preflight or post-migration identity order is invalid');
+          }
+
+          rejectText(workflow, 'mode:', 'deploy workflow still exposes a mode');
+          requireText(
+            workflow,
+            'bash scripts/deploy-services-production.sh "$SERVICES_REVISION"',
+            'deploy workflow does not use the single steady-state CLI'
+          );
+          requireText(
+            workflow,
+            'frontend_value_count != 0',
+            'frontend SSH partial-group guard is missing'
+          );
+          requireText(
+            workflow,
+            'frontend_value_count == ${#frontend_values[@]}',
+            'frontend SSH optional-group branch is missing'
+          );
+          requireText(
+            script,
+            'frontend_environment_count != 0',
+            'controller frontend SSH partial-group guard is missing'
+          );
+          requireText(
+            script,
+            'deploy_frontend_nginx=\'false\'',
+            'controller frontend Nginx default skip is missing'
+          );
+          requireText(
+            script,
+            'if [[ "$deploy_frontend_nginx" == \'true\' ]]; then',
+            'controller frontend Nginx optional branch is missing'
+          );
+
+          const backendLocations = [
+            ...backendNginx.matchAll(/^\s*location\s+(.+?)\s*\{/gm)
+          ]
+            .map(match => `location ${match[1]} {`)
+            .sort();
+          const expectedBackendLocations = [
+            'location = /api/v1 {',
+            'location = /api/v1/payments/webhook {',
+            'location = /api/v1/telegram-auth/webhook {',
+            'location = /api/v1/telegram-bot/support-webhook {',
+            'location = /api/v1/telegram-bot/webhook {',
+            'location / {',
+            'location /api/v1/ {',
+            'location /widgets/ {',
+            'location ~* ^/api/v1/payments/webhook {',
+            'location ~ ^/api/v1/dev-tools/database-restores(?:/|$) {'
+          ].sort();
+          const exactCount = (source, pattern) =>
+            (source.match(pattern) ?? []).length;
+          const backendUpstreams = [
+            ...backendNginx.matchAll(/^upstream\s+([a-z0-9_]+)\s*\{/gm)
+          ]
+            .map(match => match[1])
+            .sort();
+          const backendListeners = [
+            ...backendNginx.matchAll(/^\s*listen\s+(.+?);$/gm)
+          ]
+            .map(match => match[1])
+            .sort();
+          const backendServerNames = [
+            ...backendNginx.matchAll(/^\s*server_name\s+(.+?);$/gm)
+          ]
+            .map(match => match[1])
+            .sort();
+          if (
+            JSON.stringify(backendLocations) !==
+              JSON.stringify(expectedBackendLocations) ||
+            JSON.stringify(backendUpstreams) !==
+              JSON.stringify(['winwidget_gateway', 'winwidget_widgets']) ||
+            JSON.stringify(backendListeners) !==
+              JSON.stringify([
+                '443 ssl http2',
+                '80',
+                '[::]:443 ssl http2',
+                '[::]:80'
+              ]) ||
+            JSON.stringify(backendServerNames) !==
+              JSON.stringify(['api.winwidget.ru', 'api.winwidget.ru']) ||
+            exactCount(backendNginx, /^\s*server\s*\{$/gm) !== 2 ||
+            exactCount(backendNginx, /server 127\.0\.0\.1:4100;/g) !== 1 ||
+            exactCount(backendNginx, /server 127\.0\.0\.1:4700;/g) !== 1 ||
+            exactCount(backendNginx, /server_name api\.winwidget\.ru;/g) !== 2 ||
+            exactCount(backendNginx, /^\s*listen 80;$/gm) !== 1 ||
+            exactCount(backendNginx, /^\s*listen \[::\]:80;$/gm) !== 1 ||
+            exactCount(backendNginx, /^\s*listen 443 ssl http2;$/gm) !== 1 ||
+            exactCount(backendNginx, /^\s*listen \[::\]:443 ssl http2;$/gm) !==
+              1 ||
+            exactCount(
+              backendNginx,
+              /proxy_pass http:\/\/winwidget_gateway;/g
+            ) !== 7 ||
+            exactCount(
+              backendNginx,
+              /proxy_pass http:\/\/winwidget_widgets;/g
+            ) !== 1 ||
+            exactCount(
+              backendNginx,
+              /proxy_set_header X-Forwarded-For \$remote_addr;/g
+            ) !== 8 ||
+            exactCount(
+              backendNginx,
+              /proxy_set_header X-Real-IP \$remote_addr;/g
+            ) !== 8 ||
+            exactCount(
+              backendNginx,
+              /proxy_set_header X-Forwarded-Proto \$scheme;/g
+            ) !== 8 ||
+            exactCount(backendNginx, /proxy_set_header Host \$host;/g) !== 8 ||
+            exactCount(
+              backendNginx,
+              /proxy_set_header CF-Connecting-IP "";/g
+            ) !== 8 ||
+            exactCount(backendNginx, /limit_except POST \{/g) !== 4 ||
+            exactCount(backendNginx, /^\s*return 404;$/gm) !== 2 ||
+            /:4200|\bcore\b|winwidget\.ru_server|proxy_add_x_forwarded_for|proxy_set_header\s+(?:Forwarded|X-Forwarded-Host)\b|^\s*(?:real_ip_header|set_real_ip_from)\b|\bproxy_protocol\b/im.test(
+              backendNginx
+            )
+          ) {
+            fail('backend Nginx route or upstream boundary is unsafe');
+          }
+          for (const header of [
+            'X-User-Id',
+            'X-User-Roles',
+            'X-User-Session-Id',
+            'X-Auth-User-Id',
+            'X-Auth-Roles',
+            'X-Auth-Session-Id'
+          ]) {
+            if (
+              exactCount(
+                backendNginx,
+                new RegExp(`proxy_set_header ${header} "";`, 'g')
+              ) !== 7
+            ) {
+              fail(`backend Nginx identity header is not scrubbed: ${header}`);
+            }
+          }
+          const unsafeIdentityForward = backendNginx.match(
+            /proxy_set_header\s+X-(?:User|Auth)[A-Za-z-]*\s+(?!"")[^;]+;/gi
+          );
+          if (unsafeIdentityForward) {
+            fail('backend Nginx forwards an untrusted identity header');
+          }
+
+          const paymentWebhookStart = backendNginx.indexOf(
+            'location = /api/v1/payments/webhook {'
+          );
+          const backendTlsServerStart = backendNginx.indexOf(
+            'server {\n\tlisten 443 ssl http2;'
+          );
+          const backendTlsServerEnd = backendNginx.lastIndexOf('\n}');
+          const paymentWebhookFallbackStart = backendNginx.indexOf(
+            'location ~* ^/api/v1/payments/webhook {',
+            paymentWebhookStart
+          );
+          const nextBackendLocation = backendNginx.indexOf(
+            'location = /api/v1/telegram-auth/webhook {',
+            paymentWebhookFallbackStart
+          );
+          if (
+            backendTlsServerStart < 0 ||
+            backendTlsServerEnd <= backendTlsServerStart ||
+            paymentWebhookStart < 0 ||
+            paymentWebhookStart <= backendTlsServerStart ||
+            paymentWebhookStart >= backendTlsServerEnd ||
+            paymentWebhookFallbackStart <= paymentWebhookStart ||
+            nextBackendLocation <= paymentWebhookFallbackStart
+          ) {
+            fail('YooKassa webhook boundary is missing');
+          }
+          const paymentWebhook = backendNginx.slice(
+            paymentWebhookStart,
+            paymentWebhookFallbackStart
+          );
+          const paymentWebhookFallback = backendNginx.slice(
+            paymentWebhookFallbackStart,
+            nextBackendLocation
+          );
+          const expectedYooKassaSources = [
+            '185.71.76.0/27',
+            '185.71.77.0/27',
+            '77.75.153.0/25',
+            '77.75.156.11',
+            '77.75.156.35',
+            '77.75.154.128/25',
+            '2a02:5180::/32'
+          ];
+          const actualYooKassaSources = [
+            ...paymentWebhook.matchAll(/^\s*allow\s+(.+?);$/gm)
+          ].map(match => match[1]);
+          if (
+            JSON.stringify(actualYooKassaSources) !==
+              JSON.stringify(expectedYooKassaSources) ||
+            exactCount(paymentWebhook, /limit_except POST \{/g) !== 1 ||
+            exactCount(paymentWebhook, /^\s*deny all;$/gm) !== 2 ||
+            exactCount(
+              paymentWebhook,
+              /proxy_pass http:\/\/winwidget_gateway;/g
+            ) !== 1 ||
+            exactCount(
+              paymentWebhook,
+              /proxy_set_header X-Real-IP \$remote_addr;/g
+            ) !== 1 ||
+            exactCount(
+              paymentWebhook,
+              /proxy_set_header X-Forwarded-For \$remote_addr;/g
+            ) !== 1 ||
+            exactCount(
+              paymentWebhook,
+              /proxy_set_header CF-Connecting-IP "";/g
+            ) !== 1 ||
+            exactCount(paymentWebhook, /proxy_set_header Host \$host;/g) !== 1 ||
+            exactCount(
+              paymentWebhook,
+              /proxy_set_header X-Forwarded-Proto \$scheme;/g
+            ) !== 1 ||
+            exactCount(paymentWebhook, /proxy_http_version 1\.1;/g) !== 1 ||
+            exactCount(paymentWebhook, /proxy_request_buffering off;/g) !== 1 ||
+            exactCount(paymentWebhook, /proxy_buffering off;/g) !== 1 ||
+            exactCount(paymentWebhook, /client_max_body_size 256k;/g) !== 1 ||
+            exactCount(paymentWebhook, /client_body_timeout 10s;/g) !== 1 ||
+            exactCount(paymentWebhook, /proxy_connect_timeout 3s;/g) !== 1 ||
+            exactCount(paymentWebhook, /proxy_read_timeout 15s;/g) !== 1 ||
+            exactCount(paymentWebhook, /proxy_send_timeout 15s;/g) !== 1 ||
+            /proxy_add_x_forwarded_for|\$http_(?:forwarded|x_forwarded_for|x_real_ip|cf_connecting_ip)/i.test(
+              paymentWebhook
+            )
+          ) {
+            fail('YooKassa webhook method, source or forwarding contract is unsafe');
+          }
+          for (const header of [
+            'X-User-Id',
+            'X-User-Roles',
+            'X-User-Session-Id',
+            'X-Auth-User-Id',
+            'X-Auth-Roles',
+            'X-Auth-Session-Id'
+          ]) {
+            if (
+              exactCount(
+                paymentWebhook,
+                new RegExp(`proxy_set_header ${header} "";`, 'g')
+              ) !== 1
+            ) {
+              fail(`YooKassa webhook does not scrub identity header: ${header}`);
+            }
+          }
+          if (
+            exactCount(paymentWebhookFallback, /^\s*return 404;$/gm) !== 1 ||
+            /proxy_pass|\ballow\s|limit_except/.test(paymentWebhookFallback)
+          ) {
+            fail('YooKassa non-canonical webhook path is not rejected');
+          }
+          const allBackendAllowSources = [
+            ...backendNginx.matchAll(/^\s*allow\s+(.+?);$/gm)
+          ].map(match => match[1]);
+          if (
+            JSON.stringify(allBackendAllowSources) !==
+            JSON.stringify(expectedYooKassaSources)
+          ) {
+            fail('backend Nginx contains an unexpected source allowlist');
+          }
+
+          const backendTelegramWebhookRoutes = [
+            '/api/v1/telegram-auth/webhook',
+            '/api/v1/telegram-bot/webhook',
+            '/api/v1/telegram-bot/support-webhook'
+          ];
+          for (const route of backendTelegramWebhookRoutes) {
+            const routeStart = backendNginx.indexOf(`location = ${route} {`);
+            const routeEnd = backendNginx.indexOf(
+              '\n\tlocation ',
+              routeStart + 1
+            );
+            if (routeStart < 0 || routeEnd <= routeStart) {
+              fail(`backend Telegram webhook boundary is missing: ${route}`);
+            }
+            const routeBlock = backendNginx.slice(routeStart, routeEnd);
+            if (
+              exactCount(routeBlock, /limit_except POST \{/g) !== 1 ||
+              exactCount(routeBlock, /^\s*deny all;$/gm) !== 1 ||
+              /^\s*allow\s/m.test(routeBlock) ||
+              exactCount(
+                routeBlock,
+                /proxy_pass http:\/\/winwidget_gateway;/g
+              ) !== 1 ||
+              exactCount(routeBlock, /proxy_http_version 1\.1;/g) !== 1 ||
+              exactCount(routeBlock, /proxy_set_header Host \$host;/g) !== 1 ||
+              exactCount(
+                routeBlock,
+                /proxy_set_header X-Real-IP \$remote_addr;/g
+              ) !== 1 ||
+              exactCount(
+                routeBlock,
+                /proxy_set_header X-Forwarded-For \$remote_addr;/g
+              ) !== 1 ||
+              exactCount(
+                routeBlock,
+                /proxy_set_header CF-Connecting-IP "";/g
+              ) !== 1 ||
+              exactCount(
+                routeBlock,
+                /proxy_set_header X-Forwarded-Proto \$scheme;/g
+              ) !== 1 ||
+              exactCount(routeBlock, /proxy_request_buffering off;/g) !== 1 ||
+              exactCount(routeBlock, /proxy_buffering off;/g) !== 1 ||
+              exactCount(routeBlock, /proxy_connect_timeout 3s;/g) !== 1 ||
+              exactCount(routeBlock, /proxy_read_timeout 10s;/g) !== 1 ||
+              exactCount(routeBlock, /proxy_send_timeout 10s;/g) !== 1 ||
+              /proxy_add_x_forwarded_for|\$http_(?:forwarded|x_forwarded_for|x_real_ip|cf_connecting_ip)/i.test(
+                routeBlock
+              )
+            ) {
+              fail(`backend Telegram webhook contract is unsafe: ${route}`);
+            }
+            for (const header of [
+              'X-User-Id',
+              'X-User-Roles',
+              'X-User-Session-Id',
+              'X-Auth-User-Id',
+              'X-Auth-Roles',
+              'X-Auth-Session-Id'
+            ]) {
+              if (
+                exactCount(
+                  routeBlock,
+                  new RegExp(`proxy_set_header ${header} "";`, 'g')
+                ) !== 1
+              ) {
+                fail(
+                  `backend Telegram webhook does not scrub identity header: ${route} ${header}`
+                );
+              }
+            }
+          }
+
+          if (
+            (frontendNginx.match(/server 127\.0\.0\.1:3000;/g) ?? []).length !==
+              1 ||
+            (frontendNginx.match(
+              /server_name winwidget\.ru www\.winwidget\.ru;/g
+            ) ?? []).length !== 2 ||
+            (frontendNginx.match(
+              /proxy_pass http:\/\/winwidget_frontend;/g
+            ) ?? []).length !== 1 ||
+            /:4200|api\.winwidget\.ru|winwidget\.ru_server/i.test(frontendNginx)
+          ) {
+            fail('frontend Nginx is not the exact frontend-only contract');
+          }
+
+          const incomingWebhookRoutes = [
+            '/api/v1/telegram-auth/webhook',
+            '/api/v1/telegram-bot/webhook',
+            '/api/v1/telegram-bot/support-webhook'
+          ];
+          for (const route of incomingWebhookRoutes) {
+            if (
+              (telegramBridgeNginx.match(
+                new RegExp(`location = ${route.replaceAll('/', '\\/')} \\{`, 'g')
+              ) ?? []).length !== 1
+            ) {
+              fail(`Telegram bridge route is not exact: ${route}`);
+            }
+          }
+          if (
+            (telegramBridgeNginx.match(
+              /proxy_pass https:\/\/winwidget_api_origin;/g
+            ) ?? []).length !== incomingWebhookRoutes.length ||
+            (telegramBridgeNginx.match(/proxy_ssl_name api\.winwidget\.ru;/g) ?? [])
+              .length !== incomingWebhookRoutes.length ||
+            /proxy_ssl_verify\s+off;|webhook-health/.test(telegramBridgeNginx)
+          ) {
+            fail('Telegram incoming webhook proxy contract is unsafe');
+          }
+          const tlsServerStart = telegramBridgeNginx.lastIndexOf(
+            'server_name tg.winwidget.ru;'
+          );
+          const firstTlsLocation = telegramBridgeNginx.indexOf(
+            'location = /telegram-api-health',
+            tlsServerStart
+          );
+          const inheritedTlsContract = telegramBridgeNginx.slice(
+            tlsServerStart,
+            firstTlsLocation
+          );
+          for (const directive of [
+            'proxy_ssl_verify on;',
+            'proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;',
+            'proxy_ssl_verify_depth 3;'
+          ]) {
+            requireText(
+              inheritedTlsContract,
+              directive,
+              `Telegram inherited upstream TLS directive is missing: ${directive}`
+            );
+          }
+          for (const directive of [
+            'listen 8443;',
+            'listen [::]:8443;',
+            'default api.telegram.org:443;',
+            'proxy_pass $telegram_api_upstream;'
+          ]) {
+            requireText(
+              telegramStreamNginx,
+              directive,
+              `Telegram public TLS relay directive is missing: ${directive}`
+            );
+          }
+          if (/\ballow\s|\bdeny\s/.test(telegramStreamNginx)) {
+            fail('Telegram public TLS relay must not be source restricted');
+          }
+          for (const evidence of [
+            'steady-state',
+            'одну опциональную группу',
+            'без изменения frontend Nginx',
+            'read-only DB boundary preflight',
+            'Compose inventory',
+            'routing projection'
+          ]) {
+            requireText(readme, evidence, `README contract is missing: ${evidence}`);
+          }
+          for (const evidence of [
+            '`POST /api/v1/payments/webhook`',
+            'по `$remote_addr`',
+            'https://yookassa.ru/developers/using-api/webhooks'
+          ]) {
+            requireText(runbook, evidence, `runbook contract is missing: ${evidence}`);
+          }
+
+          process.stdout.write('steady_state_contracts=PASS\n');
+          NODE
+
+      - name: Verify rejected legacy CLI forms
+        shell: bash
+        run: |
+          set -euo pipefail
+          script='scripts/deploy-services-production.sh'
+          run_negative() {
+            local name="$1"
+            local expected_status="$2"
+            local expected_pattern="$3"
+            local output task_status
+            shift 3
+            set +e
+            output="$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
+              bash "$script" "$@" 2>&1)"
+            task_status=$?
+            set -e
+            if [[ "$task_status" != "$expected_status" ||
+              ! "$output" =~ $expected_pattern ]]; then
+              printf 'Negative CLI check failed: %s\n' "$name" >&2
+              return 1
+            fi
+          }
+          run_negative no_args 2 'Usage:'
+          run_negative old_deploy_flag 1 'Services revision must be' --deploy
+          run_negative old_cutover_flag 1 'Services revision must be' --cutover
+          run_negative extra_argument 2 'Usage:' \
+            0000000000000000000000000000000000000000 extra
+          run_negative uppercase_revision 1 'Services revision must be' \
+            AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          run_negative missing_infra_revision 1 'Infra revision must be' \
+            0000000000000000000000000000000000000000
+
+      - name: Verify tracked tree formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" HEAD -- .

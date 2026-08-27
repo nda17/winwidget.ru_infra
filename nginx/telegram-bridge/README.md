@@ -10,10 +10,9 @@ Backend services -> https://tg.winwidget.ru/telegram-api -> api.telegram.org
 
 Файл `tg.winwidget.ru.conf` устанавливается как
 `/etc/nginx/sites-available/tg.winwidget.ru`. Он завершает TLS и открывает только
-точные маршруты Auth, Info, Support и webhook-health, а также методы Bot API из
-allowlist, используемые WinWidget. Пути запросов `/telegram-api/*` содержат
-токены ботов, поэтому логирование доступа и ошибочных запросов должно оставаться
-отключённым.
+точные маршруты Auth, Info и Support, а также методы Bot API из allowlist,
+используемые WinWidget. Пути запросов `/telegram-api/*` содержат токены ботов,
+поэтому логирование доступа и ошибочных запросов должно оставаться отключённым.
 
 Backend без Core закрепляет bridge для Notification Delivery, Identity API,
 Support API/worker и Operations API/worker. Через этот путь проходят все

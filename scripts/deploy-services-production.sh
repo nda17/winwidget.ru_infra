@@ -6,8 +6,7 @@ umask 077
 usage() {
 	cat >&2 <<'USAGE'
 Usage:
-  deploy-services-production.sh --deploy <40-hex-services-revision>
-  deploy-services-production.sh --cutover <40-hex-services-revision>
+	deploy-services-production.sh <40-hex-services-revision>
 
 Required environment:
   INFRA_REVISION
@@ -18,9 +17,12 @@ Required environment:
   PRODUCTION_SSH_KNOWN_HOSTS_FILE
   EXPECTED_PRODUCTION_ENV_SHA256
 
-Required only with --cutover:
-  OPERATIONS_SNAPSHOT_SHA256
-  OPERATIONS_CONTROL_PLANE_SNAPSHOT_SHA256
+Optional environment (all five values or none):
+  FRONTEND_PRODUCTION_SSH_HOST
+  FRONTEND_PRODUCTION_SSH_PORT
+  FRONTEND_PRODUCTION_SSH_USER
+  FRONTEND_PRODUCTION_SSH_IDENTITY_FILE
+  FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS_FILE
 USAGE
 	exit 2
 }
@@ -30,15 +32,9 @@ die() {
 	exit 1
 }
 
-[[ $# -eq 2 ]] || usage
+[[ $# -eq 1 ]] || usage
 
-case "$1" in
-	--deploy) deploy_mode='deploy' ;;
-	--cutover) deploy_mode='cutover' ;;
-	*) usage ;;
-esac
-
-services_revision="$2"
+services_revision="$1"
 [[ "$services_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Services revision must be an immutable lowercase 40-hex commit.'
 
@@ -76,6 +72,20 @@ backend_nginx_base64="$(base64 <"$backend_nginx_file" | tr -d '\n')"
 	"$backend_nginx_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
 	die 'Cannot encode the apps-only backend Nginx config.'
 
+frontend_nginx_file="$controller_root/nginx/frontend.conf"
+[[ -f "$frontend_nginx_file" && ! -L "$frontend_nginx_file" ]] ||
+	die 'Tracked frontend Nginx config is missing or unsafe.'
+git -C "$controller_root" ls-files --error-unmatch \
+	nginx/frontend.conf >/dev/null 2>&1 ||
+	die 'Frontend Nginx config is not tracked by infra Git.'
+frontend_nginx_sha256="$(sha256sum "$frontend_nginx_file" | awk '{print $1}')"
+[[ "$frontend_nginx_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+	die 'Cannot calculate frontend Nginx SHA-256.'
+frontend_nginx_base64="$(base64 <"$frontend_nginx_file" | tr -d '\n')"
+[[ -n "$frontend_nginx_base64" &&
+	"$frontend_nginx_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+	die 'Cannot encode the frontend Nginx config.'
+
 required_environment=(
 	PRODUCTION_SSH_HOST
 	PRODUCTION_SSH_PORT
@@ -88,6 +98,28 @@ for variable_name in "${required_environment[@]}"; do
 	[[ -n "${!variable_name:-}" ]] ||
 		die "Required deployment setting is missing: $variable_name"
 done
+
+frontend_environment=(
+	FRONTEND_PRODUCTION_SSH_HOST
+	FRONTEND_PRODUCTION_SSH_PORT
+	FRONTEND_PRODUCTION_SSH_USER
+	FRONTEND_PRODUCTION_SSH_IDENTITY_FILE
+	FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS_FILE
+)
+frontend_environment_count=0
+for variable_name in "${frontend_environment[@]}"; do
+	if [[ -n "${!variable_name:-}" ]]; then
+		frontend_environment_count=$((frontend_environment_count + 1))
+	fi
+done
+if ((frontend_environment_count != 0 &&
+	frontend_environment_count != ${#frontend_environment[@]})); then
+	die 'Frontend production SSH settings must be configured as one complete group.'
+fi
+deploy_frontend_nginx='false'
+if ((frontend_environment_count == ${#frontend_environment[@]})); then
+	deploy_frontend_nginx='true'
+fi
 
 [[ "$PRODUCTION_SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
 	die 'Production SSH host is invalid.'
@@ -113,19 +145,30 @@ ssh-keygen -y -P '' -f "$identity_file" >/dev/null 2>&1 ||
 [[ "$(stat -c '%a' "$known_hosts_file" 2>/dev/null || stat -f '%Lp' "$known_hosts_file")" == '600' ]] ||
 	die 'Production SSH known_hosts file must have mode 0600.'
 
-operations_snapshot_sha256="${OPERATIONS_SNAPSHOT_SHA256:-}"
-control_plane_snapshot_sha256="${OPERATIONS_CONTROL_PLANE_SNAPSHOT_SHA256:-}"
-if [[ "$deploy_mode" == 'cutover' ]]; then
-	[[ "$operations_snapshot_sha256" =~ ^[0-9a-f]{64}$ ]] ||
-		die 'Operations snapshot SHA-256 is required for --cutover.'
-	[[ "$control_plane_snapshot_sha256" =~ ^[0-9a-f]{64}$ ]] ||
-		die 'Operations control-plane snapshot SHA-256 is required for --cutover.'
-elif [[ -n "$operations_snapshot_sha256" || -n "$control_plane_snapshot_sha256" ]]; then
-	die 'Snapshot hashes are accepted only with --cutover.'
-fi
-if [[ "$deploy_mode" == 'deploy' ]]; then
-	operations_snapshot_sha256='-'
-	control_plane_snapshot_sha256='-'
+frontend_identity_file=''
+frontend_known_hosts_file=''
+if [[ "$deploy_frontend_nginx" == 'true' ]]; then
+	[[ "$FRONTEND_PRODUCTION_SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
+		die 'Frontend production SSH host is invalid.'
+	if [[ ! "$FRONTEND_PRODUCTION_SSH_PORT" =~ ^[0-9]{1,5}$ ]] ||
+		((10#$FRONTEND_PRODUCTION_SSH_PORT < 1 ||
+			10#$FRONTEND_PRODUCTION_SSH_PORT > 65535)); then
+		die 'Frontend production SSH port is invalid.'
+	fi
+	[[ "$FRONTEND_PRODUCTION_SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+		die 'Frontend production SSH user is invalid.'
+	frontend_identity_file="$FRONTEND_PRODUCTION_SSH_IDENTITY_FILE"
+	frontend_known_hosts_file="$FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS_FILE"
+	[[ -f "$frontend_identity_file" && ! -L "$frontend_identity_file" ]] ||
+		die 'Frontend production SSH identity file must be a regular non-symlink file.'
+	[[ "$(stat -c '%a' "$frontend_identity_file" 2>/dev/null || stat -f '%Lp' "$frontend_identity_file")" == '600' ]] ||
+		die 'Frontend production SSH identity file must have mode 0600.'
+	ssh-keygen -y -P '' -f "$frontend_identity_file" >/dev/null 2>&1 ||
+		die 'Frontend production SSH identity file is invalid or requires a passphrase.'
+	[[ -s "$frontend_known_hosts_file" && ! -L "$frontend_known_hosts_file" ]] ||
+		die 'Frontend production SSH known_hosts file must be a non-empty regular file.'
+	[[ "$(stat -c '%a' "$frontend_known_hosts_file" 2>/dev/null || stat -f '%Lp' "$frontend_known_hosts_file")" == '600' ]] ||
+		die 'Frontend production SSH known_hosts file must have mode 0600.'
 fi
 
 ssh_options=(
@@ -147,17 +190,30 @@ ssh_options=(
 	-p "$PRODUCTION_SSH_PORT"
 )
 
-ssh "${ssh_options[@]}" \
-	"$PRODUCTION_SSH_USER@$PRODUCTION_SSH_HOST" \
-	bash -s -- \
-	"$deploy_mode" \
+printf -v remote_controller_arguments ' %q' \
 	"$infra_revision" \
 	"$services_revision" \
 	"$EXPECTED_PRODUCTION_ENV_SHA256" \
-	"$operations_snapshot_sha256" \
-	"$control_plane_snapshot_sha256" \
 	"$backend_nginx_sha256" \
-	"$backend_nginx_base64" <<'REMOTE_CONTROLLER'
+	"$backend_nginx_base64"
+# The remote shell, not this local controller, must expand these variables.
+# shellcheck disable=SC2016
+remote_controller_command='set -euo pipefail
+[[ "$(id -u)" == "0" ]]
+controller_file="$(mktemp /opt/winwidget/deploy/backend/.production-controller.XXXXXX)"
+trap '\''rm -f -- "$controller_file"'\'' EXIT
+cat >"$controller_file"
+chown 0:0 "$controller_file"
+chmod 600 "$controller_file"
+bash "$controller_file"'"$remote_controller_arguments"' </dev/null'
+
+# Stage the complete controller before executing it. Otherwise a child command
+# such as `docker compose up` can inherit SSH stdin and consume the unparsed
+# remainder of a `bash -s` controller while still returning exit code 0.
+# shellcheck disable=SC2029
+ssh "${ssh_options[@]}" \
+	"$PRODUCTION_SSH_USER@$PRODUCTION_SSH_HOST" \
+	"$remote_controller_command" <<'REMOTE_CONTROLLER'
 set -euo pipefail
 umask 077
 
@@ -166,34 +222,18 @@ die() {
 	exit 1
 }
 
-deploy_mode="$1"
-infra_revision="$2"
-services_revision="$3"
-expected_env_sha256="$4"
-operations_snapshot_sha256="$5"
-control_plane_snapshot_sha256="$6"
-backend_nginx_sha256="$7"
-backend_nginx_base64="$8"
+infra_revision="$1"
+services_revision="$2"
+expected_env_sha256="$3"
+backend_nginx_sha256="$4"
+backend_nginx_base64="$5"
 
-[[ "$deploy_mode" == 'deploy' || "$deploy_mode" == 'cutover' ]] ||
-	die 'Remote deployment mode is invalid.'
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'
 [[ "$services_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote services revision is invalid.'
 [[ "$expected_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 	die 'Remote expected env SHA-256 is invalid.'
-if [[ "$deploy_mode" == 'deploy' ]]; then
-	[[ "$operations_snapshot_sha256" == '-' &&
-		"$control_plane_snapshot_sha256" == '-' ]] ||
-		die 'Routine deploy received unexpected snapshot arguments.'
-	operations_snapshot_sha256=''
-	control_plane_snapshot_sha256=''
-else
-	[[ "$operations_snapshot_sha256" =~ ^[0-9a-f]{64}$ &&
-		"$control_plane_snapshot_sha256" =~ ^[0-9a-f]{64}$ ]] ||
-		die 'Remote cutover snapshot hashes are invalid.'
-fi
 [[ "$backend_nginx_sha256" =~ ^[0-9a-f]{64}$ &&
 	"$backend_nginx_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
 	die 'Remote apps-only backend Nginx artifact is invalid.'
@@ -207,10 +247,7 @@ readonly releases_root="$app_root/releases/winwidget.ru_services"
 readonly release_root="$releases_root/$services_revision"
 readonly env_file="$app_root/deploy/backend/.env.production"
 readonly deploy_lock="$app_root/deploy/backend/.production-deploy.lock"
-readonly operations_snapshot_file="$app_root/deploy/backend/cutover-input/operations.snapshot.json"
-readonly control_plane_snapshot_file="$app_root/deploy/backend/cutover-input/operations-control-plane.snapshot.json"
-readonly terminal_cutover_marker="$app_root/deploy/backend/.microservices-terminal-cutover-v1"
-readonly expected_repository_slug='nda17/winwidget.ru_services'
+	readonly expected_repository_slug='nda17/winwidget.ru_services'
 
 assert_root_owned_directory() {
 	local path="$1" mode
@@ -266,15 +303,7 @@ chmod 600 "$deploy_lock"
 flock -n "$deploy_lock_fd" ||
 	die 'Another production deployment currently holds the production lock.'
 
-if [[ "$deploy_mode" == 'deploy' ]]; then
-	[[ -f "$terminal_cutover_marker" && ! -L "$terminal_cutover_marker" ]] ||
-		die 'Routine deployment requires a completed terminal microservices cutover.'
-else
-	[[ ! -e "$terminal_cutover_marker" && ! -L "$terminal_cutover_marker" ]] ||
-		die 'Terminal microservices cutover is already complete; use --deploy.'
-fi
-
-env_sha256_before="$(sha256sum "$env_file" | awk '{print $1}')"
+	env_sha256_before="$(sha256sum "$env_file" | awk '{print $1}')"
 [[ "$env_sha256_before" == "$expected_env_sha256" ]] ||
 	die 'Canonical production env differs from the approved byte-identical hash.'
 
@@ -1277,6 +1306,140 @@ if ! compose_all config --format json 2>/dev/null |
 fi
 unset compose_contract_validator
 
+verify_exact_project_container_inventory() {
+	local inventory container_id project_name service_name state extra_field
+	local expected_services actual_services
+	local -a observed_services=()
+	expected_services="$({
+		printf '%s\n' "${infrastructure_services[@]}"
+		printf '%s\n' "${runtime_services[@]}"
+	} | LC_ALL=C sort)"
+	inventory="$(
+		docker ps -a --no-trunc \
+			--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+			--format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}|{{.State}}'
+	)" || die 'Cannot read the exact production Compose container inventory.'
+	[[ -n "$inventory" ]] ||
+		die 'Production Compose container inventory is empty.'
+	while IFS='|' read -r container_id project_name service_name state extra_field; do
+		[[ "$container_id" =~ ^[0-9a-f]{64}$ &&
+			"$project_name" == "$COMPOSE_PROJECT_NAME" &&
+			"$service_name" =~ ^[a-z0-9][a-z0-9-]*$ &&
+			"$state" == 'running' && -z "$extra_field" ]] ||
+			die 'Production Compose container inventory contains an invalid entry.'
+		observed_services+=("$service_name")
+	done <<<"$inventory"
+	actual_services="$(printf '%s\n' "${observed_services[@]}" | LC_ALL=C sort)"
+	[[ "$actual_services" == "$expected_services" ]] ||
+		die 'Live Compose project service inventory differs from the exact manifest contract.'
+}
+
+verify_operations_database_boundary() {
+	compose_all run --rm --no-deps --interactive \
+		--entrypoint node \
+		operations-api - <<'VERIFY_OPERATIONS_DATABASE_BOUNDARY' >/dev/null
+const { PrismaClient } = require('@prisma/operations-client');
+
+const databaseUrl = process.env.OPERATIONS_DATABASE_URL ?? '';
+if (!databaseUrl) process.exit(1);
+const client = new PrismaClient({
+	datasources: { db: { url: databaseUrl } }
+});
+const expectedCriticalTables = [
+	'admin_event_logs',
+	'database_restore_jobs',
+	'outbox_events',
+	'scheduled_job_runs',
+	'telegram_bot_settings'
+];
+
+(async () => {
+	const [identityRows, roleRows, tableRows] = await Promise.all([
+		client.$queryRaw`
+			SELECT
+				current_database()::text AS "databaseName",
+				current_user::text AS "databaseUser",
+				current_schema()::text AS "schemaName",
+				pg_is_in_recovery() AS "inRecovery",
+				pg_get_userbyid(database_entry.datdba)::text AS "databaseOwner",
+				pg_get_userbyid(schema_entry.nspowner)::text AS "schemaOwner",
+				has_schema_privilege(current_user, 'operations', 'USAGE') AS "schemaUsage",
+				has_schema_privilege(current_user, 'operations', 'CREATE') AS "schemaCreate"
+			FROM pg_database AS database_entry
+			JOIN pg_namespace AS schema_entry
+				ON schema_entry.nspname = 'operations'
+			WHERE database_entry.datname = current_database()
+		`,
+		client.$queryRaw`
+			SELECT
+				role_entry.rolname::text AS "roleName",
+				role_entry.rolsuper AS "superuser",
+				role_entry.rolcreatedb AS "createDatabase",
+				role_entry.rolcreaterole AS "createRole",
+				role_entry.rolreplication AS "replication",
+				role_entry.rolbypassrls AS "bypassRls"
+			FROM pg_roles AS role_entry
+			WHERE role_entry.rolname IN (
+				'winwidget_operations_runtime',
+				'winwidget_operations_migration'
+			)
+			ORDER BY role_entry.rolname
+		`,
+		client.$queryRaw`
+			SELECT table_name::text AS "tableName"
+			FROM information_schema.tables
+			WHERE table_schema = 'operations'
+				AND table_type = 'BASE TABLE'
+				AND table_name IN (
+					'admin_event_logs',
+					'database_restore_jobs',
+					'outbox_events',
+					'scheduled_job_runs',
+					'telegram_bot_settings'
+				)
+			ORDER BY table_name
+		`
+	]);
+	if (
+		identityRows.length !== 1 ||
+		identityRows[0].databaseName !== 'winwidget_operations' ||
+		identityRows[0].databaseUser !== 'winwidget_operations_runtime' ||
+		identityRows[0].schemaName !== 'operations' ||
+		identityRows[0].inRecovery !== false ||
+		identityRows[0].databaseOwner !== 'winwidget_operations_admin' ||
+		identityRows[0].schemaOwner !== 'winwidget_operations_migration' ||
+		identityRows[0].schemaUsage !== true ||
+		identityRows[0].schemaCreate !== false
+	) throw new Error('invalid Operations database identity');
+	if (
+		roleRows.length !== 2 ||
+		roleRows.some(
+			role =>
+				!['winwidget_operations_migration', 'winwidget_operations_runtime'].includes(
+					role.roleName
+				) ||
+				role.superuser !== false ||
+				role.createDatabase !== false ||
+				role.createRole !== false ||
+				role.replication !== false ||
+				role.bypassRls !== false
+		)
+	) throw new Error('invalid Operations database role boundary');
+	if (
+		JSON.stringify(tableRows.map(row => row.tableName)) !==
+		JSON.stringify(expectedCriticalTables)
+	) throw new Error('missing Operations steady-state table');
+})()
+	.catch(() => {
+		process.stderr.write('Operations database boundary preflight failed.\n');
+		process.exitCode = 1;
+	})
+	.finally(async () => {
+		await client.$disconnect();
+	});
+VERIFY_OPERATIONS_DATABASE_BOUNDARY
+}
+
 compose_all up -d --no-build "${infrastructure_services[@]}"
 
 wait_for_healthy_services() {
@@ -1308,15 +1471,9 @@ wait_for_healthy_services() {
 }
 
 wait_for_healthy_services "${infrastructure_services[@]}"
-
-legacy_core_services=(
-	api
-	outbox-publisher
-	integration-worker
-	maintenance-worker
-	database-restore-worker
-)
-legacy_core_container_ids=()
+wait_for_healthy_services "${runtime_services[@]}"
+verify_exact_project_container_inventory
+verify_operations_database_boundary
 
 find_exact_named_container() {
 	local container_name="$1" inventory
@@ -1358,55 +1515,6 @@ find_project_service_container() {
 	fi
 	printf '%s' "$container_ids"
 }
-
-stop_project_service_if_present() {
-	local service_name="$1" container_id running
-	container_id="$(find_project_service_container "$service_name")"
-	[[ -n "$container_id" ]] || return 0
-	running="$(docker inspect --format '{{.State.Running}}' "$container_id")"
-	if [[ "$running" == 'true' ]]; then
-		docker stop --time 90 "$container_id" >/dev/null
-	fi
-	[[ "$(docker inspect --format '{{.State.Running}}' "$container_id")" == 'false' ]] ||
-		die "Exact project service did not stop: $service_name"
-	printf '%s' "$container_id"
-}
-
-if [[ "$deploy_mode" == 'cutover' ]]; then
-	for legacy_service in "${legacy_core_services[@]}"; do
-		legacy_container_id="$(stop_project_service_if_present "$legacy_service")"
-		[[ -z "$legacy_container_id" ]] ||
-			legacy_core_container_ids+=("$legacy_container_id")
-	done
-
-	# Reporting retry queues carry immutable DLX arguments. Stop the sole
-	# consumer and delete only empty, unused queues so the apps-only owner can
-	# recreate them with the terminal routing contract.
-	stop_project_service_if_present reporting-service >/dev/null
-	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
-	[[ -n "$rabbitmq_container_id" && "$rabbitmq_container_id" != *$'\n'* ]] ||
-		die 'Exactly one running RabbitMQ container is required for terminal cutover.'
-	reporting_retry_queues=(
-		winwidget.reporting.settings.retry.1
-		winwidget.reporting.settings.retry.2
-		winwidget.reporting.settings.retry.3
-	)
-	queue_inventory="$(
-		docker exec "$rabbitmq_container_id" rabbitmqctl --silent \
-			list_queues -p winwidget name messages_ready messages_unacknowledged consumers
-	)"
-	for queue_name in "${reporting_retry_queues[@]}"; do
-		queue_row="$(awk -v queue="$queue_name" '$1 == queue { print; count += 1 } END { if (count > 1) exit 1 }' <<<"$queue_inventory")" ||
-			die 'Reporting retry queue inventory is ambiguous.'
-		[[ -n "$queue_row" ]] || continue
-		read -r _queue_name messages_ready messages_unacknowledged consumers <<<"$queue_row"
-		[[ "$messages_ready" == '0' && "$messages_unacknowledged" == '0' &&
-			"$consumers" == '0' ]] ||
-			die "Reporting retry queue is not empty and unused: $queue_name"
-		docker exec "$rabbitmq_container_id" rabbitmqctl delete_queue \
-			-p winwidget "$queue_name" --if-empty --if-unused >/dev/null
-	done
-fi
 
 notification_topology_contract="$(
 	docker run --rm \
@@ -1515,9 +1623,6 @@ if (
 	contract.reportingSettingsQueue !== 'winwidget.reporting.settings' ||
 	contract.reportingSettingsRoutingKey !==
 		'operations.notification-routing.changed.v1' ||
-	contract.routingKeys.includes(
-		'reporting.core-operational-routing.changed.v1'
-	) ||
 	contract.queueNames.length < 1 ||
 	new Set(contract.queueNames).size !== contract.queueNames.length ||
 	contract.queueNames.some(
@@ -1576,6 +1681,21 @@ RABBITMQ_EXPECTED_USERS
 [[ -n "$rabbitmq_expected_user_names" ]] ||
 	die 'RabbitMQ user inventory contract is empty.'
 
+verify_current_rabbitmq_user_inventory() {
+	local rabbitmq_container_id actual_user_names
+	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
+	[[ -n "$rabbitmq_container_id" && "$rabbitmq_container_id" != *$'\n'* ]] ||
+		die 'Exactly one running RabbitMQ container is required for the preflight.'
+	actual_user_names="$(
+		docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_users |
+			awk 'NF { print $1 }' | LC_ALL=C sort
+	)" || die 'Cannot read the current RabbitMQ user inventory.'
+	[[ "$actual_user_names" == "$rabbitmq_expected_user_names" ]] ||
+		die 'Current RabbitMQ user inventory differs from the exact apps-only contract.'
+}
+
+verify_current_rabbitmq_user_inventory
+
 docker run --rm \
 	--interactive \
 	--network host \
@@ -1588,7 +1708,6 @@ docker run --rm \
 	--env-file "$env_file" \
 	--env "NOTIFICATION_TOPOLOGY_CONTRACT=$notification_topology_contract" \
 	--env "REPORTING_TOPOLOGY_CONTRACT=$reporting_topology_contract" \
-	--env "WINWIDGET_DEPLOY_MODE=$deploy_mode" \
 	--entrypoint node \
 	"winwidget-operations:git-$services_revision" - <<'PROVISION_RABBITMQ'
 const amqp = require('amqplib');
@@ -1858,9 +1977,6 @@ if (
 	reportingTopology.queueNames.length < 1 ||
 	new Set(reportingTopology.queueNames).size !==
 		reportingTopology.queueNames.length ||
-	reportingTopology.routingKeys.includes(
-		'reporting.core-operational-routing.changed.v1'
-	) ||
 	reportingTopology.queueNames.some(
 		name =>
 			typeof name !== 'string' ||
@@ -2053,42 +2169,6 @@ const provisionTopology = async () => {
 	}
 };
 
-const removeRetiredReportingBinding = async () => {
-	if (value('WINWIDGET_DEPLOY_MODE') !== 'cutover') return;
-	const exchange = 'winwidget.events';
-	const queue = reportingTopology.reportingSettingsQueue;
-	const retiredRoutingKey =
-		'reporting.core-operational-routing.changed.v1';
-	const basePath =
-		`/api/bindings/${encoded(vhost)}/e/${encoded(exchange)}/q/${encoded(queue)}`;
-	const bindings = await request(basePath, {}, [200, 404]);
-	if (bindings !== null && !Array.isArray(bindings)) fail();
-	const retired = (bindings ?? []).filter(
-		binding =>
-			binding?.source === exchange &&
-			binding?.destination === queue &&
-			binding?.destination_type === 'queue' &&
-			binding?.routing_key === retiredRoutingKey
-	);
-	if (retired.length > 1) fail();
-	for (const binding of retired) {
-		if (
-			typeof binding.properties_key !== 'string' ||
-			!binding.properties_key
-		) fail();
-		await request(
-			`${basePath}/${encoded(binding.properties_key)}`,
-			{ method: 'DELETE' }
-		);
-	}
-	const remaining = await request(basePath, {}, [200, 404]);
-	if (
-		(remaining ?? []).some(
-			binding => binding?.routing_key === retiredRoutingKey
-		)
-	) fail();
-};
-
 (async () => {
 	await connect(adminUser, adminPassword, 'winwidget-infra-admin-check');
 	await request(`/api/vhosts/${encoded(vhost)}`, { method: 'PUT' });
@@ -2109,7 +2189,6 @@ const removeRetiredReportingBinding = async () => {
 		exactAdminPermission?.read !== '.*'
 	) fail();
 	await provisionTopology();
-	await removeRetiredReportingBinding();
 	for (const user of users) {
 		await request(`/api/users/${encoded(user.username)}`, {
 			method: 'PUT',
@@ -2194,221 +2273,79 @@ const removeRetiredReportingBinding = async () => {
 });
 PROVISION_RABBITMQ
 
-recover_failed_reporting_terminal_migration() {
-	local migration_name='20260826020000_remove_core_runtime_dependencies'
-	local postgres_container_id failed_state remaining_failed_state
-	postgres_container_id="$(find_project_service_container reporting-postgres)"
-	[[ -n "$postgres_container_id" ]] || return 1
-	if ! failed_state="$(
-		docker exec "$postgres_container_id" sh -ec '
-			exec psql \
-				--username "$POSTGRES_USER" \
-				--dbname "$POSTGRES_DB" \
-				--no-psqlrc \
-				--tuples-only \
-				--no-align \
-				--set ON_ERROR_STOP=1 \
-				--command "
-					SELECT migration_name || '\''|'\'' || applied_steps_count::text
-					FROM reporting.\"_prisma_migrations\"
-					WHERE finished_at IS NULL
-						AND rolled_back_at IS NULL
-					ORDER BY started_at;
-				"
-		' 2>/dev/null
-	)"; then
-		return 1
-	fi
-	[[ "$failed_state" == "$migration_name|0" ]] || return 1
-	compose_all run --rm --no-deps reporting-migrate \
-		migrate resolve \
-		--rolled-back "$migration_name" \
-		--schema prisma/schema.prisma >/dev/null 2>&1 ||
-		die 'Cannot mark the exact unapplied Reporting terminal migration as rolled back.'
-	remaining_failed_state="$(
-		docker exec "$postgres_container_id" sh -ec '
-			exec psql \
-				--username "$POSTGRES_USER" \
-				--dbname "$POSTGRES_DB" \
-				--no-psqlrc \
-				--tuples-only \
-				--no-align \
-				--set ON_ERROR_STOP=1 \
-				--command "
-					SELECT migration_name
-					FROM reporting.\"_prisma_migrations\"
-					WHERE finished_at IS NULL
-						AND rolled_back_at IS NULL
-					ORDER BY started_at;
-				"
-		' 2>/dev/null
-	)" || die 'Cannot verify the Reporting migration recovery state.'
-	[[ -z "$remaining_failed_state" ]] ||
-		die 'Reporting still has an unresolved failed migration after recovery.'
-}
-
 for migration_service in "${migration_services[@]}"; do
-	if ! compose_all run --rm --no-deps "$migration_service" >/dev/null 2>&1; then
-		if [[ "$deploy_mode" == 'cutover' &&
-			"$migration_service" == 'reporting-migrate' ]] &&
-			recover_failed_reporting_terminal_migration; then
-			compose_all run --rm --no-deps "$migration_service" >/dev/null 2>&1 ||
-				die "Production migration failed after exact recovery: $migration_service"
-		else
-			die "Production migration failed: $migration_service"
-		fi
-	fi
+	compose_all run --rm --no-deps "$migration_service" >/dev/null 2>&1 ||
+		die "Production migration failed: $migration_service"
 done
 
-run_operations_cli() {
-	compose_all run --rm --no-deps operations-api node "$@"
+verify_operations_service_identity() {
+	compose_all run --rm --no-deps --interactive \
+		--entrypoint node \
+		operations-api - <<'VERIFY_OPERATIONS_SERVICE_IDENTITY' >/dev/null
+const { PrismaClient } = require('@prisma/operations-client');
+
+const databaseUrl = process.env.OPERATIONS_DATABASE_URL ?? '';
+if (!databaseUrl) process.exit(1);
+const client = new PrismaClient({
+	datasources: { db: { url: databaseUrl } }
+});
+
+(async () => {
+	const rows = await client.$queryRaw`
+		SELECT
+			id::text AS "id",
+			service_name::text AS "serviceName",
+			database_id::text AS "databaseId"
+		FROM "operations"."service_identity"
+		ORDER BY id
+	`;
+	if (
+		rows.length !== 1 ||
+		rows[0].id !== 'singleton' ||
+		rows[0].serviceName !== 'operations-service' ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+			rows[0].databaseId
+		)
+	) throw new Error('invalid Operations service identity');
+})()
+	.catch(() => {
+		process.stderr.write('Operations service identity verification failed.\n');
+		process.exitCode = 1;
+	})
+	.finally(async () => {
+		await client.$disconnect();
+	});
+VERIFY_OPERATIONS_SERVICE_IDENTITY
 }
 
-run_operations_cli_with_file() {
-	local source_file="$1"
-	local target_file="$2"
-	shift 2
-	compose_all run --rm --no-deps \
-		--volume "$source_file:$target_file:ro" \
-		operations-api node "$@"
-}
+verify_operations_service_identity
 
-verify_cutover_input_inventory() {
-	local cutover_input_directory entry_path
-	local -a cutover_input_entries=()
-	cutover_input_directory="$(dirname "$operations_snapshot_file")"
-	[[ "$cutover_input_directory" == "$(dirname "$control_plane_snapshot_file")" ]] ||
-		die 'Operations cutover snapshots do not share the protected directory.'
-	assert_root_owned_directory "$cutover_input_directory"
-	mapfile -d '' -t cutover_input_entries < <(
-		find "$cutover_input_directory" -xdev -mindepth 1 -maxdepth 1 -print0
-	)
-	[[ "${#cutover_input_entries[@]}" == '2' ]] ||
-		die 'Protected cutover input directory must contain exactly two snapshots.'
-	for entry_path in "${cutover_input_entries[@]}"; do
-		[[ "$entry_path" == "$operations_snapshot_file" ||
-			"$entry_path" == "$control_plane_snapshot_file" ]] ||
-			die 'Protected cutover input directory contains an unexpected artifact.'
-	done
-}
-
-verified_control_plane_event_id=''
-verified_control_plane_source_revision=''
-verify_control_plane_convergence() {
-	local expected_sha256="$1"
-	local expected_event_id="${2:-}"
-	local expected_source_revision="${3:-}"
-	local require_current_projection="${4:-false}"
-	local operations_result event_id source_revision route_thread_id changed_at extra_field
-	[[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] ||
-		die 'Control-plane convergence SHA-256 is invalid.'
-	[[ -z "$expected_event_id" ||
-		"$expected_event_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
-		die 'Control-plane convergence event ID is invalid.'
-	[[ -z "$expected_source_revision" ||
-		"$expected_source_revision" =~ ^[0-9a-f]{40}$ ]] ||
-		die 'Control-plane convergence source revision is invalid.'
-	[[ "$require_current_projection" == 'true' ||
-		"$require_current_projection" == 'false' ]] ||
-		die 'Control-plane convergence projection mode is invalid.'
-
-	operations_result="$(
+verify_current_reporting_routing_projection() {
+	local route_thread_id
+	route_thread_id="$(
 		compose_all run --rm --no-deps --interactive \
-			--env "EXPECTED_CONTROL_PLANE_SHA256=$expected_sha256" \
-			--env "REQUIRE_CURRENT_CONTROL_PLANE_PROJECTION=$require_current_projection" \
-			operations-api node - <<'VERIFY_OPERATIONS_CONTROL_PLANE'
-const {
-	OutboxStatus,
-	PrismaClient
-} = require('@prisma/operations-client');
-const constants = require('./dist/src/messaging/operations-messaging.constants.js');
+			--entrypoint node \
+			operations-api - <<'VERIFY_CURRENT_OPERATIONS_ROUTING'
+const { PrismaClient } = require('@prisma/operations-client');
 
-const fail = () => {
-	throw new Error('Operations control-plane convergence failed');
-};
-const sha256 = process.env.EXPECTED_CONTROL_PLANE_SHA256 ?? '';
 const databaseUrl = process.env.OPERATIONS_DATABASE_URL ?? '';
 const managementUrl = process.env.RABBITMQ_MANAGEMENT_URL ?? '';
 const monitorUser = process.env.RABBITMQ_MONITOR_USER ?? '';
 const monitorPassword = process.env.RABBITMQ_MONITOR_PASSWORD ?? '';
 const vhost = process.env.RABBITMQ_VHOST ?? '';
-const requireCurrentProjection =
-	process.env.REQUIRE_CURRENT_CONTROL_PLANE_PROJECTION === 'true';
-if (
-	!/^[0-9a-f]{64}$/.test(sha256) ||
-	!databaseUrl ||
-	!managementUrl ||
-	!monitorUser ||
-	!monitorPassword ||
-	!vhost
-) fail();
-
+if (!databaseUrl || !managementUrl || !monitorUser || !monitorPassword || vhost !== 'winwidget') {
+	process.exit(1);
+}
 const client = new PrismaClient({
 	datasources: { db: { url: databaseUrl } }
 });
-const sleep = milliseconds =>
-	new Promise(resolve => setTimeout(resolve, milliseconds));
 
 (async () => {
-	let converged;
-	for (let attempt = 0; attempt < 30; attempt += 1) {
-		const [state, outbox, settings] = await Promise.all([
-			client.operationsControlPlaneBootstrapState.findUnique({
-				where: { id: 'singleton' }
-			}),
-			client.outboxEvent.findUnique({
-				where: {
-					deduplicationKey: `operations-control-bootstrap-routing:${sha256}`
-				}
-			}),
-			client.telegramBotSettings.findUnique({
-				where: { id: 'singleton' },
-				select: { operationalAlertsThreadId: true }
-			})
-		]);
-		if (
-			!state ||
-			state.sourceSha256 !== sha256 ||
-			!/^[0-9a-f]{40}$/.test(state.sourceRevision) ||
-			(requireCurrentProjection && !settings)
-		) fail();
-		if (outbox?.status === OutboxStatus.PUBLISHED) {
-			const payload = outbox.payload;
-			if (
-				!payload ||
-				typeof payload !== 'object' ||
-				Array.isArray(payload) ||
-				JSON.stringify(Object.keys(payload).sort()) !==
-					JSON.stringify([
-						'changedAt',
-						'eventId',
-						'operationalAlertsThreadId',
-						'schemaVersion'
-					]) ||
-				payload.schemaVersion !== 1 ||
-				payload.eventId !== outbox.eventId ||
-				(requireCurrentProjection &&
-					payload.operationalAlertsThreadId !==
-						settings.operationalAlertsThreadId) ||
-				typeof payload.changedAt !== 'string' ||
-				!Number.isFinite(Date.parse(payload.changedAt)) ||
-				outbox.eventType !==
-					constants.OPERATIONS_NOTIFICATION_ROUTING_CHANGED_EVENT_TYPE ||
-				outbox.routingKey !==
-					constants.OPERATIONS_NOTIFICATION_ROUTING_CHANGED_ROUTING_KEY ||
-				!outbox.publishedAt
-			) fail();
-			converged = {
-				eventId: outbox.eventId,
-				sourceRevision: state.sourceRevision,
-				routeThreadId: payload.operationalAlertsThreadId,
-				changedAt: payload.changedAt
-			};
-			break;
-		}
-		await sleep(2000);
-	}
-	if (!converged) fail();
+	const settings = await client.telegramBotSettings.findUnique({
+		where: { id: 'singleton' },
+		select: { operationalAlertsThreadId: true }
+	});
+	if (!settings) throw new Error('Operations Telegram settings are missing');
 
 	const base = new URL(managementUrl);
 	const bindingUrl = new URL(
@@ -2422,84 +2359,50 @@ const sleep = milliseconds =>
 		redirect: 'error',
 		signal: AbortSignal.timeout(10000)
 	});
-	if (!response.ok) fail();
+	if (!response.ok) throw new Error('Reporting settings binding is unavailable');
 	const bindings = await response.json();
-	if (!Array.isArray(bindings)) fail();
+	if (!Array.isArray(bindings)) throw new Error('Reporting settings bindings are invalid');
 	const current = bindings.filter(
 		binding =>
 			binding?.source === 'winwidget.events' &&
 			binding?.destination === 'winwidget.reporting.settings' &&
 			binding?.destination_type === 'queue' &&
-			binding?.routing_key ===
-				'operations.notification-routing.changed.v1'
+			binding?.routing_key === 'operations.notification-routing.changed.v1'
 	);
-	const retired = bindings.filter(
-		binding =>
-			binding?.source === 'winwidget.events' &&
-			binding?.destination === 'winwidget.reporting.settings' &&
-			binding?.destination_type === 'queue' &&
-			binding?.routing_key ===
-				'reporting.core-operational-routing.changed.v1'
-	);
-	if (current.length !== 1 || retired.length !== 0) fail();
-
+	if (bindings.length !== 1 || current.length !== 1) {
+		throw new Error('Reporting settings binding differs from the current contract');
+	}
 	process.stdout.write(
-		`${converged.eventId}|${converged.sourceRevision}|${converged.routeThreadId === null ? 'null' : converged.routeThreadId}|${converged.changedAt}`
+		settings.operationalAlertsThreadId === null
+			? 'null'
+			: String(settings.operationalAlertsThreadId)
 	);
 })()
 	.catch(() => {
-		process.stderr.write(
-			'Operations control-plane convergence verification failed.\n'
-		);
+		process.stderr.write('Current Operations routing verification failed.\n');
 		process.exitCode = 1;
 	})
 	.finally(async () => {
 		await client.$disconnect();
 	});
-VERIFY_OPERATIONS_CONTROL_PLANE
-	)" || die 'Operations control-plane convergence verification failed.'
-	[[ -n "$operations_result" && "$operations_result" != *$'\n'* ]] ||
-		die 'Operations control-plane convergence result is malformed.'
-	IFS='|' read -r event_id source_revision route_thread_id changed_at extra_field <<<"$operations_result"
-	[[ "$event_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
-		"$source_revision" =~ ^[0-9a-f]{40}$ &&
-		("$route_thread_id" == 'null' || "$route_thread_id" =~ ^[1-9][0-9]*$) &&
-		"$changed_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T &&
-		-z "$extra_field" ]] ||
-		die 'Operations control-plane convergence result is invalid.'
-	[[ -z "$expected_event_id" || "$event_id" == "$expected_event_id" ]] ||
-		die 'Operations bootstrap event differs from the terminal marker.'
-	[[ -z "$expected_source_revision" ||
-		"$source_revision" == "$expected_source_revision" ]] ||
-		die 'Operations bootstrap source revision differs from the terminal marker.'
+VERIFY_CURRENT_OPERATIONS_ROUTING
+	)" || die 'Current Operations routing verification failed.'
+	[[ "$route_thread_id" == 'null' || "$route_thread_id" =~ ^[1-9][0-9]*$ ]] ||
+		die 'Current Operations routing value is invalid.'
 
 	compose_all run --rm --no-deps --interactive \
-		--env "EXPECTED_CONTROL_PLANE_EVENT_ID=$event_id" \
-		--env "EXPECTED_CONTROL_PLANE_ROUTE_THREAD_ID=$route_thread_id" \
-		--env "EXPECTED_CONTROL_PLANE_CHANGED_AT=$changed_at" \
-		--env "REQUIRE_CURRENT_CONTROL_PLANE_PROJECTION=$require_current_projection" \
-		reporting-service node - <<'VERIFY_REPORTING_CONTROL_PLANE' >/dev/null
+		--env "EXPECTED_OPERATIONAL_ALERTS_THREAD_ID=$route_thread_id" \
+		--entrypoint node \
+		reporting-service - <<'VERIFY_CURRENT_REPORTING_ROUTING' >/dev/null
 const { PrismaClient } = require('@prisma/reporting-client');
 
-const fail = () => {
-	throw new Error('Reporting control-plane convergence failed');
-};
-const eventId = process.env.EXPECTED_CONTROL_PLANE_EVENT_ID ?? '';
-const routeThreadRaw =
-	process.env.EXPECTED_CONTROL_PLANE_ROUTE_THREAD_ID ?? '';
-const changedAt = process.env.EXPECTED_CONTROL_PLANE_CHANGED_AT ?? '';
+const expectedRaw = process.env.EXPECTED_OPERATIONAL_ALERTS_THREAD_ID ?? '';
 const databaseUrl = process.env.REPORTING_DATABASE_URL ?? '';
-const requireCurrentProjection =
-	process.env.REQUIRE_CURRENT_CONTROL_PLANE_PROJECTION === 'true';
-if (
-	!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(eventId) ||
-	!(routeThreadRaw === 'null' || /^[1-9][0-9]*$/.test(routeThreadRaw)) ||
-	!Number.isFinite(Date.parse(changedAt)) ||
-	!databaseUrl
-) fail();
-const routeThreadId =
-	routeThreadRaw === 'null' ? null : Number(routeThreadRaw);
-if (routeThreadId !== null && !Number.isSafeInteger(routeThreadId)) fail();
+if (!(expectedRaw === 'null' || /^[1-9][0-9]*$/.test(expectedRaw)) || !databaseUrl) {
+	process.exit(1);
+}
+const expected = expectedRaw === 'null' ? null : Number(expectedRaw);
+if (expected !== null && !Number.isSafeInteger(expected)) process.exit(1);
 const client = new PrismaClient({
 	datasources: { db: { url: databaseUrl } }
 });
@@ -2508,191 +2411,26 @@ const sleep = milliseconds =>
 
 (async () => {
 	for (let attempt = 0; attempt < 30; attempt += 1) {
-		const [receipt, settings] = await Promise.all([
-			client.consumerReceipt.findUnique({
-				where: {
-					eventId_consumer: {
-						eventId,
-						consumer: 'reporting-settings-v1'
-					}
-				}
-			}),
-			client.reportingSettings.findUnique({
-				where: { id: 'daily-summary' },
-				select: {
-					operationalAlertsThreadId: true,
-					operationalAlertsChangedAt: true
-				}
-			})
-		]);
-		if (receipt?.status === 'DEAD_LETTERED') fail();
-		if (receipt?.status === 'DELIVERED' && receipt.deliveredAt) {
-			if (
-				!requireCurrentProjection ||
-				(settings?.operationalAlertsThreadId === routeThreadId &&
-					settings.operationalAlertsChangedAt?.toISOString() ===
-						new Date(changedAt).toISOString())
-			) return;
-		}
+		const settings = await client.reportingSettings.findUnique({
+			where: { id: 'daily-summary' },
+			select: { operationalAlertsThreadId: true }
+		});
+		if (settings?.operationalAlertsThreadId === expected) return;
 		await sleep(2000);
 	}
-	fail();
+	throw new Error('Reporting routing projection did not converge');
 })()
 	.catch(() => {
-		process.stderr.write(
-			'Reporting control-plane convergence verification failed.\n'
-		);
+		process.stderr.write('Current Reporting routing verification failed.\n');
 		process.exitCode = 1;
 	})
 	.finally(async () => {
 		await client.$disconnect();
 	});
-VERIFY_REPORTING_CONTROL_PLANE
-
-	verified_control_plane_event_id="$event_id"
-	verified_control_plane_source_revision="$source_revision"
+VERIFY_CURRENT_REPORTING_ROUTING
 }
 
-terminal_marker_cutover_revision=''
-terminal_marker_operations_sha256=''
-terminal_marker_control_plane_sha256=''
-terminal_marker_source_revision=''
-terminal_marker_event_id=''
-validate_terminal_cutover_marker() {
-	local -a marker_lines=()
-	[[ -f "$terminal_cutover_marker" && ! -L "$terminal_cutover_marker" &&
-		"$(realpath -e "$terminal_cutover_marker")" == \
-			"$terminal_cutover_marker" &&
-		"$(stat -c '%u:%g:%a:%h' "$terminal_cutover_marker")" == \
-			'0:0:600:1' ]] || return 1
-	mapfile -t marker_lines <"$terminal_cutover_marker"
-	[[ "${#marker_lines[@]}" == '7' &&
-		"${marker_lines[0]}" == 'version=1' ]] || return 1
-	[[ "${marker_lines[1]}" =~ ^cutover_services_revision=([0-9a-f]{40})$ ]] ||
-		return 1
-	terminal_marker_cutover_revision="${BASH_REMATCH[1]}"
-	[[ "${marker_lines[2]}" =~ ^operations_snapshot_sha256=([0-9a-f]{64})$ ]] ||
-		return 1
-	terminal_marker_operations_sha256="${BASH_REMATCH[1]}"
-	[[ "${marker_lines[3]}" =~ ^control_plane_snapshot_sha256=([0-9a-f]{64})$ ]] ||
-		return 1
-	terminal_marker_control_plane_sha256="${BASH_REMATCH[1]}"
-	[[ "${marker_lines[4]}" =~ ^control_plane_source_revision=([0-9a-f]{40})$ ]] ||
-		return 1
-	terminal_marker_source_revision="${BASH_REMATCH[1]}"
-	[[ "${marker_lines[5]}" =~ ^bootstrap_event_id=([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$ ]] ||
-		return 1
-	terminal_marker_event_id="${BASH_REMATCH[1]}"
-	[[ "${marker_lines[6]}" == \
-		'core_system_identifier=7668360958158979115' ]] || return 1
-}
-
-write_terminal_cutover_marker() {
-	local marker_tmp
-	[[ "$deploy_mode" == 'cutover' &&
-		"$operations_snapshot_sha256" =~ ^[0-9a-f]{64}$ &&
-		"$control_plane_snapshot_sha256" =~ ^[0-9a-f]{64}$ &&
-		"$verified_control_plane_source_revision" =~ ^[0-9a-f]{40}$ &&
-		"$verified_control_plane_event_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
-		! -e "$terminal_cutover_marker" && ! -L "$terminal_cutover_marker" ]] ||
-		die 'Terminal cutover marker cannot be created safely.'
-	marker_tmp="$(mktemp "$deploy_state_directory/.microservices-terminal-cutover.XXXXXX")"
-	if ! {
-		printf '%s\n' \
-			'version=1' \
-			"cutover_services_revision=$services_revision" \
-			"operations_snapshot_sha256=$operations_snapshot_sha256" \
-			"control_plane_snapshot_sha256=$control_plane_snapshot_sha256" \
-			"control_plane_source_revision=$verified_control_plane_source_revision" \
-			"bootstrap_event_id=$verified_control_plane_event_id" \
-			'core_system_identifier=7668360958158979115' >"$marker_tmp" &&
-			chown 0:0 "$marker_tmp" &&
-			chmod 600 "$marker_tmp" &&
-			sync -f "$marker_tmp" &&
-			mv -f -- "$marker_tmp" "$terminal_cutover_marker" &&
-			sync -f "$deploy_state_directory" &&
-			validate_terminal_cutover_marker
-	}; then
-		rm -f -- "$marker_tmp"
-		if [[ -f "$terminal_cutover_marker" &&
-			! -L "$terminal_cutover_marker" ]]; then
-			rm -f -- "$terminal_cutover_marker" ||
-				die 'Invalid terminal cutover marker could not be removed.'
-			sync -f "$deploy_state_directory" ||
-				die 'Terminal cutover marker cleanup could not be synchronized.'
-		fi
-		die 'Terminal cutover marker could not be written and verified.'
-	fi
-}
-
-cleanup_terminal_snapshot_artifacts() {
-	local cutover_input_directory legacy_operations_snapshot_root entry_path
-	local expected_snapshot_sha256 snapshot_name
-	validate_terminal_cutover_marker ||
-		die 'Terminal marker is required for snapshot cleanup.'
-	cutover_input_directory="$(dirname "$operations_snapshot_file")"
-	if [[ -e "$cutover_input_directory" || -L "$cutover_input_directory" ]]; then
-		assert_root_owned_directory "$cutover_input_directory"
-		while IFS= read -r -d '' entry_path; do
-			case "$entry_path" in
-				"$operations_snapshot_file")
-					expected_snapshot_sha256="$terminal_marker_operations_sha256"
-					;;
-				"$control_plane_snapshot_file")
-					expected_snapshot_sha256="$terminal_marker_control_plane_sha256"
-					;;
-				*) die 'Protected cutover input contains an unexpected artifact.' ;;
-			esac
-			[[ -f "$entry_path" && ! -L "$entry_path" &&
-				"$(realpath -e "$entry_path")" == "$entry_path" &&
-				"$(stat -c '%u:%g:%a:%h' "$entry_path")" == '0:0:600:1' &&
-				"$(sha256sum "$entry_path" | awk '{print $1}')" == \
-					"$expected_snapshot_sha256" ]] ||
-				die 'Protected cutover snapshot differs from the terminal marker.'
-		done < <(find "$cutover_input_directory" -xdev -mindepth 1 -maxdepth 1 -print0)
-		for entry_path in \
-			"$operations_snapshot_file" \
-			"$control_plane_snapshot_file"; do
-			[[ ! -e "$entry_path" && ! -L "$entry_path" ]] ||
-				rm -f -- "$entry_path"
-		done
-		rmdir "$cutover_input_directory" 2>/dev/null ||
-			die 'Protected cutover input directory is not empty after cleanup.'
-	fi
-
-	legacy_operations_snapshot_root="$app_root/deploy/backend/operations-cutover"
-	if [[ -e "$legacy_operations_snapshot_root" ||
-		-L "$legacy_operations_snapshot_root" ]]; then
-		[[ -d "$legacy_operations_snapshot_root" &&
-			! -L "$legacy_operations_snapshot_root" &&
-			"$(realpath -e "$legacy_operations_snapshot_root")" == \
-				"$legacy_operations_snapshot_root" &&
-			"$(stat -c '%u:%g:%a' "$legacy_operations_snapshot_root")" == \
-				'0:1001:770' &&
-			"$(stat -c '%d' "$legacy_operations_snapshot_root")" == \
-				"$(stat -c '%d' "$deploy_state_directory")" ]] ||
-			die 'Legacy Operations snapshot root differs from the live reviewed contract.'
-		while IFS= read -r -d '' entry_path; do
-			snapshot_name="$(basename "$entry_path")"
-			[[ "$snapshot_name" =~ ^operations-[0-9a-f]{40}\.json$ &&
-				-f "$entry_path" && ! -L "$entry_path" &&
-				"$(realpath -e "$entry_path")" == "$entry_path" &&
-				"$(stat -c '%u:%g:%a:%h' "$entry_path")" == \
-					'1001:1001:600:1' &&
-				"$(stat -c '%d' "$entry_path")" == \
-					"$(stat -c '%d' "$legacy_operations_snapshot_root")" &&
-				"$(sha256sum "$entry_path" | awk '{print $1}')" == \
-					"$terminal_marker_operations_sha256" ]] ||
-				die 'Legacy Operations snapshot differs from the terminal marker.'
-		done < <(find "$legacy_operations_snapshot_root" -xdev -mindepth 1 -maxdepth 1 -print0)
-		find "$legacy_operations_snapshot_root" -xdev -mindepth 1 -maxdepth 1 \
-			-type f -name 'operations-*.json' -delete
-		rmdir "$legacy_operations_snapshot_root" 2>/dev/null ||
-			die 'Legacy Operations snapshot directory is not empty after cleanup.'
-	fi
-}
-
-verify_terminal_cutover_state() {
+verify_steady_state() {
 	local rabbitmq_container_id queue_name actual_rabbitmq_user_names
 	local remaining_legacy_queues listener_inventory retired_service entry_path
 	local retired_container_id core_container_id
@@ -2710,16 +2448,10 @@ verify_terminal_cutover_state() {
 		database-restore-worker
 		migrate
 	)
-	validate_terminal_cutover_marker ||
-		die 'Terminal microservices cutover marker is invalid.'
-	verify_control_plane_convergence \
-		"$terminal_marker_control_plane_sha256" \
-		"$terminal_marker_event_id" \
-		"$terminal_marker_source_revision"
-
+	verify_current_reporting_routing_projection
 	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
 	[[ -n "$rabbitmq_container_id" && "$rabbitmq_container_id" != *$'\n'* ]] ||
-		die 'Exactly one running RabbitMQ container is required for terminal verification.'
+		die 'Exactly one running RabbitMQ container is required for steady-state verification.'
 	for source in campaigns reporting widgets billing identity platform support; do
 		for suffix in '' .retry-v2.1 .retry-v2.2 .retry-v2.3 .dead-letter; do
 			legacy_queue_names+=("winwidget.admin.audit.$source.v1$suffix")
@@ -2757,38 +2489,38 @@ verify_terminal_cutover_state() {
 	remaining_legacy_queues="$(
 		docker exec "$rabbitmq_container_id" rabbitmqctl --silent \
 			list_queues -p winwidget name
-	)" || die 'Cannot verify the terminal RabbitMQ queue inventory.'
+	)" || die 'Cannot verify the steady-state RabbitMQ queue inventory.'
 	for queue_name in "${legacy_queue_names[@]}"; do
 		if awk -v queue="$queue_name" \
 			'$1 == queue { found = 1 } END { exit(found ? 0 : 1) }' \
 			<<<"$remaining_legacy_queues"; then
-			die "Legacy RabbitMQ queue remains after terminal cutover: $queue_name"
+			die "Legacy RabbitMQ queue remains in steady state: $queue_name"
 		fi
 	done
 	actual_rabbitmq_user_names="$(
 		docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_users |
 			awk 'NF { print $1 }' | LC_ALL=C sort
-	)" || die 'Cannot verify the terminal RabbitMQ user inventory.'
+	)" || die 'Cannot verify the steady-state RabbitMQ user inventory.'
 	[[ "$actual_rabbitmq_user_names" == "$rabbitmq_expected_user_names" ]] ||
 		die 'RabbitMQ user inventory differs from the exact apps-only contract.'
 	for legacy_user in "${legacy_rabbitmq_users[@]}"; do
 		if grep -Fqx -- "$legacy_user" <<<"$actual_rabbitmq_user_names"; then
-			die "Legacy RabbitMQ user remains after terminal cutover: $legacy_user"
+			die "Legacy RabbitMQ user remains in steady state: $legacy_user"
 		fi
 	done
 	for retired_service in "${retired_compose_services[@]}"; do
 		retired_container_id="$(find_project_service_container "$retired_service")"
 		[[ -z "$retired_container_id" ]] ||
-			die "Retired Compose container remains after terminal cutover: $retired_service"
+			die "Retired Compose container remains in steady state: $retired_service"
 	done
 
 	core_container_id="$(
 		find_exact_named_container winwidget-core-postgres-temporary
 	)"
 	[[ -z "$core_container_id" ]] ||
-		die 'Temporary Core PostgreSQL container remains after terminal cutover.'
+		die 'Temporary Core PostgreSQL container remains in steady state.'
 	! docker_volume_exists winwidget-core-postgres-temporary-data ||
-		die 'Temporary Core PostgreSQL volume remains after terminal cutover.'
+		die 'Temporary Core PostgreSQL volume remains in steady state.'
 	for entry_path in \
 		"$app_root/deploy/backend/.core-postgres-temporary-admin-password" \
 		"$app_root/deploy/backend/.core-terminal-cleanup-v1" \
@@ -2799,7 +2531,7 @@ verify_terminal_cutover_state() {
 		"$app_root/restore-staging/core-20260730" \
 		"$app_root/restore-staging/core-cutover-20260731"; do
 		[[ ! -e "$entry_path" && ! -L "$entry_path" ]] ||
-			die 'A protected legacy Core/restore artifact remains after terminal cutover.'
+			die 'A protected legacy Core/restore artifact remains in steady state.'
 	done
 
 	command -v ss >/dev/null 2>&1 ||
@@ -2810,60 +2542,8 @@ verify_terminal_cutover_state() {
 		<<<"$listener_inventory"; then
 		die 'A listener remains on the retired Core port 4200.'
 	fi
+	verify_exact_project_container_inventory
 }
-
-if [[ "$deploy_mode" == 'cutover' ]]; then
-	verify_cutover_input_inventory
-	for snapshot_file in "$operations_snapshot_file" "$control_plane_snapshot_file"; do
-		[[ -f "$snapshot_file" && ! -L "$snapshot_file" ]] ||
-			die 'A protected Operations cutover snapshot is missing.'
-		[[ "$(stat -c '%u:%g:%a:%h' "$snapshot_file")" == '0:0:600:1' ]] ||
-			die 'Operations cutover snapshots must be root:root mode 0600.'
-	done
-	[[ "$(sha256sum "$operations_snapshot_file" | awk '{print $1}')" == "$operations_snapshot_sha256" ]] ||
-		die 'Operations snapshot differs from its approved SHA-256.'
-	[[ "$(sha256sum "$control_plane_snapshot_file" | awk '{print $1}')" == "$control_plane_snapshot_sha256" ]] ||
-		die 'Operations control-plane snapshot differs from its approved SHA-256.'
-
-	run_operations_cli_with_file \
-		"$operations_snapshot_file" \
-		/run/winwidget/operations.snapshot.json \
-		dist/src/cutover/main.js import \
-		--file /run/winwidget/operations.snapshot.json \
-		--sha256 "$operations_snapshot_sha256" \
-		>/dev/null
-	run_operations_cli \
-		dist/src/cutover/main.js activate \
-		--sha256 "$operations_snapshot_sha256" >/dev/null
-	run_operations_cli_with_file \
-		"$control_plane_snapshot_file" \
-		/run/winwidget/operations-control-plane.snapshot.json \
-		dist/src/cutover/control-plane-bootstrap.js \
-		--file /run/winwidget/operations-control-plane.snapshot.json \
-		--sha256 "$control_plane_snapshot_sha256" \
-		>/dev/null
-fi
-
-operations_status="$(
-	run_operations_cli dist/src/cutover/main.js status 2>/dev/null
-)" || die 'Cannot verify Operations ownership after migrations.'
-if [[ "$deploy_mode" == 'cutover' ]]; then
-	expected_operations_snapshot_sha256="$operations_snapshot_sha256"
-	expected_operations_source_revision=''
-else
-	validate_terminal_cutover_marker ||
-		die 'Routine deployment terminal marker is invalid.'
-	expected_operations_snapshot_sha256="$terminal_marker_operations_sha256"
-	expected_operations_source_revision="$terminal_marker_source_revision"
-fi
-operations_status_pattern='^\{"phase":"ACTIVE","sourceRevision":"([0-9a-f]{40})","snapshotSha256":"'"$expected_operations_snapshot_sha256"'","notes":[0-9]+,"adminEventLogs":[0-9]+\}$'
-[[ "$operations_status" =~ $operations_status_pattern ]] ||
-	die 'Operations ownership does not match the exact ACTIVE snapshot contract.'
-operations_status_source_revision="${BASH_REMATCH[1]}"
-[[ -z "$expected_operations_source_revision" ||
-	"$operations_status_source_revision" == \
-		"$expected_operations_source_revision" ]] ||
-	die 'Operations ownership source revision differs from the terminal marker.'
 
 compose_all up -d --no-build --force-recreate "${runtime_without_gateway[@]}"
 wait_for_healthy_services "${runtime_without_gateway[@]}"
@@ -2974,8 +2654,9 @@ install_and_verify_backend_nginx() {
 		die 'Live backend Nginx enabled symlink is not the exact reviewed target.'
 	command -v nginx >/dev/null 2>&1 ||
 		die 'Nginx is required on the backend VPS.'
-	command -v systemctl >/dev/null 2>&1 &&
-		systemctl is-active --quiet nginx ||
+	command -v systemctl >/dev/null 2>&1 ||
+		die 'systemctl is required on the backend VPS.'
+	systemctl is-active --quiet nginx ||
 		die 'Backend Nginx systemd service is not active.'
 	current_sha256="$(sha256sum "$nginx_target" | awk '{print $1}')"
 	if [[ "$current_sha256" != "$backend_nginx_sha256" ]]; then
@@ -3019,8 +2700,9 @@ install_and_verify_backend_nginx() {
 		if ! systemctl reload nginx; then
 			mv -f -- "$nginx_backup" "$nginx_target"
 			sync -f "$nginx_available_dir"
-			nginx -t >/dev/null 2>&1 && systemctl reload nginx ||
+			if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx; then
 				die 'Backend Nginx reload rollback failed.'
+			fi
 			die 'Apps-only backend Nginx reload failed and was rolled back.'
 		fi
 		if [[ "$(sha256sum "$nginx_target" | awk '{print $1}')" != \
@@ -3029,8 +2711,9 @@ install_and_verify_backend_nginx() {
 			! nginx -t >/dev/null 2>&1; then
 			mv -f -- "$nginx_backup" "$nginx_target"
 			sync -f "$nginx_available_dir"
-			nginx -t >/dev/null 2>&1 && systemctl reload nginx ||
+			if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx; then
 				die 'Backend Nginx post-reload rollback failed.'
+			fi
 			die 'Apps-only backend Nginx post-reload verification failed and was rolled back.'
 		fi
 		rm -f -- "$nginx_backup"
@@ -3048,7 +2731,7 @@ install_and_verify_backend_nginx
 wait_for_http_ok 'http://127.0.0.1:4100/health/ready' ||
 	die 'Gateway local readiness check failed.'
 wait_for_http_revision \
-	'http://127.0.0.1:5200/health/deployment' "$services_revision" ||
+	'http://127.0.0.1:5200/api/v1/health/deployment' "$services_revision" ||
 	die 'Operations deployment revision check failed.'
 wait_for_http_revision \
 	'https://api.winwidget.ru/api/v1/health/deployment' "$services_revision" ||
@@ -3057,430 +2740,6 @@ verify_retired_core_public_routes_absent ||
 	die 'A retired Core public route remains reachable through backend Nginx.'
 verify_telegram_proxy_health ||
 	die 'Pinned Telegram proxy health check failed.'
-
-if [[ "$deploy_mode" == 'cutover' ]]; then
-	verify_control_plane_convergence \
-		"$control_plane_snapshot_sha256" '' '' true
-	[[ "$operations_status_source_revision" == \
-		"$verified_control_plane_source_revision" ]] ||
-		die 'Operations and control-plane snapshots have different source revisions.'
-	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
-	[[ -n "$rabbitmq_container_id" && "$rabbitmq_container_id" != *$'\n'* ]] ||
-		die 'Exactly one running RabbitMQ container is required for terminal cleanup.'
-
-	legacy_queue_names=()
-	for source in campaigns reporting widgets billing identity platform support; do
-		for suffix in '' .retry-v2.1 .retry-v2.2 .retry-v2.3 .dead-letter; do
-			legacy_queue_names+=("winwidget.admin.audit.$source.v1$suffix")
-		done
-	done
-	legacy_queue_names+=(
-		winwidget.operations.admin.audit.core.v1
-		winwidget.operations.admin.audit.core.v1.retry-v1
-		winwidget.operations.admin.audit.core.v1.dead-letter
-	)
-	for base in \
-		winwidget.core.billing.payment-details.v1 \
-		winwidget.core.billing.subscription-details.v1 \
-		winwidget.core.billing.affiliate.v1 \
-		winwidget.maintenance.database-backup \
-		winwidget.notification.delivery-outcome; do
-		for suffix in '' .retry-v2.1 .retry-v2.2 .retry-v2.3 .dead-letter; do
-			legacy_queue_names+=("$base$suffix")
-		done
-	done
-	legacy_queue_names+=(
-		winwidget.core.billing.settings.v1
-		winwidget.core.billing.settings.v1.retry-v2.1
-		winwidget.core.billing.settings.v1.retry-v2.2
-		winwidget.core.billing.settings.v1.retry-v2.3
-		winwidget.core.billing.settings.v1.dead-letter
-	)
-	for base in \
-		winwidget.billing.offer.v1 \
-		winwidget.billing.settings-source.v1; do
-		for suffix in '' .retry.1 .retry.2 .retry.3 .dead-letter; do
-			legacy_queue_names+=("$base$suffix")
-		done
-	done
-
-	legacy_queue_inventory="$(
-		docker exec "$rabbitmq_container_id" rabbitmqctl --silent \
-			list_queues -p winwidget name messages messages_ready \
-			messages_unacknowledged consumers
-	)"
-	for queue_name in "${legacy_queue_names[@]}"; do
-		queue_row="$(awk -v queue="$queue_name" '$1 == queue { print; count += 1 } END { if (count > 1) exit 1 }' <<<"$legacy_queue_inventory")" ||
-			die 'Legacy RabbitMQ queue inventory is ambiguous.'
-		[[ -n "$queue_row" ]] || continue
-		read -r _queue_name messages messages_ready messages_unacknowledged consumers <<<"$queue_row"
-		[[ "$messages" == '0' && "$messages_ready" == '0' &&
-			"$messages_unacknowledged" == '0' && "$consumers" == '0' ]] ||
-			die "Legacy RabbitMQ queue is not empty and unused: $queue_name"
-		docker exec "$rabbitmq_container_id" rabbitmqctl delete_queue \
-			-p winwidget "$queue_name" --if-empty --if-unused >/dev/null
-	done
-
-	legacy_rabbitmq_users=(
-		winwidget-publisher
-		winwidget-integration
-		winwidget-maintenance
-	)
-	for legacy_user in "${legacy_rabbitmq_users[@]}"; do
-		if ! docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_users |
-			awk '{ print $1 }' | grep -Fqx -- "$legacy_user"; then
-			continue
-		fi
-		if docker exec "$rabbitmq_container_id" rabbitmqctl --silent \
-			list_connections user | awk -v user="$legacy_user" '$1 == user { found = 1 } END { exit(found ? 0 : 1) }'; then
-			die "Legacy RabbitMQ user still has a connection: $legacy_user"
-		fi
-		while IFS= read -r rabbitmq_vhost; do
-			[[ -n "$rabbitmq_vhost" ]] || continue
-			docker exec "$rabbitmq_container_id" rabbitmqctl clear_permissions \
-				-p "$rabbitmq_vhost" "$legacy_user" >/dev/null 2>&1 || true
-			docker exec "$rabbitmq_container_id" rabbitmqctl clear_topic_permissions \
-				-p "$rabbitmq_vhost" "$legacy_user" >/dev/null 2>&1 || true
-		done < <(
-			docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_vhosts name
-		)
-		[[ -z "$(docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_user_permissions "$legacy_user" 2>/dev/null)" ]] ||
-			die "Legacy RabbitMQ user still has resource permissions: $legacy_user"
-		[[ -z "$(docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_user_topic_permissions "$legacy_user" 2>/dev/null)" ]] ||
-			die "Legacy RabbitMQ user still has topic permissions: $legacy_user"
-		docker exec "$rabbitmq_container_id" rabbitmqctl delete_user \
-			"$legacy_user" >/dev/null
-	done
-	actual_rabbitmq_user_names="$(
-		docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_users |
-			awk 'NF { print $1 }' | LC_ALL=C sort
-	)" || die 'Cannot verify the pre-terminal RabbitMQ user inventory.'
-	[[ "$actual_rabbitmq_user_names" == "$rabbitmq_expected_user_names" ]] ||
-		die 'RabbitMQ user inventory differs from the exact apps-only contract before Core cleanup.'
-
-	retired_compose_services=(
-		api
-		outbox-publisher
-		integration-worker
-		maintenance-worker
-		database-restore-worker
-		migrate
-	)
-	for retired_service in "${retired_compose_services[@]}"; do
-		retired_container_inventory="$(
-			docker ps -aq \
-				--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
-				--filter "label=com.docker.compose.service=$retired_service"
-		)" || die "Cannot read retired Compose inventory: $retired_service"
-		retired_container_ids=()
-		if [[ -n "$retired_container_inventory" ]]; then
-			mapfile -t retired_container_ids <<<"$retired_container_inventory"
-		fi
-		for retired_container_id in "${retired_container_ids[@]}"; do
-			[[ "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}|{{ index .Config.Labels "com.docker.compose.service" }}|{{.State.Running}}' "$retired_container_id")" == \
-				"$COMPOSE_PROJECT_NAME|$retired_service|false" ]] ||
-				die "Retired Compose target is running or has unexpected labels: $retired_service"
-			docker rm "$retired_container_id" >/dev/null
-		done
-	done
-
-	readonly core_postgres_container='winwidget-core-postgres-temporary'
-	readonly core_postgres_image='postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296'
-	readonly core_postgres_image_id='sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296'
-	readonly core_postgres_volume='winwidget-core-postgres-temporary-data'
-	readonly core_postgres_secret="$app_root/deploy/backend/.core-postgres-temporary-admin-password"
-	readonly core_postgres_cleanup_marker="$app_root/deploy/backend/.core-terminal-cleanup-v1"
-	core_cleanup_marker_container_id=''
-	validate_core_cleanup_marker() {
-		local marker_file="$1"
-		local -a marker_lines=()
-		[[ -f "$marker_file" && ! -L "$marker_file" &&
-			"$(stat -c '%u:%g:%a:%h' "$marker_file")" == '0:0:600:1' ]] ||
-			return 1
-		mapfile -t marker_lines <"$marker_file"
-		[[ "${#marker_lines[@]}" == '5' &&
-			"${marker_lines[0]}" == 'version=1' &&
-			"${marker_lines[1]}" =~ ^services_revision=[0-9a-f]{40}$ &&
-			"${marker_lines[2]}" =~ ^container_id=([0-9a-f]{64})$ &&
-			"${marker_lines[3]}" == 'system_identifier=7668360958158979115' &&
-			"${marker_lines[4]}" == "volume=$core_postgres_volume" ]] ||
-			return 1
-		core_cleanup_marker_container_id="${BASH_REMATCH[1]}"
-	}
-	core_cleanup_marker_present=false
-	if [[ -e "$core_postgres_cleanup_marker" || -L "$core_postgres_cleanup_marker" ]]; then
-		validate_core_cleanup_marker "$core_postgres_cleanup_marker" ||
-			die 'Temporary Core PostgreSQL cleanup marker is unsafe.'
-		core_cleanup_marker_present=true
-	fi
-	core_postgres_container_id="$(find_exact_named_container "$core_postgres_container")"
-	if [[ -n "$core_postgres_container_id" ]]; then
-		[[ "$core_postgres_container_id" =~ ^[0-9a-f]{64}$ ]] ||
-			die 'Temporary Core PostgreSQL container ID is invalid.'
-		if [[ "$core_cleanup_marker_present" == 'true' ]]; then
-			[[ "$core_cleanup_marker_container_id" == "$core_postgres_container_id" ]] ||
-				die 'Temporary Core PostgreSQL cleanup marker targets another container.'
-		fi
-		core_postgres_status="$(docker inspect --format '{{.State.Status}}' "$core_postgres_container_id")"
-		[[ "$core_postgres_status" == 'running' || "$core_postgres_status" == 'exited' ]] ||
-			die 'Temporary Core PostgreSQL container state is unsafe.'
-		core_postgres_identity="$(
-			docker inspect --format \
-				'{{.HostConfig.RestartPolicy.Name}}|{{.Config.Image}}|{{.Image}}|{{index .Config.Labels "com.winwidget.owner"}}|{{index .Config.Labels "com.winwidget.purpose"}}|{{index .Config.Labels "com.winwidget.cleanup-after"}}|{{with index .Config.Labels "com.docker.compose.project"}}{{.}}{{end}}' \
-				"$core_postgres_container_id"
-		)"
-		[[ "$core_postgres_identity" == \
-			"unless-stopped|$core_postgres_image|$core_postgres_image_id|core-monolith|temporary-postgres|monolith-removal|" ]] ||
-			die 'Temporary Core PostgreSQL container identity is unsafe.'
-		[[ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Type}}|{{.Name}}|{{.RW}}{{end}}{{end}}' "$core_postgres_container_id")" == \
-			"volume|$core_postgres_volume|true" ]] ||
-			die 'Temporary Core PostgreSQL data mount is unsafe.'
-		[[ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/core-postgres-admin-password"}}{{.Type}}|{{.Source}}|{{.RW}}{{end}}{{end}}' "$core_postgres_container_id")" == \
-			"bind|$core_postgres_secret|false" ]] ||
-			die 'Temporary Core PostgreSQL secret mount is unsafe.'
-		[[ -f "$core_postgres_secret" && ! -L "$core_postgres_secret" &&
-			"$(stat -c '%u:%g:%a' "$core_postgres_secret")" == '0:0:600' ]] ||
-			die 'Temporary Core PostgreSQL secret file is unsafe.'
-		[[ "$(docker port "$core_postgres_container_id" 5432/tcp 2>/dev/null)" == \
-			'127.0.0.1:55434' ]] ||
-			die 'Temporary Core PostgreSQL port boundary is unsafe.'
-		core_postgres_environment="$(
-			docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
-				"$core_postgres_container_id"
-		)"
-		for expected_core_postgres_environment in \
-			'POSTGRES_DB=default_db' \
-			'POSTGRES_USER=winwidget_core_admin' \
-			'POSTGRES_PASSWORD_FILE=/run/secrets/core-postgres-admin-password' \
-			'PGDATA=/var/lib/postgresql/18/docker' \
-			'POSTGRES_INITDB_ARGS=--locale=C.UTF-8 --encoding=UTF8 --auth-host=scram-sha-256 --data-checksums'; do
-			[[ "$(grep -Fxc -- "$expected_core_postgres_environment" <<<"$core_postgres_environment" || true)" == '1' ]] ||
-				die 'Temporary Core PostgreSQL environment identity is unsafe.'
-		done
-		[[ "$(docker volume inspect --format '{{.Driver}}|{{index .Labels "com.winwidget.owner"}}|{{index .Labels "com.winwidget.purpose"}}|{{index .Labels "com.winwidget.cleanup-after"}}' "$core_postgres_volume" 2>/dev/null)" == \
-			'local|core-monolith|temporary-postgres|monolith-removal' ]] ||
-			die 'Temporary Core PostgreSQL volume identity is unsafe.'
-		[[ "$(docker ps -a --filter "volume=$core_postgres_volume" --format '{{.Names}}')" == \
-			"$core_postgres_container" ]] ||
-			die 'Temporary Core PostgreSQL volume attachment is ambiguous.'
-		if [[ "$core_cleanup_marker_present" != 'true' ]]; then
-			if [[ "$core_postgres_status" == 'exited' ]]; then
-				docker start "$core_postgres_container_id" >/dev/null
-			fi
-			core_postgres_healthy=false
-			for _attempt in {1..30}; do
-				if [[ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$core_postgres_container_id")" == 'healthy' ]]; then
-					core_postgres_healthy=true
-					break
-				fi
-				sleep 2
-			done
-			[[ "$core_postgres_healthy" == 'true' ]] ||
-				die 'Temporary Core PostgreSQL did not become healthy.'
-			core_control_data="$(
-				docker exec "$core_postgres_container_id" \
-					pg_controldata /var/lib/postgresql/18/docker
-			)" || die 'Temporary Core PostgreSQL control data is unavailable.'
-			core_system_identifier="$(awk -F: '/Database system identifier/ { gsub(/[[:space:]]/, "", $2); print $2 }' <<<"$core_control_data")"
-			core_cluster_state="$(awk -F: '/Database cluster state/ { sub(/^[[:space:]]*/, "", $2); sub(/[[:space:]]*$/, "", $2); print $2 }' <<<"$core_control_data")"
-			core_checksum_version="$(awk -F: '/Data page checksum version/ { gsub(/[[:space:]]/, "", $2); print $2 }' <<<"$core_control_data")"
-			[[ "$core_system_identifier" == '7668360958158979115' &&
-				"$core_cluster_state" == 'in production' &&
-				"$core_checksum_version" == '1' ]] ||
-				die 'Temporary Core PostgreSQL cluster fingerprint is unsafe.'
-			docker exec "$core_postgres_container_id" pg_isready --quiet \
-				--host 127.0.0.1 --username winwidget_core_admin --dbname default_db ||
-				die 'Temporary Core PostgreSQL is not accepting connections.'
-			core_cleanup_marker_tmp="$(mktemp "$deploy_state_directory/.core-cleanup-marker.XXXXXX")"
-			printf '%s\n' \
-				'version=1' \
-				"services_revision=$services_revision" \
-				"container_id=$core_postgres_container_id" \
-				'system_identifier=7668360958158979115' \
-				"volume=$core_postgres_volume" >"$core_cleanup_marker_tmp"
-			chown 0:0 "$core_cleanup_marker_tmp"
-			chmod 600 "$core_cleanup_marker_tmp"
-			sync -f "$core_cleanup_marker_tmp"
-			mv -f -- "$core_cleanup_marker_tmp" "$core_postgres_cleanup_marker"
-			sync -f "$deploy_state_directory"
-			validate_core_cleanup_marker "$core_postgres_cleanup_marker" ||
-				die 'Temporary Core PostgreSQL cleanup marker could not be verified.'
-			core_cleanup_marker_present=true
-		fi
-		if [[ "$(docker inspect --format '{{.State.Running}}' "$core_postgres_container_id")" == 'true' ]]; then
-			docker stop --time 90 "$core_postgres_container_id" >/dev/null
-		fi
-		docker rm "$core_postgres_container_id" >/dev/null
-	fi
-	if docker_volume_exists "$core_postgres_volume"; then
-		[[ "$core_cleanup_marker_present" == 'true' ]] ||
-			die 'Temporary Core PostgreSQL volume remains without a cleanup marker.'
-		[[ "$(docker volume inspect --format '{{.Driver}}|{{index .Labels "com.winwidget.owner"}}|{{index .Labels "com.winwidget.purpose"}}|{{index .Labels "com.winwidget.cleanup-after"}}' "$core_postgres_volume")" == \
-			'local|core-monolith|temporary-postgres|monolith-removal' ]] ||
-			die 'Temporary Core PostgreSQL volume identity is unsafe.'
-		core_volume_container_ids="$(
-			docker ps -a --filter "volume=$core_postgres_volume" --format '{{.ID}}'
-		)" || die 'Cannot read temporary Core PostgreSQL volume attachments.'
-		[[ -z "$core_volume_container_ids" ]] ||
-			die 'Temporary Core PostgreSQL volume is still attached.'
-		docker volume rm "$core_postgres_volume" >/dev/null
-	fi
-	if [[ -e "$core_postgres_secret" || -L "$core_postgres_secret" ]]; then
-		[[ "$core_cleanup_marker_present" == 'true' &&
-			-f "$core_postgres_secret" && ! -L "$core_postgres_secret" &&
-			"$(stat -c '%u:%g:%a:%h' "$core_postgres_secret")" == '0:0:600:1' ]] ||
-			die 'Temporary Core PostgreSQL secret cleanup state is unsafe.'
-		rm -f -- "$core_postgres_secret"
-	fi
-	if [[ "$core_cleanup_marker_present" == 'true' ]]; then
-		remaining_core_container_id="$(
-			find_exact_named_container "$core_postgres_container"
-		)"
-		[[ -z "$remaining_core_container_id" ]] ||
-			die 'Temporary Core PostgreSQL container remains after cleanup.'
-		! docker_volume_exists "$core_postgres_volume" ||
-			die 'Temporary Core PostgreSQL volume remains after cleanup.'
-		[[ ! -e "$core_postgres_secret" && ! -L "$core_postgres_secret" ]] ||
-			die 'Temporary Core PostgreSQL secret remains after cleanup.'
-		rm -f -- "$core_postgres_cleanup_marker"
-	elif docker_volume_exists "$core_postgres_volume" ||
-		[[ -e "$core_postgres_secret" || -L "$core_postgres_secret" ]]; then
-		die 'Partial temporary Core PostgreSQL cleanup state is unsafe.'
-	fi
-
-	legacy_restore_root="$app_root/deploy/backend/database-restores"
-	if [[ -e "$legacy_restore_root" || -L "$legacy_restore_root" ]]; then
-		[[ -d "$legacy_restore_root" && ! -L "$legacy_restore_root" &&
-			"$(realpath -e "$legacy_restore_root")" == "$legacy_restore_root" &&
-			"$(stat -c '%u:%g:%a' "$legacy_restore_root")" == \
-				'1001:1001:700' &&
-			"$(stat -c '%d' "$legacy_restore_root")" == \
-				"$(stat -c '%d' "$deploy_state_directory")" ]] ||
-			die 'Legacy restore root metadata differs from the live reviewed contract.'
-		legacy_restore_directories=(
-			uploads queued processing terminal locks gates fences permits receipts
-		)
-		legacy_restore_files=(
-			worker-ready.json
-			.database-restore-worker.singleton.lock
-		)
-		while IFS= read -r -d '' entry_path; do
-			entry_name="$(basename "$entry_path")"
-			allowed_legacy_restore_entry=false
-			for allowed_entry_name in \
-				"${legacy_restore_directories[@]}" \
-				"${legacy_restore_files[@]}"; do
-				if [[ "$entry_name" == "$allowed_entry_name" ]]; then
-					allowed_legacy_restore_entry=true
-					break
-				fi
-			done
-			[[ "$allowed_legacy_restore_entry" == 'true' ]] ||
-				die 'Legacy restore root contains an unexpected artifact.'
-		done < <(find "$legacy_restore_root" -xdev -mindepth 1 -maxdepth 1 -print0)
-		for entry_name in "${legacy_restore_directories[@]}"; do
-			entry_path="$legacy_restore_root/$entry_name"
-			[[ -e "$entry_path" || -L "$entry_path" ]] || continue
-			[[ -d "$entry_path" && ! -L "$entry_path" &&
-				"$(realpath -e "$entry_path")" == "$entry_path" &&
-				"$(stat -c '%u:%g' "$entry_path")" == '1001:1001' &&
-				"$(stat -c '%d' "$entry_path")" == \
-					"$(stat -c '%d' "$legacy_restore_root")" ]] ||
-				die "Legacy restore directory target is unsafe: $entry_name"
-			find "$entry_path" -xdev -depth -delete
-		done
-		for entry_name in "${legacy_restore_files[@]}"; do
-			entry_path="$legacy_restore_root/$entry_name"
-			[[ -e "$entry_path" || -L "$entry_path" ]] || continue
-			[[ -f "$entry_path" && ! -L "$entry_path" &&
-				"$(realpath -e "$entry_path")" == "$entry_path" &&
-				"$(stat -c '%u:%g' "$entry_path")" == '1001:1001' &&
-				"$(stat -c '%d' "$entry_path")" == \
-					"$(stat -c '%d' "$legacy_restore_root")" ]] ||
-				die "Legacy restore file target is unsafe: $entry_name"
-			rm -f -- "$entry_path"
-		done
-		rmdir "$legacy_restore_root" 2>/dev/null ||
-			die 'Legacy restore root contains an unexpected artifact after cleanup.'
-	fi
-	legacy_restore_marker="$app_root/deploy/backend/.database-restore-control-v1"
-	if [[ -e "$legacy_restore_marker" || -L "$legacy_restore_marker" ]]; then
-		[[ -f "$legacy_restore_marker" && ! -L "$legacy_restore_marker" ]] ||
-			die 'Legacy restore control marker is unsafe.'
-		rm -f -- "$legacy_restore_marker"
-	fi
-	legacy_restore_staging_root="$app_root/restore-staging"
-	legacy_restore_staging_names=(
-		core-20260730
-		core-cutover-20260731
-	)
-	if [[ -e "$legacy_restore_staging_root" || -L "$legacy_restore_staging_root" ]]; then
-		[[ -d "$legacy_restore_staging_root" && ! -L "$legacy_restore_staging_root" &&
-			"$(realpath -e "$legacy_restore_staging_root")" == "$legacy_restore_staging_root" &&
-			"$(stat -c '%u:%g' "$legacy_restore_staging_root")" == '0:0' ]] ||
-			die 'Legacy restore staging root is unsafe.'
-		legacy_restore_staging_device="$(stat -c '%d' "$legacy_restore_staging_root")"
-		for entry_name in "${legacy_restore_staging_names[@]}"; do
-			entry_path="$legacy_restore_staging_root/$entry_name"
-			[[ -e "$entry_path" || -L "$entry_path" ]] || continue
-			[[ -d "$entry_path" && ! -L "$entry_path" &&
-				"$(realpath -e "$entry_path")" == "$entry_path" &&
-				"$(stat -c '%u:%g' "$entry_path")" == '0:0' &&
-				"$(stat -c '%d' "$entry_path")" == \
-					"$legacy_restore_staging_device" ]] ||
-				die "Legacy restore staging target is unsafe: $entry_name"
-			find "$entry_path" -xdev -depth -delete
-		done
-		legacy_restore_staging_remaining="$(
-			find "$legacy_restore_staging_root" -xdev -mindepth 1 \
-				-maxdepth 1 -print -quit
-		)" || die 'Cannot verify the legacy restore staging root after cleanup.'
-		if [[ -z "$legacy_restore_staging_remaining" ]]; then
-			rmdir "$legacy_restore_staging_root" ||
-				die 'Empty legacy restore staging root could not be removed.'
-		fi
-	fi
-
-	remaining_legacy_queues="$(
-		docker exec "$rabbitmq_container_id" rabbitmqctl --silent \
-			list_queues -p winwidget name
-	)"
-	for queue_name in "${legacy_queue_names[@]}"; do
-		if awk -v queue="$queue_name" '$1 == queue { found = 1 } END { exit(found ? 0 : 1) }' <<<"$remaining_legacy_queues"; then
-			die "Legacy RabbitMQ queue remains after terminal cleanup: $queue_name"
-		fi
-	done
-	for legacy_user in "${legacy_rabbitmq_users[@]}"; do
-		if docker exec "$rabbitmq_container_id" rabbitmqctl --silent list_users |
-			awk '{ print $1 }' | grep -Fqx -- "$legacy_user"; then
-			die "Legacy RabbitMQ user remains after terminal cleanup: $legacy_user"
-		fi
-	done
-	for retired_service in "${retired_compose_services[@]}"; do
-		retired_container_id="$(find_project_service_container "$retired_service")"
-		[[ -z "$retired_container_id" ]] ||
-			die "Retired Compose container remains after terminal cleanup: $retired_service"
-	done
-	! docker_volume_exists "$core_postgres_volume" ||
-		die 'Temporary Core PostgreSQL volume remains after terminal cleanup.'
-	for entry_name in "${legacy_restore_staging_names[@]}"; do
-		entry_path="$legacy_restore_staging_root/$entry_name"
-		[[ ! -e "$entry_path" && ! -L "$entry_path" ]] ||
-			die "Legacy restore staging target remains: $entry_name"
-	done
-	command -v ss >/dev/null 2>&1 ||
-		die 'The ss utility is required to prove retired Core port absence.'
-	listener_inventory="$(ss -ltnH 2>/dev/null)" ||
-		die 'Cannot read the production TCP listener inventory.'
-	if awk '$4 ~ /:4200$/ { found = 1 } END { exit(found ? 0 : 1) }' \
-		<<<"$listener_inventory"; then
-		die 'A listener remains on the retired Core port 4200.'
-	fi
-	wait_for_healthy_services "${runtime_services[@]}"
-	wait_for_http_revision \
-		'https://api.winwidget.ru/api/v1/health/deployment' "$services_revision" ||
-		die 'Public Gateway revision check failed after terminal cleanup.'
-fi
 
 env_sha256_after="$(sha256sum "$env_file" | awk '{print $1}')"
 [[ "$env_sha256_after" == "$env_sha256_before" &&
@@ -3496,32 +2755,189 @@ done
 [[ "$(service_env_manifest_sha256)" == "$service_env_manifest_sha256_before" ]] ||
 	die 'A service-owned production env changed during deployment.'
 
-if [[ "$deploy_mode" == 'cutover' ]]; then
-	verify_cutover_input_inventory
-	for snapshot_file in "$operations_snapshot_file" "$control_plane_snapshot_file"; do
-		[[ -f "$snapshot_file" && ! -L "$snapshot_file" ]] ||
-			die 'Protected cutover snapshot disappeared before final cleanup.'
-	done
-	[[ "$(sha256sum "$operations_snapshot_file" | awk '{print $1}')" == \
-		"$operations_snapshot_sha256" ]] ||
-		die 'Operations snapshot changed before final cleanup.'
-	[[ "$(sha256sum "$control_plane_snapshot_file" | awk '{print $1}')" == \
-		"$control_plane_snapshot_sha256" ]] ||
-		die 'Operations control-plane snapshot changed before final cleanup.'
-	write_terminal_cutover_marker
-fi
-
-cleanup_terminal_snapshot_artifacts
-verify_terminal_cutover_state
+verify_steady_state
 wait_for_healthy_services "${runtime_services[@]}"
 verify_telegram_proxy_health ||
-	die 'Pinned Telegram proxy health check failed after terminal verification.'
+	die 'Pinned Telegram proxy health check failed after steady-state verification.'
 wait_for_http_revision \
 	'https://api.winwidget.ru/api/v1/health/deployment' "$services_revision" ||
-	die 'Public Gateway revision check failed after terminal-state verification.'
+	die 'Public Gateway revision check failed after steady-state verification.'
 verify_retired_core_public_routes_absent ||
-	die 'A retired Core public route reappeared after terminal verification.'
+	die 'A retired Core public route reappeared after steady-state verification.'
 
-printf 'Production services deployment completed: mode=%s infra=%s services=%s\n' \
-	"$deploy_mode" "$infra_revision" "$services_revision"
+printf 'Backend services deployment completed: infra=%s services=%s\n' \
+	"$infra_revision" "$services_revision"
 REMOTE_CONTROLLER
+
+if [[ "$deploy_frontend_nginx" == 'true' ]]; then
+frontend_ssh_options=(
+	-F /dev/null
+	-o BatchMode=yes
+	-o ClearAllForwardings=yes
+	-o ConnectTimeout=15
+	-o ForwardAgent=no
+	-o IdentitiesOnly=yes
+	-o LogLevel=ERROR
+	-o PasswordAuthentication=no
+	-o PermitLocalCommand=no
+	-o RequestTTY=no
+	-o ServerAliveCountMax=3
+	-o ServerAliveInterval=15
+	-o StrictHostKeyChecking=yes
+	-o "UserKnownHostsFile=$frontend_known_hosts_file"
+	-i "$frontend_identity_file"
+	-p "$FRONTEND_PRODUCTION_SSH_PORT"
+)
+
+printf -v frontend_controller_arguments ' %q' \
+	"$frontend_nginx_sha256" \
+	"$frontend_nginx_base64"
+# shellcheck disable=SC2016
+frontend_controller_command='set -euo pipefail
+[[ "$(id -u)" == "0" ]]
+controller_file="$(mktemp /etc/nginx/.winwidget-frontend-controller.XXXXXX)"
+trap '\''rm -f -- "$controller_file"'\'' EXIT
+cat >"$controller_file"
+chown 0:0 "$controller_file"
+chmod 600 "$controller_file"
+bash "$controller_file"'"$frontend_controller_arguments"' </dev/null'
+
+# shellcheck disable=SC2029
+ssh "${frontend_ssh_options[@]}" \
+	"$FRONTEND_PRODUCTION_SSH_USER@$FRONTEND_PRODUCTION_SSH_HOST" \
+	"$frontend_controller_command" <<'FRONTEND_CONTROLLER'
+set -euo pipefail
+umask 077
+
+die() {
+	printf '%s\n' "$1" >&2
+	exit 1
+}
+
+frontend_nginx_sha256="$1"
+frontend_nginx_base64="$2"
+[[ "$frontend_nginx_sha256" =~ ^[0-9a-f]{64}$ &&
+	"$frontend_nginx_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+	die 'Remote frontend Nginx artifact is invalid.'
+[[ "$(id -u)" == '0' ]] ||
+	die 'Frontend Nginx controller must run as root.'
+
+assert_root_owned_directory() {
+	local path="$1" mode
+	[[ -d "$path" && ! -L "$path" && "$(realpath -e "$path")" == "$path" &&
+		"$(stat -c '%u:%g' "$path")" == '0:0' ]] ||
+		die "Root-owned frontend Nginx directory is unsafe: $path"
+	mode="$(stat -c '%a' "$path")"
+	[[ "$mode" =~ ^[0-7]{3,4}$ ]] ||
+		die "Frontend Nginx directory mode is invalid: $path"
+	(( (8#$mode & 8#022) == 0 )) ||
+		die "Frontend Nginx directory is group/world writable: $path"
+}
+
+readonly nginx_available_dir='/etc/nginx/sites-available'
+readonly nginx_enabled_dir='/etc/nginx/sites-enabled'
+readonly nginx_target='/etc/nginx/sites-available/winwidget.ru'
+readonly nginx_link='/etc/nginx/sites-enabled/winwidget.ru'
+readonly nginx_lock='/run/lock/winwidget-frontend-nginx.lock'
+assert_root_owned_directory /etc/nginx
+assert_root_owned_directory "$nginx_available_dir"
+assert_root_owned_directory "$nginx_enabled_dir"
+[[ -f "$nginx_target" && ! -L "$nginx_target" &&
+	"$(realpath -e "$nginx_target")" == "$nginx_target" &&
+	"$(stat -c '%u:%g:%a:%h' "$nginx_target")" == '0:0:644:1' ]] ||
+	die 'Live frontend Nginx config metadata is unsafe.'
+[[ -L "$nginx_link" && "$(readlink "$nginx_link")" == "$nginx_target" ]] ||
+	die 'Live frontend Nginx enabled symlink is not the exact reviewed target.'
+command -v nginx >/dev/null 2>&1 ||
+	die 'Nginx is required on the frontend VPS.'
+command -v systemctl >/dev/null 2>&1 ||
+	die 'systemctl is required on the frontend VPS.'
+systemctl is-active --quiet nginx ||
+	die 'Frontend Nginx systemd service is not active.'
+command -v flock >/dev/null 2>&1 ||
+	die 'flock is required on the frontend VPS.'
+[[ ! -L "$nginx_lock" && (! -e "$nginx_lock" || -f "$nginx_lock") ]] ||
+	die 'Frontend Nginx lock path is unsafe.'
+exec {nginx_lock_fd}>"$nginx_lock"
+chown 0:0 "$nginx_lock"
+chmod 600 "$nginx_lock"
+[[ "$(stat -c '%u:%g:%a:%h' "$nginx_lock")" == '0:0:600:1' ]] ||
+	die 'Frontend Nginx lock identity is unsafe.'
+flock -n "$nginx_lock_fd" ||
+	die 'Another frontend Nginx deployment holds the lock.'
+
+current_sha256="$(sha256sum "$nginx_target" | awk '{print $1}')"
+if [[ "$current_sha256" != "$frontend_nginx_sha256" ]]; then
+	nginx_candidate="$(mktemp "$nginx_available_dir/.winwidget.ru.candidate.XXXXXX")"
+	nginx_backup="$(mktemp "$nginx_available_dir/.winwidget.ru.backup.XXXXXX")"
+	if ! {
+		printf '%s' "$frontend_nginx_base64" |
+			base64 --decode >"$nginx_candidate" &&
+			[[ "$(sha256sum "$nginx_candidate" | awk '{print $1}')" == \
+				"$frontend_nginx_sha256" ]] &&
+			chown 0:0 "$nginx_candidate" &&
+			chmod 644 "$nginx_candidate" &&
+			cp --reflink=auto --preserve=all -- "$nginx_target" "$nginx_backup" &&
+			[[ "$(stat -c '%u:%g:%a:%h' "$nginx_backup")" == '0:0:644:1' ]] &&
+			sync -f "$nginx_candidate" &&
+			sync -f "$nginx_backup"
+	}; then
+		rm -f -- "$nginx_candidate" "$nginx_backup"
+		die 'Cannot stage the frontend Nginx config safely.'
+	fi
+	if ! mv -f -- "$nginx_candidate" "$nginx_target" ||
+		! sync -f "$nginx_available_dir"; then
+		rm -f -- "$nginx_candidate" ||
+			die 'Failed frontend Nginx candidate could not be removed.'
+		if ! {
+			mv -f -- "$nginx_backup" "$nginx_target" &&
+				sync -f "$nginx_available_dir" &&
+				nginx -t >/dev/null 2>&1
+		}; then
+			die 'Frontend Nginx install rollback failed.'
+		fi
+		die 'Cannot install the frontend Nginx config safely.'
+	fi
+	if ! nginx -t >/dev/null 2>&1; then
+		mv -f -- "$nginx_backup" "$nginx_target"
+		sync -f "$nginx_available_dir"
+		nginx -t >/dev/null 2>&1 ||
+			die 'Frontend Nginx validation rollback failed.'
+		die 'Frontend Nginx config failed validation and was rolled back.'
+	fi
+	if ! systemctl reload nginx; then
+		mv -f -- "$nginx_backup" "$nginx_target"
+		sync -f "$nginx_available_dir"
+		if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx; then
+			die 'Frontend Nginx reload rollback failed.'
+		fi
+		die 'Frontend Nginx reload failed and was rolled back.'
+	fi
+	if [[ "$(sha256sum "$nginx_target" | awk '{print $1}')" != \
+		"$frontend_nginx_sha256" ||
+		"$(stat -c '%u:%g:%a:%h' "$nginx_target")" != '0:0:644:1' ]] ||
+		! nginx -t >/dev/null 2>&1; then
+		mv -f -- "$nginx_backup" "$nginx_target"
+		sync -f "$nginx_available_dir"
+		if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx; then
+			die 'Frontend Nginx post-reload rollback failed.'
+		fi
+		die 'Frontend Nginx post-reload verification failed and was rolled back.'
+	fi
+	rm -f -- "$nginx_backup"
+	sync -f "$nginx_available_dir"
+fi
+
+[[ "$(sha256sum "$nginx_target" | awk '{print $1}')" == \
+	"$frontend_nginx_sha256" &&
+	"$(stat -c '%u:%g:%a:%h' "$nginx_target")" == '0:0:644:1' ]] ||
+	die 'Live frontend Nginx config does not match the tracked artifact.'
+nginx -t >/dev/null 2>&1 ||
+	die 'Live frontend Nginx config validation failed.'
+curl --fail --silent --max-time 15 https://winwidget.ru/ >/dev/null 2>&1 ||
+	die 'Public frontend health check failed after Nginx verification.'
+FRONTEND_CONTROLLER
+fi
+
+printf 'Production steady-state deployment completed: infra=%s services=%s frontend_nginx=%s\n' \
+	"$infra_revision" "$services_revision" "$deploy_frontend_nginx"

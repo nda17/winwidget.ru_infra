@@ -3,24 +3,9 @@ name: Deploy production services
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: Forward deployment mode
-        required: true
-        type: choice
-        options:
-          - deploy
-          - cutover
       services_revision:
         description: Immutable lowercase 40-hex winwidget.ru_services commit
         required: true
-        type: string
-      operations_snapshot_sha256:
-        description: Required only for cutover; SHA-256 of Operations data snapshot
-        required: false
-        type: string
-      operations_control_plane_snapshot_sha256:
-        description: Required only for cutover; SHA-256 of Operations control-plane snapshot
-        required: false
         type: string
 
 permissions:
@@ -50,15 +35,17 @@ jobs:
         shell: bash
         env:
           INFRA_REVISION: ${{ github.sha }}
-          DEPLOY_MODE: ${{ inputs.mode }}
           SERVICES_REVISION: ${{ inputs.services_revision }}
-          OPERATIONS_SNAPSHOT_SHA256: ${{ inputs.operations_snapshot_sha256 }}
-          OPERATIONS_CONTROL_PLANE_SNAPSHOT_SHA256: ${{ inputs.operations_control_plane_snapshot_sha256 }}
           PRODUCTION_SSH_HOST: ${{ secrets.BACKEND_PRODUCTION_SSH_HOST }}
           PRODUCTION_SSH_PORT: ${{ secrets.BACKEND_PRODUCTION_SSH_PORT }}
           PRODUCTION_SSH_USER: ${{ secrets.BACKEND_PRODUCTION_SSH_USER }}
           PRODUCTION_SSH_PRIVATE_KEY: ${{ secrets.BACKEND_PRODUCTION_SSH_PRIVATE_KEY }}
           PRODUCTION_SSH_KNOWN_HOSTS: ${{ secrets.BACKEND_PRODUCTION_SSH_KNOWN_HOSTS }}
+          FRONTEND_PRODUCTION_SSH_HOST: ${{ secrets.FRONTEND_PRODUCTION_SSH_HOST }}
+          FRONTEND_PRODUCTION_SSH_PORT: ${{ secrets.FRONTEND_PRODUCTION_SSH_PORT }}
+          FRONTEND_PRODUCTION_SSH_USER: ${{ secrets.FRONTEND_PRODUCTION_SSH_USER }}
+          FRONTEND_PRODUCTION_SSH_PRIVATE_KEY: ${{ secrets.FRONTEND_PRODUCTION_SSH_PRIVATE_KEY }}
+          FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS: ${{ secrets.FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS }}
           EXPECTED_PRODUCTION_ENV_SHA256: ${{ secrets.BACKEND_PRODUCTION_ENV_SHA256 }}
         run: |
           set -euo pipefail
@@ -79,9 +66,29 @@ jobs:
             fi
           done
 
+          frontend_values=(
+            FRONTEND_PRODUCTION_SSH_HOST
+            FRONTEND_PRODUCTION_SSH_PORT
+            FRONTEND_PRODUCTION_SSH_USER
+            FRONTEND_PRODUCTION_SSH_PRIVATE_KEY
+            FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS
+          )
+          frontend_value_count=0
+          for variable_name in "${frontend_values[@]}"; do
+            if [[ -n "${!variable_name:-}" ]]; then
+              frontend_value_count=$((frontend_value_count + 1))
+            fi
+          done
+          if ((frontend_value_count != 0 && frontend_value_count != ${#frontend_values[@]})); then
+            echo 'Frontend production SSH secrets must be configured as one complete group.' >&2
+            exit 1
+          fi
+
           credential_directory="$RUNNER_TEMP/winwidget-production-ssh"
           identity_file="$credential_directory/id_ed25519"
           known_hosts_file="$credential_directory/known_hosts"
+          frontend_identity_file="$credential_directory/frontend_id_ed25519"
+          frontend_known_hosts_file="$credential_directory/frontend_known_hosts"
           install -m 700 -d "$credential_directory"
           trap 'find "$credential_directory" -type f -delete; rmdir "$credential_directory"' EXIT
 
@@ -91,16 +98,12 @@ jobs:
 
           export PRODUCTION_SSH_IDENTITY_FILE="$identity_file"
           export PRODUCTION_SSH_KNOWN_HOSTS_FILE="$known_hosts_file"
+          if ((frontend_value_count == ${#frontend_values[@]})); then
+            printf '%s\n' "$FRONTEND_PRODUCTION_SSH_PRIVATE_KEY" >"$frontend_identity_file"
+            printf '%s\n' "$FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS" >"$frontend_known_hosts_file"
+            chmod 600 "$frontend_identity_file" "$frontend_known_hosts_file"
+            export FRONTEND_PRODUCTION_SSH_IDENTITY_FILE="$frontend_identity_file"
+            export FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS_FILE="$frontend_known_hosts_file"
+          fi
 
-          case "$DEPLOY_MODE" in
-            deploy) controller_mode='--deploy' ;;
-            cutover) controller_mode='--cutover' ;;
-            *)
-              echo 'Unsupported deployment mode.' >&2
-              exit 1
-              ;;
-          esac
-
-          bash scripts/deploy-services-production.sh \
-            "$controller_mode" \
-            "$SERVICES_REVISION"
+          bash scripts/deploy-services-production.sh "$SERVICES_REVISION"

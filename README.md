@@ -3,7 +3,8 @@
 Репозиторий `winwidget.ru_infra` содержит контроллер production-деплоя и
 эксплуатационные инструкции. Исходный код приложений, Dockerfile, схемы Prisma и
 production-манифест Compose остаются в `winwidget.ru_services`, а фронтенд — в
-`winwidget.ru_client`.
+`winwidget.ru_client`. Канонические Nginx-конфигурации backend и frontend
+хранятся соответственно в `nginx/backend-api.conf` и `nginx/frontend.conf`.
 
 Production-секреты и файлы `.env.production` никогда не хранятся в этом
 репозитории, не передаются через GitHub и не выводятся в логи. На VPS контроллер
@@ -22,24 +23,23 @@ Production-job выполняется только при запуске workflo
 `master`; теги и другие ветки отклоняются до предоставления секретов
 окружения.
 
-У контроллера два режима:
-
-- `--deploy` выполняет обычный прямой деплой после того, как владение Operations
-  уже перешло в состояние `ACTIVE`.
-- `--cutover` выполняет однократный импорт snapshot Operations, активацию и
-  начальную настройку control plane перед запуском worker-процессов сервисов.
+Отдельный workflow [`Verify infrastructure`](.github/workflows/ci.yml)
+запускается на каждый push и pull request. Он не использует production secrets
+и SSH, не меняет внешнее состояние и проверяет shell/YAML/embedded JavaScript,
+единственный steady-state CLI, read-only DB boundary preflight, точный live
+Compose inventory, текущую Operations/Reporting routing projection,
+legacy-negative guards и Nginx-контракты. Только его зелёный результат является
+CI-доказательством exact infra SHA; production workflow не заменяет эту
+проверку.
 
 Ревизия сервисов должна совпадать с commit, полученным из `origin/prod`; SHA из
-другой ветки или более старый достижимый commit отклоняется. Целей деплоя для
-монолита, совместимости, rollback или legacy-runtime нет. Однократный путь
-`--cutover` содержит только точные цели финального удаления. Если cutover
-прерван до создания терминального маркера, его продолжают в режиме `cutover` с
-теми же двумя hash snapshot и той же точной ревизией `origin/prod`. После
-появления долговечного маркера `.microservices-terminal-cutover-v1` режим
-`cutover` больше нельзя запускать: продолжать нужно в режиме `deploy` с точной
-текущей вершиной `origin/prod` (это может быть более новая forward-only
-ревизия). Контроллер никогда не пытается угадать предыдущее состояние и не
-запускает более старый образ.
+другой ветки или более старый достижимый commit отклоняется. Контроллер имеет
+только steady-state deploy mode. До любых RabbitMQ mutations и миграций он fail
+closed проверяет имя Operations DB, schema/role boundaries, текущие critical
+tables, точный набор уже работающих Compose services и текущий набор RabbitMQ
+users. После migrations и до rollout он требует единственный текущий
+`operations.service_identity` с именем `operations-service` и валидным
+`database_id` UUID.
 
 ## Production-окружение GitHub
 
@@ -47,18 +47,29 @@ Production-job выполняется только при запуске workflo
 reviewer-ов и ограничьте круг пользователей, которые могут запускать workflow.
 Настройте следующие секреты:
 
-| Секрет                               | Назначение                                                                                                        |
-| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `BACKEND_PRODUCTION_SSH_HOST`        | Имя хоста или IPv4-адрес backend VPS                                                                              |
-| `BACKEND_PRODUCTION_SSH_PORT`        | SSH-порт                                                                                                          |
-| `BACKEND_PRODUCTION_SSH_USER`        | Отдельный пользователь деплоя; текущему контроллеру требуется root                                                |
-| `BACKEND_PRODUCTION_SSH_PRIVATE_KEY` | Незашифрованный ключ деплоя, ограниченный этим VPS                                                                |
-| `BACKEND_PRODUCTION_SSH_KNOWN_HOSTS` | Заранее проверенная закреплённая строка ключа хоста; никогда не создавайте её через `ssh-keyscan` внутри workflow |
-| `BACKEND_PRODUCTION_ENV_SHA256`      | SHA-256 побайтово идентичного канонического backend-файла `.env.production`                                       |
+| Секрет                                | Назначение                                                                                                        |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `BACKEND_PRODUCTION_SSH_HOST`         | Имя хоста или IPv4-адрес backend VPS                                                                              |
+| `BACKEND_PRODUCTION_SSH_PORT`         | SSH-порт                                                                                                          |
+| `BACKEND_PRODUCTION_SSH_USER`         | Отдельный пользователь деплоя; текущему контроллеру требуется root                                                |
+| `BACKEND_PRODUCTION_SSH_PRIVATE_KEY`  | Незашифрованный ключ деплоя, ограниченный этим VPS                                                                |
+| `BACKEND_PRODUCTION_SSH_KNOWN_HOSTS`  | Заранее проверенная закреплённая строка ключа хоста; никогда не создавайте её через `ssh-keyscan` внутри workflow |
+| `FRONTEND_PRODUCTION_SSH_HOST`        | Опционально: имя хоста или IPv4-адрес frontend VPS                                                                |
+| `FRONTEND_PRODUCTION_SSH_PORT`        | Опционально: SSH-порт frontend VPS                                                                                |
+| `FRONTEND_PRODUCTION_SSH_USER`        | Опционально: отдельный root-пользователь деплоя frontend Nginx                                                    |
+| `FRONTEND_PRODUCTION_SSH_PRIVATE_KEY` | Опционально: незашифрованный ключ, ограниченный frontend VPS                                                      |
+| `FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS` | Опционально: заранее проверенная закреплённая строка ключа frontend VPS                                           |
+| `BACKEND_PRODUCTION_ENV_SHA256`       | SHA-256 побайтово идентичного канонического backend-файла `.env.production`                                       |
 
 Ключ деплоя нельзя повторно использовать для доступа к GitHub-репозиторию.
 Checkout на VPS использует отдельный заранее установленный read-only deploy
 key.
+
+Пять `FRONTEND_*` secrets образуют одну опциональную группу: при отсутствии
+всей группы backend-деплой выполняется без изменения frontend Nginx; частичная
+группа отклоняется. Это позволяет не копировать frontend credentials в infra
+только ради backend-релиза. Frontend image по-прежнему выпускается собственным
+workflow репозитория `winwidget.ru_client`.
 
 При изменении production env сначала соблюдайте правило двусторонней
 синхронизации: сравните локальный файл с файлом на VPS, обновите канонический
@@ -92,6 +103,16 @@ env-файл. После этого при каждом деплое на VPS а
 его атомарно, выполняет `nginx -t`, перезагружает Nginx и восстанавливает
 предыдущий файл, если проверка или перезагрузка завершается ошибкой.
 
+`nginx/frontend.conf` — единственный tracked source Nginx для `winwidget.ru` и
+`www.winwidget.ru` на отдельном frontend VPS. Когда настроена полная группа
+`FRONTEND_*`, после успешного backend-деплоя контроллер через отдельные pinned
+SSH credentials сравнивает его SHA-256 с
+`/etc/nginx/sites-available/winwidget.ru`, атомарно устанавливает изменение под
+отдельным lock, выполняет `nginx -t`, reload с восстановлением предыдущего файла
+при ошибке и публичную HTTPS-проверку. При отсутствии всей группы frontend Nginx
+не изменяется и не является обязательным gate backend-релиза. Локальная копия
+`deploy/frontend/nginx.conf` больше не является source of truth.
+
 Каталог `nginx/telegram-bridge/` содержит конфигурацию зарубежного VPS для
 входящих Telegram webhook, исходящего трафика Bot API и намеренно публичного
 raw TLS listener на `8443`. Установка и безопасная проверка без токенов описаны
@@ -111,7 +132,11 @@ raw TLS listener на `8443`. Установка и безопасная про�
 - все внешние PostgreSQL volumes и файлы секретов с паролями, указанные в
   Compose-манифесте сервисов;
 - production-lock `/opt/winwidget/deploy/backend/.production-deploy.lock`
-  (если обычный файл отсутствует, контроллер безопасно создаёт его).
+  (если обычный файл отсутствует, контроллер безопасно создаёт его);
+- при включённой синхронизации на frontend VPS — Nginx, `systemctl`, `flock`,
+  `curl`, `sha256sum`, GNU `stat`, существующий обычный файл
+  `/etc/nginx/sites-available/winwidget.ru` режима `0644` и точный symlink из
+  `sites-enabled`.
 
 `/opt/winwidget`, канонический checkout сервисов, его Git-конфигурация и hooks,
 каждый канонический каталог приложения и корневые каталоги релизов должны быть
@@ -127,90 +152,42 @@ Compose-манифест из этого неизменяемого катало
 
 ## Обычный деплой
 
-Запустите workflow `Deploy production services`, выберите `deploy` и вставьте
-SHA зелёного commit сервисов. Далее контроллер:
+Запустите workflow `Deploy production services` и вставьте SHA зелёного commit
+сервисов. Далее контроллер:
 
 1. захватывает фиксированный production-lock;
 2. до начала работы проверяет канонический env;
 3. получает `origin/prod` и требует, чтобы его вершина совпадала с запрошенным
    commit;
-4. отклоняет runtime-артефакты корневого монолита и любые неожиданные сервисы
-   Compose;
+4. отклоняет retired Core runtime-артефакты и любые неожиданные сервисы Compose;
 5. без раскрытия значений формирует из одобренного канонического источника
    десять production env-файлов, принадлежащих сервисам;
 6. собирает десять принадлежащих приложениям семейств образов с тегом
    `git-<revision>` и проверяет OCI label ревизии и неизменяемый ID каждого
    образа;
-7. без вывода значений проверяет контракты Gateway без Core и усиленную защиту
-   Operations restore-worker;
-8. запускает девять сервисов PostgreSQL и RabbitMQ, создаёт все точные
-   принадлежащие сервисам identities/permissions RabbitMQ и выполняет все
-   девять миграций;
-9. проверяет, что владение Operations находится в состоянии `ACTIVE`;
+7. без вывода значений проверяет точный Gateway manifest без catch-all/Core
+   upstream и усиленную защиту Operations restore-worker;
+8. запускает девять сервисов PostgreSQL и RabbitMQ, затем до изменения
+   RabbitMQ users/permissions и до миграций read-only проверяет имя Operations
+   DB, schema/role boundaries, текущие critical tables, точный live Compose
+   inventory и точный текущий RabbitMQ user inventory;
+9. создаёт точные принадлежащие сервисам identities/permissions RabbitMQ и
+   выполняет все девять миграций, после чего до rollout проверяет единственный
+   текущий `operations.service_identity`;
 10. пересоздаёт сервисы, кроме Gateway, запускает изолированный Operations
     restore worker после перехода Operations Outbox publisher в healthy и
     последним запускает Gateway;
 11. проверяет health контейнеров, точные ID образов, локальную readiness,
-    публичную ревизию деплоя Gateway и неизменность hash env.
+    публичную ревизию деплоя Gateway, согласованность текущего Telegram routing
+    Operations с Reporting projection, точный набор live Compose containers,
+    отсутствие retired Core routes, queues, users, контейнеров, volume,
+    артефактов и listener `:4200`, а также неизменность hash env.
+12. при настроенной полной группе `FRONTEND_*` устанавливает и проверяет tracked
+    frontend Nginx на отдельном VPS и подтверждает доступность
+    `https://winwidget.ru/`; без группы явно пропускает только этот шаг.
 
 Контроллер не использует `latest`, `--remove-orphans`, широкую очистку Docker
 или восстановление канонического production env из примеров.
-
-## Первый терминальный cutover
-
-Перед запуском `cutover`, пока источник ещё доступен, разместите на VPS два уже
-проверенных экспорта:
-
-```text
-/opt/winwidget/deploy/backend/cutover-input/operations.snapshot.json
-/opt/winwidget/deploy/backend/cutover-input/operations-control-plane.snapshot.json
-```
-
-Оба файла должны быть обычными файлами, не symlink, с владельцем `root:root` и
-режимом `0600`. Вычислите их SHA-256 независимо и передайте эти hash в два input
-workflow. Не вставляйте содержимое файлов в GitHub.
-
-Порядок действий `cutover` зафиксирован:
-
-1. проверить точные ревизии infra/services, hash канонического env,
-   сформированные env-файлы сервисов, apps-only Compose, образы, базы данных и
-   RabbitMQ;
-2. остановить только пять точных Core writer/worker-контейнеров по label
-   Compose;
-3. остановить Reporting и удалить только пустые/неиспользуемые неизменяемые
-   retry-очереди, чтобы текущий владелец Reporting мог воссоздать их с
-   окончательными аргументами DLX;
-4. создать всех пользователей RabbitMQ сервисов, включая изолированного
-   `winwidget-operations-restore-worker`, и выполнить все миграции сервисов;
-5. импортировать snapshot Notes/AdminEventLog (`EMPTY` → `IMPORTED`),
-   активировать владение Operations, затем выполнить начальную настройку данных
-   Telegram и Reporting control plane;
-6. в указанном порядке запустить runtime-процессы сервисов и Outbox publisher,
-   Operations restore worker и Gateway;
-7. потребовать успешного прохождения всех внутренних/публичных health-проверок
-   и проверок точной ревизии;
-8. потребовать, чтобы у каждой legacy-очереди из allowlist было ноль сообщений,
-   неподтверждённых доставок и consumers, затем удалить её с guards
-   empty/unused;
-9. вывести из эксплуатации трёх legacy-пользователей RabbitMQ, шесть точных
-   семейств Core Compose-сервисов, идентифицированные по fingerprint временные
-   Core-контейнер/volume/secret PostgreSQL и только legacy-элементы
-   restore-staging из allowlist;
-10. доказать отсутствие legacy-очередей, пользователей, контейнеров, volume и
-    порта `4200`, повторить публичную readiness и проверить hash env;
-11. атомарно сохранить `.microservices-terminal-cutover-v1` с обоими
-    одобренными hash snapshot, их общей исходной ревизией Core, ID события
-    начальной настройки и идентификатором системы Core; только после этого
-    удалить импортированные snapshot.
-
-Оба импорта атомарны и принимают только переданный SHA-256. Пока маркер не
-записан, защищённые snapshot остаются доступными, а запрос `cutover` с теми же
-параметрами является путём прямого восстановления. После записи маркера его
-состояние считается авторитетным, даже если удаление snapshot или более поздний
-gate были прерваны: повторно запускайте `deploy`, но никогда `cutover`; обычный
-путь проверяет маркер и идемпотентно завершает очистку snapshot из allowlist.
-Общий корневой каталог восстановления сохраняется, потому что он принадлежит
-Operations: удаляются только старые подкаталоги и маркеры staging Core.
 
 ## Локальная статическая проверка
 
@@ -219,6 +196,13 @@ Operations: удаляются только старые подкаталоги 
 ```bash
 bash -n scripts/deploy-services-production.sh
 shellcheck -x scripts/deploy-services-production.sh
+sed -n "/<<'REMOTE_CONTROLLER'$/,/^REMOTE_CONTROLLER$/p" scripts/deploy-services-production.sh | sed '1d;$d' | bash -n
+sed -n "/<<'FRONTEND_CONTROLLER'$/,/^FRONTEND_CONTROLLER$/p" scripts/deploy-services-production.sh | sed '1d;$d' | bash -n
 ruby -e 'require "yaml"; YAML.load_file(".github/workflows/deploy-production.yml")'
 git diff --check
 ```
+
+## Документация
+
+- [Единый production runbook](docs/runbook.md)
+- [Документация сервисов и технический backlog](https://github.com/nda17/winwidget.ru_services/tree/prod/docs)
