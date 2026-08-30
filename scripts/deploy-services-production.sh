@@ -926,6 +926,9 @@ const { open, unlink } = require('node:fs/promises');
 });
 RESTORE_STORAGE_PROBE
 done
+[[ "$(stat -c '%d:%i' "$operations_restore_staging")" != \
+	"$(stat -c '%d:%i' "$operations_restore_sealed")" ]] ||
+	die 'Operations restore staging and sealed storage must not alias one host directory.'
 
 docker run --rm \
 	--interactive \
@@ -1229,6 +1232,7 @@ try {
 		'RABBITMQ_MAX_MESSAGE_BYTES',
 		'DATABASE_RESTORE_STAGING_DIR',
 		'DATABASE_RESTORE_SEALED_DIR',
+		'DATABASE_RESTORE_ARTIFACT_RETENTION_HOURS',
 		...restoreReceiptEnvironmentKeys
 	];
 	for (const [, prefix] of databaseTargets) {
@@ -1249,6 +1253,7 @@ try {
 		environment.OPERATIONS_RESTORE_WORKER_PORT !== '5203' ||
 		environment.DATABASE_RESTORE_STAGING_DIR !== '/var/lib/winwidget-operations/restore-staging' ||
 		environment.DATABASE_RESTORE_SEALED_DIR !== '/var/lib/winwidget-operations/restore-sealed' ||
+		environment.DATABASE_RESTORE_ARTIFACT_RETENTION_HOURS !== '168' ||
 		environment.RABBITMQ_CONNECTION_NAME !== 'winwidget-operations-restore-worker' ||
 		environment.RABBITMQ_ASSERT_TOPOLOGY !== 'true'
 	) fail();

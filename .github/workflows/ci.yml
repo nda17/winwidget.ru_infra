@@ -176,6 +176,11 @@ jobs:
             );
           }
           requireText(
+            composeContract,
+            'DATABASE_RESTORE_ARTIFACT_RETENTION_HOURS',
+            'restore artifact retention Compose contract is missing'
+          );
+          requireText(
             serviceEnvMaterializer,
             'decodedRestoreReceiptHmacKey.fill(0)',
             'decoded restore receipt key is not cleared after validation'
@@ -189,6 +194,11 @@ jobs:
             composeContract,
             "name === 'operations-api' || name === 'operations-restore-worker'",
             'restore receipt signing key is not restricted to the exact runtimes'
+          );
+          requireText(
+            script,
+            "stat -c '%d:%i' \"$operations_restore_staging\"",
+            'restore staging/sealed host inode alias guard is missing'
           );
           requireText(
             rabbitProvision,

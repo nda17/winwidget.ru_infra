@@ -303,8 +303,9 @@ trailing slash или дополнительным suffix отклоняются
 - API пишет upload только в staging. Restore-worker атомарно копирует exact
   approved SHA через file descriptor в worker-only sealed storage, выполняет
   `fsync` файла и каталога, повторно проверяет SHA/TOC/ledger и запускает
-  `pg_restore` только по sealed path. Sealed bind отсутствует у API и всех
-  остальных runtime.
+  `pg_restore` только по sealed path. Deploy дополнительно отклоняет разные
+  пути, которые через bind mount указывают на одинаковые host device+inode.
+  Sealed bind отсутствует у API и всех остальных runtime.
 - Каждый terminal transition атомарно закрывает permit и создаёт immutable
   receipt только с hash/operational identifiers. Receipt подписывается HMAC
   SHA-256 ключом `DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64` и содержит

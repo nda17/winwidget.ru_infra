@@ -112,7 +112,8 @@ restore-worker для атомарного claim/cleanup. `DATABASE_RESTORE_SEAL
 монтируется только в restore-worker: именно из worker-only sealed storage после
 копирования через file descriptor, `fsync` и повторной SHA-256 проверки
 выполняются `pg_restore` и recovery. Deploy создаёт и отдельно проверяет запись
-в оба каталога; API и остальные контейнеры не получают sealed mount.
+в оба каталога, запрещает совпадение их host device+inode; API и остальные
+контейнеры не получают sealed mount.
 Bootstrap-admin credentials также получает только единственный restore-worker.
 Они являются доверенной recovery control-plane boundary, а не application
 writer: deploy запрещает их другим runtime, проверяет отсутствие других LOGIN
