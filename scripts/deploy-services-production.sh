@@ -1167,6 +1167,10 @@ try {
 	const restoreWorker = services['operations-restore-worker'];
 	const operationsApi = services['operations-api'];
 	if (!restoreWorker || !operationsApi) fail();
+	if (
+		restoreWorker.labels?.['com.winwidget.singleton'] !== 'true' ||
+		restoreWorker.deploy?.replicas !== 1
+	) fail();
 	const telegramRuntimeNames = [
 		'notification-delivery-worker',
 		'identity-api',
@@ -1854,6 +1858,23 @@ wait_for_healthy_services() {
 		sleep 2
 	done
 	die 'Production services did not become healthy before the deadline.'
+}
+
+verify_singleton_running_service() {
+	local service_name="$1" container_id singleton_label
+	local -a container_ids=()
+	mapfile -t container_ids < <(
+		compose_all ps --status running -q "$service_name" 2>/dev/null
+	)
+	[[ "${#container_ids[@]}" -eq 1 && -n "${container_ids[0]}" ]] ||
+		die "Production singleton service must have exactly one running container: $service_name"
+	container_id="${container_ids[0]}"
+	singleton_label="$(
+		docker inspect --format '{{ index .Config.Labels "com.winwidget.singleton" }}' \
+			"$container_id" 2>/dev/null
+	)" || die "Cannot verify singleton label: $service_name"
+	[[ "$singleton_label" == 'true' ]] ||
+		die "Production singleton label is missing: $service_name"
 }
 
 wait_for_healthy_services "${infrastructure_services[@]}"
@@ -2918,6 +2939,7 @@ compose_all up -d --no-build --force-recreate "${runtime_without_gateway[@]}"
 wait_for_healthy_services "${runtime_without_gateway[@]}"
 compose_all up -d --no-build --force-recreate operations-restore-worker
 wait_for_healthy_services operations-restore-worker
+verify_singleton_running_service operations-restore-worker
 compose_all up -d --no-build --force-recreate api-gateway
 wait_for_healthy_services "${runtime_services[@]}"
 

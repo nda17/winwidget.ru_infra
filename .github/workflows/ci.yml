@@ -192,6 +192,21 @@ jobs:
           );
           requireText(
             composeContract,
+            "restoreWorker.labels?.['com.winwidget.singleton'] !== 'true'",
+            'restore-worker singleton label is not validated'
+          );
+          requireText(
+            composeContract,
+            'restoreWorker.deploy?.replicas !== 1',
+            'restore-worker single replica is not validated'
+          );
+          requireText(
+            script,
+            'verify_singleton_running_service operations-restore-worker',
+            'restore-worker runtime singleton count is not verified'
+          );
+          requireText(
+            composeContract,
             "name === 'operations-api' || name === 'operations-restore-worker'",
             'restore receipt signing key is not restricted to the exact runtimes'
           );
