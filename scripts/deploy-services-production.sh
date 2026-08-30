@@ -1157,11 +1157,9 @@ try {
 		['campaigns', 'CAMPAIGNS', '55433'],
 		['reporting', 'REPORTING', '55435'],
 		['widgets', 'WIDGETS', '55436'],
-		['billing', 'BILLING', '55437'],
 		['identity', 'IDENTITY', '55438'],
 		['platform', 'PLATFORM', '55439'],
-		['support', 'SUPPORT', '55440'],
-		['operations', 'OPERATIONS', '55441']
+		['support', 'SUPPORT', '55440']
 	];
 	const environment = restoreWorker.environment ?? {};
 	const expectedEnvironmentKeys = [
