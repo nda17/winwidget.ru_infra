@@ -1237,6 +1237,7 @@ try {
 		'DATABASE_RESTORE_STAGING_DIR',
 		'DATABASE_RESTORE_SEALED_DIR',
 		'DATABASE_RESTORE_ARTIFACT_RETENTION_HOURS',
+		'DATABASE_RESTORE_ENABLED',
 		...restoreReceiptEnvironmentKeys
 	];
 	for (const [, prefix] of databaseTargets) {
@@ -1255,6 +1256,7 @@ try {
 		environment.OPERATIONS_PROCESS_ROLE !== 'restore-worker' ||
 		environment.OPERATIONS_LISTEN_HOST !== '127.0.0.1' ||
 		environment.OPERATIONS_RESTORE_WORKER_PORT !== '5203' ||
+		environment.DATABASE_RESTORE_ENABLED !== 'false' ||
 		environment.DATABASE_RESTORE_STAGING_DIR !== '/var/lib/winwidget-operations/restore-staging' ||
 		environment.DATABASE_RESTORE_SEALED_DIR !== '/var/lib/winwidget-operations/restore-sealed' ||
 		environment.DATABASE_RESTORE_ARTIFACT_RETENTION_HOURS !== '168' ||
@@ -1263,6 +1265,8 @@ try {
 	) fail();
 	if (
 		apiEnvironment.DATABASE_RESTORE_ENABLED !== 'false' ||
+		apiEnvironment.DATABASE_RESTORE_ENABLED !==
+			environment.DATABASE_RESTORE_ENABLED ||
 		apiEnvironment.DATABASE_RESTORE_STAGING_DIR !==
 			environment.DATABASE_RESTORE_STAGING_DIR ||
 		'DATABASE_RESTORE_SEALED_DIR' in apiEnvironment ||

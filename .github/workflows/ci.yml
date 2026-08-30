@@ -192,6 +192,16 @@ jobs:
           );
           requireText(
             composeContract,
+            "environment.DATABASE_RESTORE_ENABLED !== 'false'",
+            'restore-worker does not enforce the production kill switch'
+          );
+          requireText(
+            composeContract,
+            'apiEnvironment.DATABASE_RESTORE_ENABLED !==',
+            'API and restore-worker kill switches are not bound together'
+          );
+          requireText(
+            composeContract,
             "restoreWorker.labels?.['com.winwidget.singleton'] !== 'true'",
             'restore-worker singleton label is not validated'
           );

@@ -99,8 +99,10 @@ Base64-декодирования) и идентификатор ротации
 вывода значений, а resolved Compose — что обе переменные с одинаковыми
 значениями получает ровно `operations-api` и `operations-restore-worker`.
 Другим контейнерам, включая Operations worker/outbox/migrate, signing key не
-передаётся. Обычный deploy требует `DATABASE_RESTORE_ENABLED=false` и не
-открывает production restore. Первичное provisioning использует один новый
+передаётся. Обычный deploy требует `DATABASE_RESTORE_ENABLED=false` одновременно
+в Operations API и restore-worker; worker проверяет kill switch до claim
+обычного restore job, не блокируя signed recovery/reconciliation. Первичное
+provisioning использует один новый
 случайный ключ и новый key ID. Это не ротация: активный ключ нельзя заменять,
 пока есть выполняющийся restore или незакрытый `RECOVERY_REQUIRED`. До
 реализации keyring с проверкой current/previous key ID старый ключ нельзя

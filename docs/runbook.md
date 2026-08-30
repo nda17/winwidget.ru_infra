@@ -275,8 +275,10 @@ trailing slash или дополнительным suffix отклоняются
 - Плановые backup jobs и policy принадлежат Operations.
 - `maintenance-worker` запускает `pg_dump` read-only backup role.
 - Telegram-копия — временный off-VPS logical backup, не PITR.
-- Production enqueue restore выключен: канонический env и resolved Compose
-  обязаны сохранять `DATABASE_RESTORE_ENABLED=false`. DEV API и RabbitMQ
+- Production restore выключен: канонический env и resolved Compose обязаны
+  сохранять `DATABASE_RESTORE_ENABLED=false` одновременно для DEV API и
+  restore-worker. Worker проверяет kill switch до claim обычного restore job;
+  signed recovery и terminal reconciliation остаются доступны. API и RabbitMQ
   consumer являются подготовленным recovery workflow, а не разрешением на
   реальное восстановление без отдельной approved procedure.
 - До допуска к production обязательна повторяемая rehearsal-матрица в
