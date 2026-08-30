@@ -275,16 +275,28 @@ trailing slash или дополнительным suffix отклоняются
 - Плановые backup jobs и policy принадлежат Operations.
 - `maintenance-worker` запускает `pg_dump` read-only backup role.
 - Telegram-копия — временный off-VPS logical backup, не PITR.
-- Restore инициируется только DEV control plane и выполняется изолированным
-  `database-restore-worker` с admin credential целевой БД.
-- Restore требует manifest/SHA/TOC/migration/ACL checks, fence, safety dump и
-  post-restore verification.
+- Production enqueue restore выключен. DEV API и RabbitMQ consumer являются
+  подготовленным recovery workflow, а не разрешением на реальное
+  восстановление без отдельной approved procedure.
+- В разрешённом rehearsal restore инициируется только DEV control plane и
+  выполняется изолированным `database-restore-worker` с admin credential ровно
+  одной целевой БД. Job использует единственный active lease и durable phase
+  checkpoints; повторная доставка не запускает destructive execution заново.
+- Restore требует manifest/SHA/TOC/migration/exact ACL checks, safety dump и
+  post-restore verification. Ошибка после начала mutation сохраняет source и
+  safety artifacts и переводит job в recovery-required, а не в обычный retry.
 - Retired Core отсутствует среди backup/restore targets.
-- Registry содержит только активные service-owned targets, а каждый активный
-  target имеет актуальный успешный плановый job.
+- Operations не является restore target: job, lease и recovery evidence сейчас
+  принадлежат той же БД и не переживут self-restore. Возврат target допустим
+  только после выноса control ledger в отдельную невосстанавливаемую границу.
+- Billing временно не является restore target: его backup остаётся активным, а
+  restore/ACL rehearsal выполняются только в отдельном платёжном scope.
+- Registry содержит семь остальных active service-owned targets, а каждый
+  target имеет актуальный успешный плановый backup job.
 - Размер dump контролируется до приближения к лимиту Telegram.
 - Реальный restore требует exact target, permit и approved recovery procedure;
-  он не запускается через обычный API runtime или RabbitMQ consumer.
+  production enqueue включается только на время согласованной операции и снова
+  закрывается после terminal/recovery evidence.
 
 Незавершённые ограничения restore и перехода к object storage/PITR находятся в
 [`backlog.md`](https://github.com/nda17/winwidget.ru_services/blob/prod/docs/backlog.md).
@@ -414,7 +426,11 @@ frontend Nginx, но не устанавливает bridge-конфигурац
       каждой активной БД есть актуальный успешный scheduled backup.
 - [ ] Dump не приблизился к лимиту Telegram.
 - [ ] Для реального restore определены exact target, manifest, SHA, permit,
-      fence, safety dump и approved recovery procedure.
+      lease/checkpoints, exact ACL, safety dump и approved recovery procedure.
+- [ ] Production enqueue остаётся выключенным вне approved recovery window;
+      Operations self-restore и Billing отсутствуют в registry.
+- [ ] Recovery-required job сохраняет source/safety artifacts и не запускается
+      повторно автоматически.
 - [ ] `:8443`, TLS/SNI, Nginx, listener, firewall и upstream smoke зелёные.
 - [ ] Auth, Info и Support webhook status корректен; сообщение, чат оператора,
       сводка и backup используют relay.
