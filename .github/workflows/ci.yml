@@ -110,6 +110,7 @@ jobs:
             if (source.includes(value)) fail(message);
           };
 
+          const javascriptHeredocs = new Map();
           for (const label of [
             'MATERIALIZE_SERVICE_ENVS',
             'RESTORE_STORAGE_PROBE',
@@ -135,6 +136,84 @@ jobs:
             } catch {
               fail(`invalid JavaScript heredoc: ${label}`);
             }
+            javascriptHeredocs.set(label, match[1]);
+          }
+
+          const serviceEnvMaterializer = javascriptHeredocs.get(
+            'MATERIALIZE_SERVICE_ENVS'
+          );
+          const composeContract = javascriptHeredocs.get('COMPOSE_CONTRACT');
+          const rabbitProvision =
+            javascriptHeredocs.get('PROVISION_RABBITMQ');
+          for (const key of [
+            'DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64',
+            'DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID'
+          ]) {
+            requireText(
+              serviceEnvMaterializer,
+              key,
+              `restore receipt key materialization is missing: ${key}`
+            );
+            requireText(
+              composeContract,
+              key,
+              `restore receipt Compose scope is missing: ${key}`
+            );
+          }
+          for (const key of [
+            'DATABASE_RESTORE_STAGING_DIR',
+            'DATABASE_RESTORE_SEALED_DIR'
+          ]) {
+            requireText(
+              serviceEnvMaterializer,
+              key,
+              `restore storage materialization is missing: ${key}`
+            );
+            requireText(
+              composeContract,
+              key,
+              `restore storage Compose scope is missing: ${key}`
+            );
+          }
+          requireText(
+            serviceEnvMaterializer,
+            'decodedRestoreReceiptHmacKey.fill(0)',
+            'decoded restore receipt key is not cleared after validation'
+          );
+          requireText(
+            composeContract,
+            "apiEnvironment.DATABASE_RESTORE_ENABLED !== 'false'",
+            'resolved Compose does not keep production restore disabled'
+          );
+          requireText(
+            composeContract,
+            "name === 'operations-api' || name === 'operations-restore-worker'",
+            'restore receipt signing key is not restricted to the exact runtimes'
+          );
+          requireText(
+            rabbitProvision,
+            String.raw`write: '^winwidget\\.retry$'`,
+            'restore-worker retry exchange write permission is missing'
+          );
+          requireText(
+            rabbitProvision,
+            'const retryKey = `${routingKey}.retry.v1`;',
+            'restore retry TTL routing contract is missing'
+          );
+          for (const evidence of [
+            'изолированном PostgreSQL 18',
+            'DATABASE_RESTORE_ENABLED=false',
+            'writer-fence evidence',
+            'worker-only sealed storage',
+            'transport retries не имеют terminal cap',
+            'DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64',
+            'Operations self-restore и Billing отсутствуют'
+          ]) {
+            requireText(
+              runbook,
+              evidence,
+              `recovery runbook evidence is missing: ${evidence}`
+            );
           }
 
           for (const retired of [

@@ -92,6 +92,41 @@ env-файл. После этого при каждом деплое на VPS а
 значение допускается только для явно необязательной настройки
 `widgets:S3_KEY_PREFIX`.
 
+Для recovery-контракта канонический backend env обязан содержать
+`DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64` (минимум 32 случайных байта после
+Base64-декодирования) и идентификатор ротации
+`DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID`. Контроллер проверяет их формат без
+вывода значений, а resolved Compose — что обе переменные с одинаковыми
+значениями получает ровно `operations-api` и `operations-restore-worker`.
+Другим контейнерам, включая Operations worker/outbox/migrate, signing key не
+передаётся. Обычный deploy требует `DATABASE_RESTORE_ENABLED=false` и не
+открывает production restore. Первичное provisioning использует один новый
+случайный ключ и новый key ID. Это не ротация: активный ключ нельзя заменять,
+пока есть выполняющийся restore или незакрытый `RECOVERY_REQUIRED`. До
+реализации keyring с проверкой current/previous key ID старый ключ нельзя
+удалять, иначе ранее созданные immutable receipts станут непроверяемыми.
+
+Restore artifacts разделены на два bind-каталога UID/GID `1001:1001`, mode
+`0700`. `DATABASE_RESTORE_STAGING_DIR` доступен Operations API для upload и
+restore-worker для атомарного claim/cleanup. `DATABASE_RESTORE_SEALED_DIR`
+монтируется только в restore-worker: именно из worker-only sealed storage после
+копирования через file descriptor, `fsync` и повторной SHA-256 проверки
+выполняются `pg_restore` и recovery. Deploy создаёт и отдельно проверяет запись
+в оба каталога; API и остальные контейнеры не получают sealed mount.
+Bootstrap-admin credentials также получает только единственный restore-worker.
+Они являются доверенной recovery control-plane boundary, а не application
+writer: deploy запрещает их другим runtime, проверяет отсутствие других LOGIN
+SUPERUSER и полагается на один global CAS lease. Перед multi-replica или remote
+recovery требуется отдельная proxy/session boundary; обычный `CONNECTION LIMIT`
+не считается защитой SUPERUSER.
+
+RabbitMQ identity restore-worker может читать и конфигурировать только exact
+restore queue family. Из write-ресурсов ей разрешён исключительно direct
+exchange `winwidget.retry`: временный сбой публикуется с mandatory/confirm в
+`operations.database-restore.requested.v1.retry.v1`, а retry queue через TTL и
+DLX возвращает сообщение в основную очередь. Это даёт задержку без конечного
+лимита попыток; events/manual-retry/dead-letter остаются недоступны для записи.
+
 ## Nginx и Telegram relay
 
 `nginx/backend-api.conf` — конфигурация публичного API, содержащая только
@@ -167,7 +202,9 @@ lifecycle gate и полной матрицы сервисов release-job ав�
    `git-<revision>` и проверяет OCI label ревизии и неизменяемый ID каждого
    образа;
 7. без вывода значений проверяет точный Gateway manifest без catch-all/Core
-   upstream и усиленную защиту Operations restore-worker;
+   upstream, выключенный production restore, изоляцию signing key между
+   Operations API/restore-worker и остальными контейнерами, а также усиленную
+   защиту restore-worker;
 8. запускает девять сервисов PostgreSQL и RabbitMQ, затем до изменения
    RabbitMQ users/permissions и до миграций read-only проверяет имя Operations
    DB, schema/role boundaries, текущие critical tables, точный набор работающих

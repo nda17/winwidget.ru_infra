@@ -527,6 +527,29 @@ const canonical = parse(
 const revision = process.env.EXPECTED_SERVICES_REVISION ?? '';
 if (!/^[0-9a-f]{40}$/.test(revision)) fail();
 
+const restoreReceiptHmacKey = canonical.get(
+	'DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64'
+);
+const restoreReceiptHmacKeyId = canonical.get(
+	'DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID'
+);
+if (
+	typeof restoreReceiptHmacKey !== 'string' ||
+	!/^[A-Za-z0-9+/]+={0,2}$/.test(restoreReceiptHmacKey) ||
+	typeof restoreReceiptHmacKeyId !== 'string' ||
+	!/^[A-Za-z0-9._:-]{1,80}$/.test(restoreReceiptHmacKeyId)
+) fail();
+const decodedRestoreReceiptHmacKey = Buffer.from(
+	restoreReceiptHmacKey,
+	'base64'
+);
+const restoreReceiptHmacKeyIsValid =
+	decodedRestoreReceiptHmacKey.length >= 32 &&
+	decodedRestoreReceiptHmacKey.toString('base64').replace(/=+$/u, '') ===
+		restoreReceiptHmacKey.replace(/=+$/u, '');
+decodedRestoreReceiptHmacKey.fill(0);
+if (!restoreReceiptHmacKeyIsValid) fail();
+
 const rabbitAliases = {
 	'billing': 'RABBITMQ_BILLING_WORKER_URL',
 	'campaigns': 'RABBITMQ_CAMPAIGNS_URL',
@@ -591,8 +614,12 @@ const fallbacks = new Map([
 const overrides = new Map();
 const explicitlyOptionalEmptyValues = new Set(['widgets:S3_KEY_PREFIX']);
 overrides.set(
-	'operations:DATABASE_RESTORE_STORAGE_DIR',
-	'/var/lib/winwidget-operations/restores'
+	'operations:DATABASE_RESTORE_STAGING_DIR',
+	'/var/lib/winwidget-operations/restore-staging'
+);
+overrides.set(
+	'operations:DATABASE_RESTORE_SEALED_DIR',
+	'/var/lib/winwidget-operations/restore-sealed'
 );
 for (const app of apps) {
 	overrides.set(`${app}:APP_REVISION`, revision);
@@ -848,39 +875,43 @@ for image_name in "${built_images[@]}"; do
 done
 
 readonly operations_restore_host_root='/var/lib/winwidget-operations'
-readonly operations_restore_storage='/var/lib/winwidget-operations/restores'
+readonly operations_restore_staging='/var/lib/winwidget-operations/restore-staging'
+readonly operations_restore_sealed='/var/lib/winwidget-operations/restore-sealed'
 if [[ ! -e "$operations_restore_host_root" &&
 	! -L "$operations_restore_host_root" ]]; then
 	install -d -o root -g root -m 0755 "$operations_restore_host_root"
 fi
 assert_root_owned_directory "$operations_restore_host_root"
-if [[ ! -e "$operations_restore_storage" &&
-	! -L "$operations_restore_storage" ]]; then
-	install -d -o 1001 -g 1001 -m 0700 "$operations_restore_storage"
-fi
-[[ -d "$operations_restore_storage" && ! -L "$operations_restore_storage" &&
-	"$(realpath -e "$operations_restore_storage")" == \
-		"$operations_restore_storage" &&
-	"$(stat -c '%u:%g:%a' "$operations_restore_storage")" == '1001:1001:700' ]] ||
-	die 'Operations restore storage must be canonical UID/GID 1001 mode 0700.'
-docker run --rm \
-	--interactive \
-	--network none \
-	--read-only \
-	--tmpfs /tmp:rw,noexec,nosuid,nodev,size=8m \
-	--cap-drop ALL \
-	--security-opt no-new-privileges \
-	--pids-limit 32 \
-	--log-driver none \
-	--user 1001:1001 \
-	--volume "$operations_restore_storage:/run/winwidget/restores" \
-	--entrypoint node \
-	"winwidget-operations:git-$services_revision" - <<'RESTORE_STORAGE_PROBE'
+for operations_restore_storage in \
+	"$operations_restore_staging" \
+	"$operations_restore_sealed"; do
+	if [[ ! -e "$operations_restore_storage" &&
+		! -L "$operations_restore_storage" ]]; then
+		install -d -o 1001 -g 1001 -m 0700 "$operations_restore_storage"
+	fi
+	[[ -d "$operations_restore_storage" && ! -L "$operations_restore_storage" &&
+		"$(realpath -e "$operations_restore_storage")" == \
+			"$operations_restore_storage" &&
+		"$(stat -c '%u:%g:%a' "$operations_restore_storage")" == '1001:1001:700' ]] ||
+		die 'Operations restore storage must be canonical UID/GID 1001 mode 0700.'
+	docker run --rm \
+		--interactive \
+		--network none \
+		--read-only \
+		--tmpfs /tmp:rw,noexec,nosuid,nodev,size=8m \
+		--cap-drop ALL \
+		--security-opt no-new-privileges \
+		--pids-limit 32 \
+		--log-driver none \
+		--user 1001:1001 \
+		--volume "$operations_restore_storage:/run/winwidget/restore-storage" \
+		--entrypoint node \
+		"winwidget-operations:git-$services_revision" - <<'RESTORE_STORAGE_PROBE'
 const { randomUUID } = require('node:crypto');
 const { open, unlink } = require('node:fs/promises');
 
 (async () => {
-	const path = `/run/winwidget/restores/.write-probe-${randomUUID()}`;
+	const path = `/run/winwidget/restore-storage/.write-probe-${randomUUID()}`;
 	const handle = await open(path, 'wx', 0o600);
 	try {
 		await handle.writeFile('probe');
@@ -894,6 +925,7 @@ const { open, unlink } = require('node:fs/promises');
 	process.exit(1);
 });
 RESTORE_STORAGE_PROBE
+done
 
 docker run --rm \
 	--interactive \
@@ -1109,6 +1141,22 @@ function sorted(values) {
 	return [...values].sort((left, right) => left.localeCompare(right));
 }
 
+function validBase64HmacKey(value) {
+	if (
+		typeof value !== 'string' ||
+		!/^[A-Za-z0-9+/]+={0,2}$/.test(value)
+	) {
+		return false;
+	}
+	const decoded = Buffer.from(value, 'base64');
+	const valid =
+		decoded.length >= 32 &&
+		decoded.toString('base64').replace(/=+$/u, '') ===
+			value.replace(/=+$/u, '');
+	decoded.fill(0);
+	return valid;
+}
+
 try {
 	const config = JSON.parse(fs.readFileSync(0, 'utf8'));
 	const services = config.services;
@@ -1162,6 +1210,11 @@ try {
 		['support', 'SUPPORT', '55440']
 	];
 	const environment = restoreWorker.environment ?? {};
+	const apiEnvironment = operationsApi.environment ?? {};
+	const restoreReceiptEnvironmentKeys = [
+		'DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64',
+		'DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID'
+	];
 	const expectedEnvironmentKeys = [
 		'APP_REVISION',
 		'NODE_ENV',
@@ -1174,7 +1227,9 @@ try {
 		'RABBITMQ_CONNECTION_NAME',
 		'RABBITMQ_ASSERT_TOPOLOGY',
 		'RABBITMQ_MAX_MESSAGE_BYTES',
-		'DATABASE_RESTORE_STORAGE_DIR'
+		'DATABASE_RESTORE_STAGING_DIR',
+		'DATABASE_RESTORE_SEALED_DIR',
+		...restoreReceiptEnvironmentKeys
 	];
 	for (const [, prefix] of databaseTargets) {
 		expectedEnvironmentKeys.push(
@@ -1192,10 +1247,35 @@ try {
 		environment.OPERATIONS_PROCESS_ROLE !== 'restore-worker' ||
 		environment.OPERATIONS_LISTEN_HOST !== '127.0.0.1' ||
 		environment.OPERATIONS_RESTORE_WORKER_PORT !== '5203' ||
-		environment.DATABASE_RESTORE_STORAGE_DIR !== '/var/lib/winwidget-operations/restores' ||
+		environment.DATABASE_RESTORE_STAGING_DIR !== '/var/lib/winwidget-operations/restore-staging' ||
+		environment.DATABASE_RESTORE_SEALED_DIR !== '/var/lib/winwidget-operations/restore-sealed' ||
 		environment.RABBITMQ_CONNECTION_NAME !== 'winwidget-operations-restore-worker' ||
 		environment.RABBITMQ_ASSERT_TOPOLOGY !== 'true'
 	) fail();
+	if (
+		apiEnvironment.DATABASE_RESTORE_ENABLED !== 'false' ||
+		apiEnvironment.DATABASE_RESTORE_STAGING_DIR !==
+			environment.DATABASE_RESTORE_STAGING_DIR ||
+		'DATABASE_RESTORE_SEALED_DIR' in apiEnvironment ||
+		!validBase64HmacKey(
+			apiEnvironment.DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64
+		) ||
+		apiEnvironment.DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64 !==
+			environment.DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64 ||
+		!/^[A-Za-z0-9._:-]{1,80}$/.test(
+			apiEnvironment.DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID ?? ''
+		) ||
+		apiEnvironment.DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID !==
+			environment.DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID
+	) fail();
+	for (const [name, service] of Object.entries(services)) {
+		const receiptKeyCount = restoreReceiptEnvironmentKeys.filter(key =>
+			Object.hasOwn(service.environment ?? {}, key)
+		).length;
+		if (name === 'operations-api' || name === 'operations-restore-worker') {
+			if (receiptKeyCount !== restoreReceiptEnvironmentKeys.length) fail();
+		} else if (receiptKeyCount !== 0) fail();
+	}
 	const rabbitUrl = new URL(environment.RABBITMQ_URL);
 	if (
 		rabbitUrl.pathname !== '/winwidget' ||
@@ -1223,27 +1303,46 @@ try {
 		.sort(([left], [right]) => left.localeCompare(right));
 	if (JSON.stringify(actualSecrets) !== JSON.stringify(expectedSecrets)) fail();
 
-	const restoreStorage = environment.DATABASE_RESTORE_STORAGE_DIR;
+	const restoreStaging = environment.DATABASE_RESTORE_STAGING_DIR;
+	const restoreSealed = environment.DATABASE_RESTORE_SEALED_DIR;
 	for (const [name, service] of Object.entries(services)) {
 		const mounts = service.volumes ?? [];
 		const restoreMounts = mounts.filter(
-			mount => mount.source === restoreStorage || mount.target === restoreStorage
+			mount =>
+				mount.source === restoreStaging ||
+				mount.target === restoreStaging ||
+				mount.source === restoreSealed ||
+				mount.target === restoreSealed
 		);
-		if (name === 'operations-api' || name === 'operations-restore-worker') {
+		if (name === 'operations-api') {
 			if (
 				mounts.length !== 1 ||
 				restoreMounts.length !== 1 ||
 				restoreMounts[0].type !== 'bind' ||
-				restoreMounts[0].source !== restoreStorage ||
-				restoreMounts[0].target !== restoreStorage
+				restoreMounts[0].source !== restoreStaging ||
+				restoreMounts[0].target !== restoreStaging
 			) {
 				fail(
 					`restore mount ${name}: mounts=${mounts.length}, matches=${restoreMounts.length}, ` +
 					`type=${restoreMounts[0]?.type ?? 'missing'}, ` +
-					`sourceMatch=${restoreMounts[0]?.source === restoreStorage}, ` +
-					`targetMatch=${restoreMounts[0]?.target === restoreStorage}`
+					`sourceMatch=${restoreMounts[0]?.source === restoreStaging}, ` +
+					`targetMatch=${restoreMounts[0]?.target === restoreStaging}`
 				);
 			}
+		} else if (name === 'operations-restore-worker') {
+			const expectedMounts = new Map([
+				[restoreStaging, restoreStaging],
+				[restoreSealed, restoreSealed]
+			]);
+			if (
+				mounts.length !== 2 ||
+				restoreMounts.length !== 2 ||
+				restoreMounts.some(
+					mount =>
+						mount.type !== 'bind' ||
+						expectedMounts.get(mount.source) !== mount.target
+				)
+			) fail(`restore mount ${name} does not isolate staging and sealed storage`);
 		} else if (restoreMounts.length !== 0) fail();
 	}
 
@@ -2373,7 +2472,10 @@ const users = [
 	},
 	{
 		...services.operationsRestoreWorker,
-		configure: restoreQueuePattern, write: '^$', read: restoreQueuePattern, topics: []
+		configure: restoreQueuePattern,
+		write: '^winwidget\\.retry$',
+		read: restoreQueuePattern,
+		topics: []
 	},
 	{
 		...services.operationsPublisher,

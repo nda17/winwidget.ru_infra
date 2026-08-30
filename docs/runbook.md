@@ -275,16 +275,73 @@ trailing slash или дополнительным suffix отклоняются
 - Плановые backup jobs и policy принадлежат Operations.
 - `maintenance-worker` запускает `pg_dump` read-only backup role.
 - Telegram-копия — временный off-VPS logical backup, не PITR.
-- Production enqueue restore выключен. DEV API и RabbitMQ consumer являются
-  подготовленным recovery workflow, а не разрешением на реальное
-  восстановление без отдельной approved procedure.
-- В разрешённом rehearsal restore инициируется только DEV control plane и
-  выполняется изолированным `database-restore-worker` с admin credential ровно
-  одной целевой БД. Job использует единственный active lease и durable phase
-  checkpoints; повторная доставка не запускает destructive execution заново.
-- Restore требует manifest/SHA/TOC/migration/exact ACL checks, safety dump и
+- Production enqueue restore выключен: канонический env и resolved Compose
+  обязаны сохранять `DATABASE_RESTORE_ENABLED=false`. DEV API и RabbitMQ
+  consumer являются подготовленным recovery workflow, а не разрешением на
+  реальное восстановление без отдельной approved procedure.
+- До допуска к production обязательна повторяемая rehearsal-матрица в
+  изолированном PostgreSQL 18 без production credentials и сетевого доступа к
+  production target. Она должна покрывать все семь разрешённых targets,
+  совместимый и несовместимый dump, нехватку диска, cancel/restart race,
+  checkpoint resume, ACL drift и доказательство отсутствия cross-target
+  доступа.
+- Первый DEV запрашивает короткоживущий exact one-shot permit, привязанный к
+  server-side job ID, target, SHA-256 source dump, точному 40-символьному
+  services SHA и SHA-256 доверенного migration manifest. Разрешение становится
+  действующим только после подтверждения другим DEV и атомарно потребляется
+  вместе с созданием job; повторное использование запрещено.
+- Перед первым применением recovery migration таблица `database_restore_jobs`
+  должна быть пустой. Migration блокирует её и fail closed отклоняет legacy
+  jobs; автоматически удалять или переносить такие строки в deploy нельзя.
+- В разрешённом rehearsal job выполняется изолированным
+  `database-restore-worker` с admin credential ровно одной целевой БД. Job
+  использует единственный active lease и durable phase checkpoints; повторная
+  доставка не запускает destructive execution заново.
+- Restore требует source SHA/TOC/migration/exact ACL checks, safety dump и
   post-restore verification. Ошибка после начала mutation сохраняет source и
-  safety artifacts и переводит job в recovery-required, а не в обычный retry.
+  safety artifacts и переводит job в `RECOVERY_REQUIRED`, а не в обычный retry.
+- API пишет upload только в staging. Restore-worker атомарно копирует exact
+  approved SHA через file descriptor в worker-only sealed storage, выполняет
+  `fsync` файла и каталога, повторно проверяет SHA/TOC/ledger и запускает
+  `pg_restore` только по sealed path. Sealed bind отсутствует у API и всех
+  остальных runtime.
+- Каждый terminal transition атомарно закрывает permit и создаёт immutable
+  receipt только с hash/operational identifiers. Receipt подписывается HMAC
+  SHA-256 ключом `DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64` и содержит
+  `DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID`; signing key хранится только в env,
+  передаётся ровно Operations API и restore-worker и не выводится в логи или
+  БД. При первичном provisioning создаётся один новый случайный ключ; до
+  появления current/previous keyring его запрещено заменять при выполняющемся
+  restore или незакрытом `RECOVERY_REQUIRED`, а старые receipts должны
+  оставаться проверяемыми по своему key ID.
+- Для `RECOVERY_REQUIRED` первый DEV выбирает `VERIFY_AS_IS`,
+  `ROLL_BACK_SAFETY` или `ROLL_FORWARD_SOURCE`, а второй DEV подтверждает
+  действие, привязанное к hash immutable receipt. Recovery executor принимает
+  только это exact approved action и перед любой проверкой или mutation
+  переводит runtime, migration и backup roles целевой БД в `NOLOGIN`, завершает
+  их активные sessions и сохраняет writer-fence evidence. Rollback и
+  roll-forward предварительно повторяют SHA-256, TOC и migration-ledger
+  проверки выбранного артефакта. Writer fence снимается только после повторной
+  exact ACL/ledger проверки; итог закрепляется отдельным immutable signed
+  recovery receipt. Сбой либо истечение lease оставляет или восстанавливает
+  fence и требует нового dual-approved action.
+- Writer fence физически закрывает application runtime/migration/backup roles.
+  Единственный LOGIN SUPERUSER каждой цели — доверенный bootstrap-admin
+  recovery control plane: его password-file монтируется только в один
+  restore-worker, доступ API и обычным workers запрещён, а global CAS lease не
+  допускает параллельное выполнение. Контракт запрещает другие LOGIN
+  SUPERUSER, memberships этих ролей и неожиданные admin sessions. Fence не
+  заявляет защиту при компрометации restore-worker либо admin secret; до
+  multi-replica/remote recovery для этого нужна отдельная recovery proxy/session
+  boundary.
+- Временная ошибка restore consumer не возвращается tight-loop в main queue.
+  Worker публикует исходный `Buffer` с `mandatory` и publisher confirm только в
+  `winwidget.retry` по exact routing key
+  `operations.database-restore.requested.v1.retry.v1`; исходное сообщение
+  подтверждается лишь после обеих проверок публикации. Retry queue держит его
+  30 секунд и через DLX возвращает в main queue. Счётчик попыток только
+  диагностический: transport retries не имеют terminal cap, а malformed
+  contract уходит в DLQ.
 - Retired Core отсутствует среди backup/restore targets.
 - Operations не является restore target: job, lease и recovery evidence сейчас
   принадлежат той же БД и не переживут self-restore. Возврат target допустим
@@ -294,9 +351,13 @@ trailing slash или дополнительным suffix отклоняются
 - Registry содержит семь остальных active service-owned targets, а каждый
   target имеет актуальный успешный плановый backup job.
 - Размер dump контролируется до приближения к лимиту Telegram.
-- Реальный restore требует exact target, permit и approved recovery procedure;
-  production enqueue включается только на время согласованной операции и снова
-  закрывается после terminal/recovery evidence.
+- Source/safety artifacts нельзя удалять, пока открыто recovery-решение; после
+  его закрытия действует закреплённый retention и контролируемая очистка.
+  Production enqueue не включается без отдельной approved procedure и exact-SHA
+  rehearsal. Зашифрованное versioned object storage становится обязательным,
+  когда dump приближается к лимиту Telegram, измеренный RPO/RTO требует PITR
+  либо текущий off-VPS канал перестаёт укладываться в SLA; до этого Telegram
+  остаётся принятым временным off-VPS logical backup.
 
 Незавершённые ограничения restore и перехода к object storage/PITR находятся в
 [`backlog.md`](https://github.com/nda17/winwidget.ru_services/blob/prod/docs/backlog.md).
@@ -422,15 +483,26 @@ frontend Nginx, но не устанавливает bridge-конфигурац
 
 ### Backup, restore и Telegram
 
-- [ ] Operations registry содержит только активные service-owned targets, у
-      каждой активной БД есть актуальный успешный scheduled backup.
-- [ ] Dump не приблизился к лимиту Telegram.
-- [ ] Для реального restore определены exact target, manifest, SHA, permit,
-      lease/checkpoints, exact ACL, safety dump и approved recovery procedure.
-- [ ] Production enqueue остаётся выключенным вне approved recovery window;
-      Operations self-restore и Billing отсутствуют в registry.
-- [ ] Recovery-required job сохраняет source/safety artifacts и не запускается
-      повторно автоматически.
+- [ ] Operations registry содержит ровно семь разрешённых service-owned
+      targets; Operations self-restore и Billing отсутствуют, у каждой активной
+      БД есть актуальный успешный scheduled backup.
+- [ ] Dump не приблизился к лимиту Telegram; retention/deletion и backup
+      freshness/failure alerts имеют проверенное evidence.
+- [ ] Изолированная PostgreSQL 18 rehearsal-матрица зелёная для каждого target
+      и обязательных failure/cancel/restart/ACL сценариев.
+- [ ] Exact target, source SHA-256, services SHA и trusted migration manifest
+      SHA-256 совпадают с short-lived one-shot permit; request и approval
+      выполнили разные DEV.
+- [ ] Lease/checkpoints, exact ACL, safety dump, immutable signed terminal
+      receipt и approved recovery procedure имеют сохранённое evidence без
+      секретов.
+- [ ] `DATABASE_RESTORE_ENABLED=false`; recovery executor запускает действие
+      только после exact receipt binding и подтверждения вторым DEV, а writer
+      fence остаётся fail-closed при любой незавершённой фиксации результата.
+- [ ] `RECOVERY_REQUIRED` job сохраняет source/safety artifacts; действие
+      привязано к receipt hash и подтверждено вторым DEV; SHA/TOC/ledger
+      проверяются до mutation, а signed recovery receipt создан до признания
+      incident закрытым.
 - [ ] `:8443`, TLS/SNI, Nginx, listener, firewall и upstream smoke зелёные.
 - [ ] Auth, Info и Support webhook status корректен; сообщение, чат оператора,
       сводка и backup используют relay.
