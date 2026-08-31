@@ -275,12 +275,58 @@ trailing slash или дополнительным suffix отклоняются
 - Плановые backup jobs и policy принадлежат Operations.
 - `maintenance-worker` запускает `pg_dump` read-only backup role.
 - Telegram-копия — временный off-VPS logical backup, не PITR.
-- Production restore выключен: канонический env и resolved Compose обязаны
-  сохранять `DATABASE_RESTORE_ENABLED=false` одновременно для DEV API и
-  restore-worker. Worker проверяет kill switch до claim обычного restore job;
-  signed recovery и terminal reconciliation остаются доступны. API и RabbitMQ
-  consumer являются подготовленным recovery workflow, а не разрешением на
-  реальное восстановление без отдельной approved procedure.
+- Для семи restore-targets `maintenance-worker` отправляет рядом с dump
+  отдельный `.provenance.json`: exact evidence содержит backup job ID, target,
+  имя/размер/SHA-256 artifact, services revision и trusted migration manifest,
+  а envelope подписан Ed25519. Старый unsigned dump не является разрешённым
+  source для нового permit. API проверяет подпись и exact binding при создании
+  permit, restore-worker повторяет проверку перед fence и mutation; браузерная
+  проверка sidecar является только ранней диагностикой и не trust boundary.
+- Ed25519 private key существует только как непустой обычный файл
+  `/opt/winwidget/deploy/backend/.database-backup-provenance-private-key.pem`
+  с owner `root:root`, mode `0600`, link count `1` и без symlink. Root
+  `.env.example` и production env не содержат provenance key ID/path:
+  согласованные immutable services/infra releases закрепляют literal key ID
+  `operations-backup-ed25519-2026-08-31` и literal host path непосредственно в
+  Compose. Compose монтирует secret только в `operations-worker` как root-only
+  source `/run/secrets/database-backup-provenance-private-key-source`. Image
+  entrypoint
+  проверяет тип/link/owner/mode source, создаёт и сверяет temporary copy как
+  `root:root/0600`, затем переводит final-файл в `1001:1001/0400` внутри
+  tmpfs-каталога `root:nodejs/0710` и атомарно публикует его по пути
+  `/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem`
+  и только затем запускает PID 1 через `gosu` без root-прав. Bootstrap имеет
+  `cap_drop: ALL` и exact `CHOWN`, `SETGID`, `SETUID`; `FOWNER` и
+  `DAC_OVERRIDE` отсутствуют. API, restore-worker, migrate/outbox
+  и остальные runtime не получают private key, source mount или runtime path.
+  Public keys хранятся в tracked immutable keyring
+  `apps/operations/restore-manifests/database-backup-provenance-public-keys.json`.
+  Deploy до миграций проверяет tracked-файл, exact source/tmpfs/runtime scope,
+  PID UID/GID 1001, runtime mode `0400` и соответствие active private/public
+  Ed25519 пары без вывода содержимого или fingerprint. После rollout и в обеих
+  steady-state фазах контроллер отдельно проверяет `/proc/1/status` фактически
+  работающего worker: PID 1 — `node`, а все real/effective/saved/filesystem
+  UID/GID равны `1001`, supplemental groups содержат только `1001`,
+  `NoNewPrivs=1`, а inherited/permitted/effective/ambient capabilities нулевые;
+  runtime-файл доступен, root-only source остаётся недоступным этому UID.
+- `DATABASE_RESTORE_ENABLED` принимает только literal `true` или `false`, а
+  resolved Compose обязан передавать exact одинаковое значение DEV API и
+  restore-worker. Безопасный default `.env.example` — `false`. Production
+  `true` разрешается только после зелёных provenance/private-key gates,
+  повторяемой PostgreSQL 18 rehearsal-матрицы, exact read-only inventory
+  pending job/permit/queue и отдельного recovery change window/approval.
+  Routine deploy не создаёт restore job, но `true` разрешает worker исполнить
+  уже существующую approved работу, поэтому включение нельзя считать
+  недеструктивным application deploy. Deploy controller при `true` требует
+  нулевые non-terminal restore jobs/permits/recovery actions/execution lease,
+  pending restore Outbox и ready/unacknowledged main/retry RabbitMQ messages:
+  первый раз до provisioning/migrations, второй — непосредственно перед
+  recreate restore-worker. `RECOVERY_REQUIRED` входит в pending inventory
+  только при `recoveryResolvedAt IS NULL`; завершённое recovery не блокирует
+  следующее окно. Это snapshot-gate, поэтому recovery change window также
+  запрещает параллельный enqueue. При `false` worker проверяет kill switch
+  до claim обычного restore job; signed recovery и terminal reconciliation
+  остаются доступны.
 - До допуска к production обязательна повторяемая rehearsal-матрица в
   изолированном PostgreSQL 18 без production credentials и сетевого доступа к
   production target. Она должна покрывать все семь разрешённых targets,
@@ -288,10 +334,12 @@ trailing slash или дополнительным suffix отклоняются
   checkpoint resume, ACL drift и доказательство отсутствия cross-target
   доступа.
 - Первый DEV запрашивает короткоживущий exact one-shot permit, привязанный к
-  server-side job ID, target, SHA-256 source dump, точному 40-символьному
-  services SHA и SHA-256 доверенного migration manifest. Разрешение становится
-  действующим только после подтверждения другим DEV и атомарно потребляется
-  вместе с созданием job; повторное использование запрещено.
+  server-side job ID, source backup job ID, target, имени, размеру и SHA-256
+  source dump, hash/key ID подписанного provenance envelope, точному
+  40-символьному services SHA и SHA-256 доверенного migration manifest.
+  Разрешение становится действующим только после подтверждения другим DEV и
+  атомарно потребляется вместе с созданием job; повторное использование
+  запрещено.
 - Перед первым применением recovery migration таблица `database_restore_jobs`
   должна быть пустой. Migration блокирует её и fail closed отклоняет legacy
   jobs; автоматически удалять или переносить такие строки в deploy нельзя.
@@ -364,6 +412,52 @@ trailing slash или дополнительным suffix отклоняются
 
 Незавершённые ограничения restore и перехода к object storage/PITR находятся в
 [`backlog.md`](https://github.com/nda17/winwidget.ru_services/blob/prod/docs/backlog.md).
+
+### Ротация Ed25519 backup provenance
+
+1. Вне репозиториев и логов создайте новую Ed25519 пару: PKCS#8 PEM private key
+   и SPKI DER public key. Назначьте новый уникальный key ID и офлайн проверьте
+   пару до изменения production. Private bytes, fingerprint и команды с ними
+   не помещайте в CI output или тикет.
+2. Подготовьте immutable release A: добавьте новый public key в tracked keyring
+   services рядом со старым, но оставьте Compose literal active key ID старым.
+   Получите green tests/CI exact SHA и выпустите release A со старым host
+   private key. Старый public key не удаляйте: он нужен для всех ещё допустимых
+   к restore sidecar, permit и job.
+3. Подготовьте и проверьте согласованные immutable services/infra release B:
+   keyring содержит старый и новый public keys, а Compose literal active key ID
+   и exact infra-validator меняются на новый. Root `.env.production`,
+   `.env.example` и `BACKEND_PRODUCTION_ENV_SHA256` при этой ротации не меняются
+   и не должны содержать provenance key ID/path.
+4. Остановите автоматические deploy/recreate, убедитесь, что backup job не
+   находится в `PROCESSING`, и в отдельном change window получите exclusive
+   flock ровно на
+   `/opt/winwidget/deploy/backend/.production-deploy.lock`. Сохраните старый
+   private key только в защищённом offline rollback-контуре на ограниченный
+   срок; на VPS одновременно активен один private key.
+5. Удерживая этот lock, установите новый private key через temporary file в том
+   же root-owned каталоге: owner `root:root`, mode `0600`, `fsync`, затем atomic
+   rename ровно в
+   `/opt/winwidget/deploy/backend/.database-backup-provenance-private-key.pem`.
+   Не изменяйте байты текущего inode на месте. Уже запущенный worker продолжает
+   видеть старый bind-mounted inode; до освобождения lock для release B
+   запрещены ручной restart, recreate и параллельный deploy.
+6. Освободите lock только для немедленного запуска exact release B controller.
+   Любой промежуточный старый release обязан fail closed на несовпадении пары
+   до production mutation. Release B deploy до миграций проверяет source,
+   создаёт runtime directory `root:nodejs/0710` и exact file `1001:1001/0400`,
+   подтверждает нулевые capabilities PID 1 UID/GID 1001 и совпадение derived
+   public key с новым literal key ID. Source/runtime private key отсутствует у
+   остальных containers, а host inode/hash не меняется внутри deploy.
+7. После rollout создайте новый недеструктивный backup каждого активного
+   restore-target и проверьте sidecar/permit verification без запуска restore.
+   Rollback выполняется только как exact возврат согласованной тройки release
+   B/A + literal active key ID/keyring + private key; смешивать поколения
+   запрещено.
+8. Старый public key удаляется только после доказанного окончания retention и
+   restore eligibility всех подписанных им artifacts и отсутствия ссылок из
+   permits/jobs. Старый private key после rollback-window уничтожается; его
+   наличие не требуется для проверки старых подписей.
 
 ## Telegram
 
@@ -499,9 +593,13 @@ frontend Nginx, но не устанавливает bridge-конфигурац
 - [ ] Lease/checkpoints, exact ACL, safety dump, immutable signed terminal
       receipt и approved recovery procedure имеют сохранённое evidence без
       секретов.
-- [ ] `DATABASE_RESTORE_ENABLED=false`; recovery executor запускает действие
-      только после exact receipt binding и подтверждения вторым DEV, а writer
-      fence остаётся fail-closed при любой незавершённой фиксации результата.
+- [ ] `DATABASE_RESTORE_ENABLED` — literal `true|false` и одинаков в API/worker;
+      для `true` отдельно сохранены green provenance/key gate, PostgreSQL 18
+      rehearsal, нулевые DB/Outbox/RabbitMQ pending-work inventories перед
+      mutations и worker rollout, recovery change window и operational
+      approval. Recovery executor запускает действие только после exact receipt
+      binding и подтверждения вторым DEV, а writer fence остаётся fail-closed
+      при любой незавершённой фиксации результата.
 - [ ] `RECOVERY_REQUIRED` job сохраняет source/safety artifacts; действие
       привязано к receipt hash и подтверждено вторым DEV; SHA/TOC/ledger
       проверяются до mutation, а signed recovery receipt создан до признания

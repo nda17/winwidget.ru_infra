@@ -247,7 +247,8 @@ readonly releases_root="$app_root/releases/winwidget.ru_services"
 readonly release_root="$releases_root/$services_revision"
 readonly env_file="$app_root/deploy/backend/.env.production"
 readonly deploy_lock="$app_root/deploy/backend/.production-deploy.lock"
-	readonly expected_repository_slug='nda17/winwidget.ru_services'
+readonly backup_provenance_private_key_file="$app_root/deploy/backend/.database-backup-provenance-private-key.pem"
+readonly expected_repository_slug='nda17/winwidget.ru_services'
 
 assert_root_owned_directory() {
 	local path="$1" mode
@@ -271,6 +272,20 @@ assert_root_owned_file() {
 		die "File mode is invalid: $path"
 	(( (8#$mode & 8#022) == 0 )) ||
 		die "File is group/world writable: $path"
+}
+
+assert_backup_provenance_private_key() {
+	local size
+	[[ -f "$backup_provenance_private_key_file" &&
+		! -L "$backup_provenance_private_key_file" &&
+		"$(realpath -e "$backup_provenance_private_key_file")" == "$backup_provenance_private_key_file" &&
+		"$(stat -c '%u:%g:%a:%h' "$backup_provenance_private_key_file")" == '0:0:600:1' ]] ||
+		die 'Backup provenance private key must be the fixed root-owned mode 0600 file.'
+	size="$(stat -c '%s' "$backup_provenance_private_key_file")"
+	[[ "$size" =~ ^[0-9]+$ ]] ||
+		die 'Backup provenance private key size is outside the safe boundary.'
+	((size >= 64 && size <= 16384)) ||
+		die 'Backup provenance private key size is outside the safe boundary.'
 }
 
 assert_root_owned_directory "$app_root"
@@ -303,7 +318,17 @@ chmod 600 "$deploy_lock"
 flock -n "$deploy_lock_fd" ||
 	die 'Another production deployment currently holds the production lock.'
 
-	env_sha256_before="$(sha256sum "$env_file" | awk '{print $1}')"
+assert_backup_provenance_private_key
+backup_provenance_private_key_identity_before="$(
+	stat -c '%d:%i:%s' "$backup_provenance_private_key_file"
+)"
+backup_provenance_private_key_sha256_before="$(
+	sha256sum "$backup_provenance_private_key_file" | awk '{print $1}'
+)"
+[[ "$backup_provenance_private_key_sha256_before" =~ ^[0-9a-f]{64}$ ]] ||
+	die 'Cannot calculate backup provenance private key integrity hash.'
+
+env_sha256_before="$(sha256sum "$env_file" | awk '{print $1}')"
 [[ "$env_sha256_before" == "$expected_env_sha256" ]] ||
 	die 'Canonical production env differs from the approved byte-identical hash.'
 
@@ -413,6 +438,13 @@ for app_name in "${required_apps[@]}"; do
 		"apps/$app_name/.env.production" ||
 		die 'A service production env path is not ignored by the services repository.'
 done
+
+readonly backup_provenance_public_keyring="$release_root/apps/operations/restore-manifests/database-backup-provenance-public-keys.json"
+assert_root_owned_file "$backup_provenance_public_keyring"
+git -C "$release_root" ls-files --error-unmatch \
+	'apps/operations/restore-manifests/database-backup-provenance-public-keys.json' \
+	>/dev/null 2>&1 ||
+	die 'Backup provenance public keyring is not tracked by the requested services revision.'
 
 export COMPOSE_PROJECT_NAME='winwidget'
 export APP_VERSION="git-$services_revision"
@@ -526,6 +558,11 @@ const canonical = parse(
 ).values;
 const revision = process.env.EXPECTED_SERVICES_REVISION ?? '';
 if (!/^[0-9a-f]{40}$/.test(revision)) fail();
+const immutableBackupProvenanceRootEnvKeys = [
+	'DATABASE_BACKUP_PROVENANCE_KEY_ID',
+	'DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_HOST_FILE'
+];
+if (immutableBackupProvenanceRootEnvKeys.some(key => canonical.has(key))) fail();
 
 const restoreReceiptHmacKey = canonical.get(
 	'DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64'
@@ -533,11 +570,36 @@ const restoreReceiptHmacKey = canonical.get(
 const restoreReceiptHmacKeyId = canonical.get(
 	'DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID'
 );
+const backupProvenanceKeyId = 'operations-backup-ed25519-2026-08-31';
+const backupProvenancePublicKeyring = JSON.parse(
+	fs.readFileSync(
+		'/run/winwidget/apps/operations/restore-manifests/database-backup-provenance-public-keys.json',
+		'utf8'
+	)
+);
 if (
 	typeof restoreReceiptHmacKey !== 'string' ||
 	!/^[A-Za-z0-9+/]+={0,2}$/.test(restoreReceiptHmacKey) ||
 	typeof restoreReceiptHmacKeyId !== 'string' ||
 	!/^[A-Za-z0-9._:-]{1,80}$/.test(restoreReceiptHmacKeyId)
+) fail();
+if (
+	typeof backupProvenanceKeyId !== 'string' ||
+	!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(backupProvenanceKeyId) ||
+	!backupProvenancePublicKeyring ||
+	backupProvenancePublicKeyring.schemaVersion !== 1 ||
+	backupProvenancePublicKeyring.domain !==
+		'winwidget.operations.database-backup-provenance.v1' ||
+	!Array.isArray(backupProvenancePublicKeyring.keys) ||
+	backupProvenancePublicKeyring.keys.length < 1 ||
+	backupProvenancePublicKeyring.keys.length > 16 ||
+	!backupProvenancePublicKeyring.keys.some(
+		key =>
+			key &&
+			typeof key === 'object' &&
+			key.keyId === backupProvenanceKeyId &&
+			typeof key.publicKeySpkiDerBase64 === 'string'
+	)
 ) fail();
 const decodedRestoreReceiptHmacKey = Buffer.from(
 	restoreReceiptHmacKey,
@@ -620,6 +682,14 @@ overrides.set(
 overrides.set(
 	'operations:DATABASE_RESTORE_SEALED_DIR',
 	'/var/lib/winwidget-operations/restore-sealed'
+);
+overrides.set(
+	'operations:DATABASE_BACKUP_PROVENANCE_KEY_ID',
+	'operations-backup-ed25519-2026-08-31'
+);
+overrides.set(
+	'operations:DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_FILE',
+	'/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem'
 );
 for (const app of apps) {
 	overrides.set(`${app}:APP_REVISION`, revision);
@@ -874,6 +944,19 @@ for image_name in "${built_images[@]}"; do
 	built_image_ids["$image_name"]="$image_id"
 done
 
+operations_image_entrypoint="$(
+	docker image inspect --format '{{json .Config.Entrypoint}}' \
+		"winwidget-operations:git-$services_revision" 2>/dev/null
+)" || die 'Cannot inspect the Operations image entrypoint.'
+operations_image_user="$(
+	docker image inspect --format '{{.Config.User}}' \
+		"winwidget-operations:git-$services_revision" 2>/dev/null
+)" || die 'Cannot inspect the Operations image runtime identity.'
+[[ "$operations_image_entrypoint" == \
+	'["/usr/local/bin/operations-entrypoint.sh"]' &&
+	"$operations_image_user" == 'operations' ]] ||
+	die 'Operations image entrypoint or default runtime identity is invalid.'
+
 readonly operations_restore_host_root='/var/lib/winwidget-operations'
 readonly operations_restore_staging='/var/lib/winwidget-operations/restore-staging'
 readonly operations_restore_sealed='/var/lib/winwidget-operations/restore-sealed'
@@ -981,6 +1064,11 @@ try {
 		'DATABASE_BACKUP_URL'
 	];
 	if (retiredCoreKeys.some(key => values.has(key))) fail();
+	const immutableBackupProvenanceRootEnvKeys = [
+		'DATABASE_BACKUP_PROVENANCE_KEY_ID',
+		'DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_HOST_FILE'
+	];
+	if (immutableBackupProvenanceRootEnvKeys.some(key => values.has(key))) fail();
 	if (values.get('COMPOSE_PROJECT_NAME') !== 'winwidget') fail();
 	if (
 		values.get('TELEGRAM_API_BASE_URL') !==
@@ -1135,6 +1223,7 @@ ENV_CONTRACT
 compose_contract_validator=''
 read -r -d '' compose_contract_validator <<'COMPOSE_CONTRACT' || true
 const fs = require('node:fs');
+const path = require('node:path');
 
 function fail(reason = 'invalid production Compose contract') {
 	throw new Error(reason);
@@ -1142,6 +1231,25 @@ function fail(reason = 'invalid production Compose contract') {
 
 function sorted(values) {
 	return [...values].sort((left, right) => left.localeCompare(right));
+}
+
+function isPathEqualOrAncestor(ancestor, candidate) {
+	if (
+		typeof ancestor !== 'string' ||
+		typeof candidate !== 'string' ||
+		!path.posix.isAbsolute(ancestor) ||
+		!path.posix.isAbsolute(candidate)
+	) return false;
+	const normalizedAncestor = path.posix.normalize(ancestor);
+	const normalizedCandidate = path.posix.normalize(candidate);
+	return (
+		normalizedAncestor === normalizedCandidate ||
+		normalizedCandidate.startsWith(
+			normalizedAncestor === '/'
+				? '/'
+				: `${normalizedAncestor}/`
+		)
+	);
 }
 
 function validBase64HmacKey(value) {
@@ -1164,9 +1272,29 @@ try {
 	const config = JSON.parse(fs.readFileSync(0, 'utf8'));
 	const services = config.services;
 	if (!services || typeof services !== 'object' || Array.isArray(services)) fail();
+	const backupProvenancePrivateKeyHostFile =
+		'/opt/winwidget/deploy/backend/.database-backup-provenance-private-key.pem';
+	const backupProvenanceSecretNames = Object.entries(config.secrets ?? {})
+		.filter(([, secret]) => secret?.file === backupProvenancePrivateKeyHostFile)
+		.map(([name]) => name);
+	if (
+		config.secrets?.['database-backup-provenance-private-key']?.file !==
+			backupProvenancePrivateKeyHostFile ||
+		JSON.stringify(backupProvenanceSecretNames) !==
+			JSON.stringify(['database-backup-provenance-private-key'])
+	) fail();
 	const restoreWorker = services['operations-restore-worker'];
 	const operationsApi = services['operations-api'];
-	if (!restoreWorker || !operationsApi) fail();
+	const operationsWorker = services['operations-worker'];
+	if (!restoreWorker || !operationsApi || !operationsWorker) fail();
+	for (const name of [
+		'operations-api',
+		'operations-outbox-publisher',
+		'operations-migrate',
+		'operations-restore-worker'
+	]) {
+		if (!services[name] || Object.hasOwn(services[name], 'user')) fail();
+	}
 	if (
 		restoreWorker.labels?.['com.winwidget.singleton'] !== 'true' ||
 		restoreWorker.deploy?.replicas !== 1
@@ -1216,6 +1344,16 @@ try {
 		['platform', 'PLATFORM', '55439'],
 		['support', 'SUPPORT', '55440']
 	];
+	const expectedTopLevelSecrets = [
+		'database-backup-provenance-private-key',
+		'billing-postgres-admin-password',
+		'operations-postgres-admin-password',
+		...databaseTargets.map(([slug]) => `${slug}-postgres-admin-password`)
+	].sort();
+	if (
+		JSON.stringify(Object.keys(config.secrets ?? {}).sort()) !==
+		JSON.stringify(expectedTopLevelSecrets)
+	) fail();
 	const environment = restoreWorker.environment ?? {};
 	const apiEnvironment = operationsApi.environment ?? {};
 	const restoreReceiptEnvironmentKeys = [
@@ -1256,7 +1394,7 @@ try {
 		environment.OPERATIONS_PROCESS_ROLE !== 'restore-worker' ||
 		environment.OPERATIONS_LISTEN_HOST !== '127.0.0.1' ||
 		environment.OPERATIONS_RESTORE_WORKER_PORT !== '5203' ||
-		environment.DATABASE_RESTORE_ENABLED !== 'false' ||
+		!['false', 'true'].includes(environment.DATABASE_RESTORE_ENABLED) ||
 		environment.DATABASE_RESTORE_STAGING_DIR !== '/var/lib/winwidget-operations/restore-staging' ||
 		environment.DATABASE_RESTORE_SEALED_DIR !== '/var/lib/winwidget-operations/restore-sealed' ||
 		environment.DATABASE_RESTORE_ARTIFACT_RETENTION_HOURS !== '168' ||
@@ -1264,7 +1402,6 @@ try {
 		environment.RABBITMQ_ASSERT_TOPOLOGY !== 'true'
 	) fail();
 	if (
-		apiEnvironment.DATABASE_RESTORE_ENABLED !== 'false' ||
 		apiEnvironment.DATABASE_RESTORE_ENABLED !==
 			environment.DATABASE_RESTORE_ENABLED ||
 		apiEnvironment.DATABASE_RESTORE_STAGING_DIR !==
@@ -1304,6 +1441,88 @@ try {
 		) fail();
 	}
 	if ('TELEGRAM_INFO_BOT_TOKEN' in environment) fail();
+
+	const backupProvenanceEnvironmentKeys = [
+		'DATABASE_BACKUP_PROVENANCE_KEY_ID',
+		'DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_FILE'
+	];
+	for (const [name, service] of Object.entries(services)) {
+		const count = backupProvenanceEnvironmentKeys.filter(key =>
+			Object.hasOwn(service.environment ?? {}, key)
+		).length;
+		const backupProvenanceSecretMounts = (service.secrets ?? []).filter(
+			secret => {
+				const sourceSecret = config.secrets?.[secret.source];
+				return (
+					secret.source === 'database-backup-provenance-private-key' ||
+					sourceSecret?.file === backupProvenancePrivateKeyHostFile ||
+					secret.target ===
+						'database-backup-provenance-private-key-source'
+				);
+			}
+		).length;
+		const privateBindMountCount = (service.volumes ?? []).filter(
+			mount =>
+				mount.type === 'bind' &&
+				(isPathEqualOrAncestor(
+					mount.source,
+					backupProvenancePrivateKeyHostFile
+				) ||
+					isPathEqualOrAncestor(
+						mount.target,
+						'/run/secrets/database-backup-provenance-private-key-source'
+					) ||
+					isPathEqualOrAncestor(
+						mount.target,
+						'/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem'
+					))
+		).length;
+		const runtimeTmpfsCount = (service.tmpfs ?? []).filter(tmpfs =>
+			tmpfs.startsWith('/run/winwidget-operations-secrets:')
+		).length;
+		if (
+			name === 'operations-worker'
+				? count !== backupProvenanceEnvironmentKeys.length ||
+					backupProvenanceSecretMounts !== 1 ||
+					privateBindMountCount !== 0 ||
+					runtimeTmpfsCount !== 1
+				: count !== 0 ||
+					backupProvenanceSecretMounts !== 0 ||
+					privateBindMountCount !== 0 ||
+					runtimeTmpfsCount !== 0
+		) fail();
+	}
+	if (
+		operationsWorker.environment?.DATABASE_BACKUP_PROVENANCE_KEY_ID !==
+			'operations-backup-ed25519-2026-08-31' ||
+		operationsWorker.environment?.DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_FILE !==
+			'/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem' ||
+		operationsWorker.user !== '0:0' ||
+		Object.hasOwn(operationsWorker, 'init') ||
+		operationsWorker.read_only !== true ||
+		JSON.stringify(operationsWorker.security_opt ?? []) !==
+			JSON.stringify(['no-new-privileges:true']) ||
+		JSON.stringify(operationsWorker.cap_drop ?? []) !==
+			JSON.stringify(['ALL']) ||
+		JSON.stringify([...(operationsWorker.cap_add ?? [])].sort()) !==
+			JSON.stringify(['CHOWN', 'SETGID', 'SETUID'].sort()) ||
+		JSON.stringify([...(operationsWorker.tmpfs ?? [])].sort()) !==
+			JSON.stringify(
+				[
+					'/run/winwidget-operations-secrets:size=64k,mode=0700,uid=0,gid=0,noexec,nosuid,nodev',
+					'/tmp:size=64m,mode=1777,noexec,nosuid,nodev'
+				].sort()
+			) ||
+		JSON.stringify((operationsWorker.healthcheck?.test ?? []).slice(0, 5)) !==
+			JSON.stringify(['CMD', 'gosu', 'operations:nodejs', 'node', '-e']) ||
+		JSON.stringify(operationsWorker.secrets ?? []) !==
+			JSON.stringify([
+				{
+					source: 'database-backup-provenance-private-key',
+					target: 'database-backup-provenance-private-key-source'
+				}
+			])
+	) fail();
 
 	const expectedSecrets = databaseTargets
 		.map(([slug]) => [
@@ -1384,6 +1603,7 @@ try {
 		restoreWorker.stop_grace_period !== '1m30s' ||
 		restoreWorker.restart !== 'unless-stopped'
 	) fail();
+	process.stdout.write(environment.DATABASE_RESTORE_ENABLED);
 } catch (error) {
 	const locations = [
 		...(error instanceof Error ? error.stack ?? '' : '').matchAll(
@@ -1401,7 +1621,8 @@ try {
 }
 COMPOSE_CONTRACT
 
-if ! compose_all config --format json 2>/dev/null |
+database_restore_enabled="$(
+	compose_all config --format json 2>/dev/null |
 	docker run --rm -i \
 		--network none \
 		--read-only \
@@ -1411,10 +1632,122 @@ if ! compose_all config --format json 2>/dev/null |
 		--env "EXPECTED_SERVICES_REVISION=$services_revision" \
 		--entrypoint node \
 		"winwidget-api-gateway:git-$services_revision" \
-		-e "$compose_contract_validator"; then
-	die 'Production Compose apps-only hardening validation failed.'
-fi
+		-e "$compose_contract_validator"
+)" || die 'Production Compose apps-only hardening validation failed.'
+[[ "$database_restore_enabled" == 'false' ||
+	"$database_restore_enabled" == 'true' ]] ||
+	die 'Production Compose returned an invalid restore gate.'
+readonly database_restore_enabled
 unset compose_contract_validator
+
+compose_all run --rm --no-deps --interactive operations-worker node - \
+	<<'VERIFY_BACKUP_PROVENANCE_KEY' >/dev/null
+const {
+	createPrivateKey,
+	createPublicKey,
+	timingSafeEqual
+} = require('node:crypto');
+const fs = require('node:fs');
+
+const fail = () => {
+	throw new Error('backup provenance key verification failed');
+};
+
+try {
+	if (
+		process.pid !== 1 ||
+		process.getuid?.() !== 1001 ||
+		process.getgid?.() !== 1001
+	) fail();
+	const processStatus = fs.readFileSync('/proc/1/status', 'utf8');
+	const statusValue = name =>
+		processStatus.match(new RegExp(`^${name}:\\s+(.+)$`, 'm'))?.[1]?.trim();
+	const zeroCapability = '0000000000000000';
+	if (
+		statusValue('Groups') !== '1001' ||
+		statusValue('NoNewPrivs') !== '1' ||
+		['CapInh', 'CapPrm', 'CapEff', 'CapAmb'].some(
+			name => statusValue(name) !== zeroCapability
+		)
+	) fail();
+	const privateKeyFile =
+		process.env.DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_FILE ?? '';
+	const runtimeKeyDirectory = '/run/winwidget-operations-secrets';
+	const sourceKeyFile =
+		'/run/secrets/database-backup-provenance-private-key-source';
+	const keyId = process.env.DATABASE_BACKUP_PROVENANCE_KEY_ID ?? '';
+	const runtimeKeyDirectoryStat = fs.lstatSync(runtimeKeyDirectory);
+	const privateKeyStat = fs.lstatSync(privateKeyFile);
+	const sourceKeyStat = fs.lstatSync(sourceKeyFile);
+	if (
+		privateKeyFile !==
+			'/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem' ||
+		!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(keyId) ||
+		!runtimeKeyDirectoryStat.isDirectory() ||
+		runtimeKeyDirectoryStat.uid !== 0 ||
+		runtimeKeyDirectoryStat.gid !== 1001 ||
+		(runtimeKeyDirectoryStat.mode & 0o777) !== 0o710 ||
+		!privateKeyStat.isFile() ||
+		privateKeyStat.uid !== 1001 ||
+		privateKeyStat.gid !== 1001 ||
+		(privateKeyStat.mode & 0o777) !== 0o400 ||
+		privateKeyStat.nlink !== 1 ||
+		!sourceKeyStat.isFile() ||
+		sourceKeyStat.uid !== 0 ||
+		sourceKeyStat.gid !== 0 ||
+		(sourceKeyStat.mode & 0o777) !== 0o600 ||
+		sourceKeyStat.nlink !== 1
+	) fail();
+	try {
+		const unexpectedSource = fs.readFileSync(sourceKeyFile);
+		unexpectedSource.fill(0);
+		fail();
+	} catch (error) {
+		if (error?.code !== 'EACCES') fail();
+	}
+	const privateKeyPem = fs.readFileSync(privateKeyFile);
+	let privateKey;
+	try {
+		privateKey = createPrivateKey(privateKeyPem);
+	} finally {
+		privateKeyPem.fill(0);
+	}
+	if (privateKey.asymmetricKeyType !== 'ed25519') fail();
+	const keyring = JSON.parse(
+		fs.readFileSync(
+			'/app/restore-manifests/database-backup-provenance-public-keys.json',
+			'utf8'
+		)
+	);
+	const matches = Array.isArray(keyring.keys)
+		? keyring.keys.filter(key => key?.keyId === keyId)
+		: [];
+	if (matches.length !== 1) fail();
+	const expectedPublicKey = createPublicKey({
+		key: Buffer.from(matches[0].publicKeySpkiDerBase64, 'base64'),
+		format: 'der',
+		type: 'spki'
+	});
+	const actualPublicKey = createPublicKey(privateKey).export({
+		format: 'der',
+		type: 'spki'
+	});
+	const expectedPublicKeyDer = expectedPublicKey.export({
+		format: 'der',
+		type: 'spki'
+	});
+	if (
+		expectedPublicKey.asymmetricKeyType !== 'ed25519' ||
+		!Buffer.isBuffer(actualPublicKey) ||
+		!Buffer.isBuffer(expectedPublicKeyDer) ||
+		actualPublicKey.length !== expectedPublicKeyDer.length ||
+		!timingSafeEqual(actualPublicKey, expectedPublicKeyDer)
+	) fail();
+} catch {
+	process.stderr.write('Backup provenance private/public key gate failed.\n');
+	process.exit(1);
+}
+VERIFY_BACKUP_PROVENANCE_KEY
 
 # BEGIN WINWIDGET_DOCKER_CLEANUP
 inspect_validated_project_container() {
@@ -1864,6 +2197,89 @@ wait_for_healthy_services() {
 	die 'Production services did not become healthy before the deadline.'
 }
 
+verify_operations_worker_runtime_identity() {
+	local container_id
+	local -a container_ids=()
+	mapfile -t container_ids < <(
+		compose_all ps --status running -q operations-worker 2>/dev/null
+	)
+	[[ "${#container_ids[@]}" -eq 1 &&
+		"${container_ids[0]}" =~ ^[0-9a-f]{64}$ ]] ||
+		die 'Operations worker must have exactly one running container for PID 1 verification.'
+	container_id="${container_ids[0]}"
+
+	docker exec --user 1001:1001 --interactive "$container_id" node - \
+		<<'VERIFY_OPERATIONS_WORKER_RUNTIME_IDENTITY' >/dev/null
+const fs = require('node:fs');
+
+const fail = () => {
+	throw new Error('operations worker runtime identity verification failed');
+};
+
+try {
+	if (process.getuid?.() !== 1001 || process.getgid?.() !== 1001) fail();
+	const status = fs.readFileSync('/proc/1/status', 'utf8');
+	const processName = status.match(/^Name:\s+(.+)$/m)?.[1]?.trim();
+	const uidValues = status.match(/^Uid:\s+(.+)$/m)?.[1]?.trim().split(/\s+/);
+	const gidValues = status.match(/^Gid:\s+(.+)$/m)?.[1]?.trim().split(/\s+/);
+	const statusValue = name =>
+		status.match(new RegExp(`^${name}:\\s+(.+)$`, 'm'))?.[1]?.trim();
+	const zeroCapability = '0000000000000000';
+	if (
+		processName !== 'node' ||
+		uidValues?.length !== 4 ||
+		gidValues?.length !== 4 ||
+		!uidValues.every(value => value === '1001') ||
+		!gidValues.every(value => value === '1001') ||
+		statusValue('Groups') !== '1001' ||
+		statusValue('NoNewPrivs') !== '1' ||
+		['CapInh', 'CapPrm', 'CapEff', 'CapAmb'].some(
+			name => statusValue(name) !== zeroCapability
+		)
+	) fail();
+
+	const privateKeyFile =
+		process.env.DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_FILE ?? '';
+	const runtimeKeyDirectory = '/run/winwidget-operations-secrets';
+	const sourceKeyFile =
+		'/run/secrets/database-backup-provenance-private-key-source';
+	const runtimeKeyDirectoryStat = fs.lstatSync(runtimeKeyDirectory);
+	const privateKeyStat = fs.lstatSync(privateKeyFile);
+	const sourceKeyStat = fs.lstatSync(sourceKeyFile);
+	if (
+		privateKeyFile !==
+			'/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem' ||
+		!runtimeKeyDirectoryStat.isDirectory() ||
+		runtimeKeyDirectoryStat.uid !== 0 ||
+		runtimeKeyDirectoryStat.gid !== 1001 ||
+		(runtimeKeyDirectoryStat.mode & 0o777) !== 0o710 ||
+		!privateKeyStat.isFile() ||
+		privateKeyStat.uid !== 1001 ||
+		privateKeyStat.gid !== 1001 ||
+		(privateKeyStat.mode & 0o777) !== 0o400 ||
+		privateKeyStat.nlink !== 1 ||
+		!sourceKeyStat.isFile() ||
+		sourceKeyStat.uid !== 0 ||
+		sourceKeyStat.gid !== 0 ||
+		(sourceKeyStat.mode & 0o777) !== 0o600 ||
+		sourceKeyStat.nlink !== 1
+	) fail();
+	const privateKeyDescriptor = fs.openSync(privateKeyFile, 'r');
+	fs.closeSync(privateKeyDescriptor);
+	try {
+		const unexpectedSource = fs.readFileSync(sourceKeyFile);
+		unexpectedSource.fill(0);
+		fail();
+	} catch (error) {
+		if (error?.code !== 'EACCES') fail();
+	}
+} catch {
+	process.stderr.write('Operations worker PID 1 identity gate failed.\n');
+	process.exit(1);
+}
+VERIFY_OPERATIONS_WORKER_RUNTIME_IDENTITY
+}
+
 verify_singleton_running_service() {
 	local service_name="$1" container_id singleton_label
 	local -a container_ids=()
@@ -2088,7 +2504,104 @@ verify_current_rabbitmq_user_inventory() {
 		die 'Current RabbitMQ user inventory differs from the exact apps-only contract.'
 }
 
+verify_database_restore_activation_is_idle() {
+	local rabbitmq_container_id queue_inventory queue_name queue_state
+	[[ "$database_restore_enabled" == 'true' ]] || return 0
+
+	compose_all run --rm --no-deps --interactive \
+		--entrypoint node \
+		operations-api - <<'VERIFY_DATABASE_RESTORE_ACTIVATION_IDLE' >/dev/null
+const { PrismaClient } = require('@prisma/operations-client');
+
+const databaseUrl = process.env.OPERATIONS_DATABASE_URL ?? '';
+if (!databaseUrl) process.exit(1);
+const client = new PrismaClient({
+	datasources: { db: { url: databaseUrl } }
+});
+
+(async () => {
+	const [jobs, permits, recoveryActions, outboxEvents, lease] =
+		await Promise.all([
+			client.databaseRestoreJob.count({
+				where: {
+					OR: [
+						{ status: { in: ['QUEUED', 'PROCESSING'] } },
+						{
+							status: 'RECOVERY_REQUIRED',
+							recoveryResolvedAt: null
+						}
+					]
+				}
+			}),
+			client.databaseRestorePermit.count({
+				where: {
+					status: {
+						in: ['PENDING_APPROVAL', 'APPROVED', 'CONSUMED']
+					}
+				}
+			}),
+			client.databaseRestoreRecoveryAction.count({
+				where: { status: { notIn: ['RESOLVED', 'EXPIRED'] } }
+			}),
+			client.outboxEvent.count({
+				where: {
+					eventType: {
+						in: [
+							'operations.database-restore.requested.v1',
+							'operations.database-restore.recovery-action.requested.v1'
+						]
+					},
+					status: { in: ['PENDING', 'PROCESSING'] }
+				}
+			}),
+			client.databaseRestoreExecutionLease.findUnique({
+				where: { id: 'singleton' },
+				select: {
+					operationType: true,
+					operationId: true,
+					leaseOwner: true,
+					leaseToken: true
+				}
+			})
+		]);
+	if (
+		[jobs, permits, recoveryActions, outboxEvents].some(count => count !== 0) ||
+		(lease && Object.values(lease).some(value => value !== null))
+	) {
+		throw new Error('database restore activation is not idle');
+	}
+})()
+	.catch(() => {
+		process.stderr.write('Database restore activation DB inventory is not idle.\n');
+		process.exitCode = 1;
+	})
+	.finally(async () => {
+		await client.$disconnect();
+	});
+VERIFY_DATABASE_RESTORE_ACTIVATION_IDLE
+
+	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
+	[[ "$rabbitmq_container_id" =~ ^[0-9a-f]{64}$ ]] ||
+		die 'Exactly one running RabbitMQ container is required for restore activation.'
+	queue_inventory="$(
+		docker exec "$rabbitmq_container_id" rabbitmqctl --silent \
+			list_queues -p winwidget name messages_ready messages_unacknowledged
+	)" || die 'Cannot read the database restore RabbitMQ queue inventory.'
+	for queue_name in \
+		winwidget.operations.database-restore.v1 \
+		winwidget.operations.database-restore.v1.retry-v1; do
+		queue_state="$(
+			awk -v queue="$queue_name" \
+				'$1 == queue { print $1 ":" $2 ":" $3 }' \
+				<<<"$queue_inventory"
+		)"
+		[[ "$queue_state" == "$queue_name:0:0" ]] ||
+			die 'Database restore activation RabbitMQ inventory is not idle.'
+	done
+}
+
 verify_current_rabbitmq_user_inventory
+verify_database_restore_activation_is_idle
 
 docker run --rm \
 	--interactive \
@@ -2849,6 +3362,7 @@ verify_steady_state_phase() {
 		# project service remains in either running or stopped state.
 		verify_project_has_no_stopped_containers
 	fi
+	verify_operations_worker_runtime_identity
 	verify_current_reporting_routing_projection
 	rabbitmq_container_id="$(compose_all ps --status running -q rabbitmq 2>/dev/null)"
 	[[ -n "$rabbitmq_container_id" && "$rabbitmq_container_id" != *$'\n'* ]] ||
@@ -2941,11 +3455,13 @@ verify_steady_state_phase() {
 
 compose_all up -d --no-build --force-recreate "${runtime_without_gateway[@]}"
 wait_for_healthy_services "${runtime_without_gateway[@]}"
+verify_database_restore_activation_is_idle
 compose_all up -d --no-build --force-recreate operations-restore-worker
 wait_for_healthy_services operations-restore-worker
 verify_singleton_running_service operations-restore-worker
 compose_all up -d --no-build --force-recreate api-gateway
 wait_for_healthy_services "${runtime_services[@]}"
+verify_operations_worker_runtime_identity
 
 for service_name in "${runtime_services[@]}"; do
 	container_id="$(compose_all ps --status running -q "$service_name" 2>/dev/null)"
@@ -3142,6 +3658,10 @@ env_sha256_after="$(sha256sum "$env_file" | awk '{print $1}')"
 	die 'Canonical production env changed during deployment.'
 [[ "$(stat -c '%u:%g:%a:%h' "$env_file")" == '0:0:600:1' ]] ||
 	die 'Canonical production env permissions changed during deployment.'
+assert_backup_provenance_private_key
+[[ "$(stat -c '%d:%i:%s' "$backup_provenance_private_key_file")" == "$backup_provenance_private_key_identity_before" &&
+	"$(sha256sum "$backup_provenance_private_key_file" | awk '{print $1}')" == "$backup_provenance_private_key_sha256_before" ]] ||
+	die 'Backup provenance private key changed during deployment.'
 for service_env_file in "${service_env_files[@]}"; do
 	[[ -f "$service_env_file" && ! -L "$service_env_file" &&
 		"$(stat -c '%u:%g:%a:%h' "$service_env_file")" == '0:0:600:1' ]] ||
@@ -3154,6 +3674,7 @@ verify_steady_state_phase pre_cleanup
 cleanup_obsolete_winwidget_docker_resources
 verify_steady_state_phase post_cleanup
 wait_for_healthy_services "${runtime_services[@]}"
+verify_operations_worker_runtime_identity
 verify_telegram_proxy_health ||
 	die 'Pinned Telegram proxy health check failed after steady-state verification.'
 wait_for_http_revision \

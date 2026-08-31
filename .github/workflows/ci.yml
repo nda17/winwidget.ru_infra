@@ -124,6 +124,9 @@ jobs:
             'VERIFY_OPERATIONS_SERVICE_IDENTITY',
             'VERIFY_CURRENT_OPERATIONS_ROUTING',
             'VERIFY_CURRENT_REPORTING_ROUTING',
+            'VERIFY_BACKUP_PROVENANCE_KEY',
+            'VERIFY_OPERATIONS_WORKER_RUNTIME_IDENTITY',
+            'VERIFY_DATABASE_RESTORE_ACTIVATION_IDLE',
             'VERIFY_TELEGRAM_PROXY_HEALTH'
           ]) {
             const pattern = new RegExp(
@@ -142,7 +145,17 @@ jobs:
           const serviceEnvMaterializer = javascriptHeredocs.get(
             'MATERIALIZE_SERVICE_ENVS'
           );
+          const envContract = javascriptHeredocs.get('ENV_CONTRACT');
           const composeContract = javascriptHeredocs.get('COMPOSE_CONTRACT');
+          const backupProvenanceKeyProbe = javascriptHeredocs.get(
+            'VERIFY_BACKUP_PROVENANCE_KEY'
+          );
+          const operationsWorkerRuntimeIdentityProbe = javascriptHeredocs.get(
+            'VERIFY_OPERATIONS_WORKER_RUNTIME_IDENTITY'
+          );
+          const databaseRestoreActivationIdleProbe = javascriptHeredocs.get(
+            'VERIFY_DATABASE_RESTORE_ACTIVATION_IDLE'
+          );
           const rabbitProvision =
             javascriptHeredocs.get('PROVISION_RABBITMQ');
           for (const key of [
@@ -187,19 +200,77 @@ jobs:
           );
           requireText(
             composeContract,
-            "apiEnvironment.DATABASE_RESTORE_ENABLED !== 'false'",
-            'resolved Compose does not keep production restore disabled'
+            "!['false', 'true'].includes(environment.DATABASE_RESTORE_ENABLED)",
+            'restore gate is not restricted to literal true or false'
           );
           requireText(
-            composeContract,
-            "environment.DATABASE_RESTORE_ENABLED !== 'false'",
-            'restore-worker does not enforce the production kill switch'
+            serviceEnvMaterializer,
+            "['operations:DATABASE_RESTORE_ENABLED', 'false']",
+            'restore gate materializer default is not fail-safe false'
           );
           requireText(
             composeContract,
             'apiEnvironment.DATABASE_RESTORE_ENABLED !==',
             'API and restore-worker kill switches are not bound together'
           );
+          requireText(
+            composeContract,
+            'process.stdout.write(environment.DATABASE_RESTORE_ENABLED)',
+            'validated restore gate is not returned to the deployment controller'
+          );
+          for (const evidence of [
+            "{ status: { in: ['QUEUED', 'PROCESSING'] } },",
+            "status: 'RECOVERY_REQUIRED',",
+            'recoveryResolvedAt: null',
+            "in: ['PENDING_APPROVAL', 'APPROVED', 'CONSUMED']",
+            "status: { notIn: ['RESOLVED', 'EXPIRED'] }",
+            'operations.database-restore.requested.v1',
+            'operations.database-restore.recovery-action.requested.v1',
+            "client.databaseRestoreExecutionLease.findUnique({"
+          ]) {
+            requireText(
+              databaseRestoreActivationIdleProbe,
+              evidence,
+              `restore=true DB idle gate is missing: ${evidence}`
+            );
+          }
+          for (const evidence of [
+            'winwidget.operations.database-restore.v1',
+            'winwidget.operations.database-restore.v1.retry-v1',
+            'messages_ready messages_unacknowledged'
+          ]) {
+            requireText(
+              script,
+              evidence,
+              `restore=true RabbitMQ idle gate is missing: ${evidence}`
+            );
+          }
+          const restoreIdleCall = '\nverify_database_restore_activation_is_idle\n';
+          const firstRestoreIdleCall = script.indexOf(restoreIdleCall);
+          const rabbitProvisionStart = script.indexOf("<<'PROVISION_RABBITMQ'");
+          if (
+            firstRestoreIdleCall < 0 ||
+            rabbitProvisionStart <= firstRestoreIdleCall
+          ) {
+            fail('restore=true idle gate must precede production provisioning');
+          }
+          const runtimeWithoutGatewayStart = script.indexOf(
+            'compose_all up -d --no-build --force-recreate "${runtime_without_gateway[@]}"'
+          );
+          const restoreWorkerRolloutStart = script.indexOf(
+            'compose_all up -d --no-build --force-recreate operations-restore-worker'
+          );
+          const secondRestoreIdleCall = script.indexOf(
+            restoreIdleCall,
+            runtimeWithoutGatewayStart
+          );
+          if (
+            runtimeWithoutGatewayStart < 0 ||
+            secondRestoreIdleCall <= runtimeWithoutGatewayStart ||
+            secondRestoreIdleCall >= restoreWorkerRolloutStart
+          ) {
+            fail('restore=true idle gate must repeat immediately before worker rollout');
+          }
           requireText(
             composeContract,
             "restoreWorker.labels?.['com.winwidget.singleton'] !== 'true'",
@@ -211,6 +282,11 @@ jobs:
             'restore-worker single replica is not validated'
           );
           requireText(
+            composeContract,
+            "Object.hasOwn(services[name], 'user')",
+            'non-worker Operations roles may override the image non-root identity'
+          );
+          requireText(
             script,
             'verify_singleton_running_service operations-restore-worker',
             'restore-worker runtime singleton count is not verified'
@@ -219,6 +295,217 @@ jobs:
             composeContract,
             "name === 'operations-api' || name === 'operations-restore-worker'",
             'restore receipt signing key is not restricted to the exact runtimes'
+          );
+          for (const key of [
+            'DATABASE_BACKUP_PROVENANCE_KEY_ID',
+            'DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_FILE'
+          ]) {
+            requireText(
+              serviceEnvMaterializer,
+              key,
+              `backup provenance materialization is missing: ${key}`
+            );
+            requireText(
+              composeContract,
+              key,
+              `backup provenance Compose scope is missing: ${key}`
+            );
+          }
+          const fixedBackupProvenanceKeyPath =
+            '/opt/winwidget/deploy/backend/.database-backup-provenance-private-key.pem';
+          for (const [name, source] of [
+            ['controller', script],
+            ['Compose contract', composeContract],
+            ['README', readme],
+            ['runbook', runbook]
+          ]) {
+            requireText(
+              source,
+              fixedBackupProvenanceKeyPath,
+              `${name} does not enforce the fixed backup provenance key path`
+            );
+          }
+          const fixedBackupProvenanceKeyId =
+            'operations-backup-ed25519-2026-08-31';
+          for (const [name, source] of [
+            ['service env materializer', serviceEnvMaterializer],
+            ['Compose contract', composeContract],
+            ['README', readme],
+            ['runbook', runbook]
+          ]) {
+            requireText(
+              source,
+              fixedBackupProvenanceKeyId,
+              `${name} does not pin the immutable backup provenance key ID`
+            );
+          }
+          for (const rootEnvKey of [
+            'DATABASE_BACKUP_PROVENANCE_KEY_ID',
+            'DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_HOST_FILE'
+          ]) {
+            requireText(
+              serviceEnvMaterializer,
+              rootEnvKey,
+              `service env materializer does not reject mutable root env input: ${rootEnvKey}`
+            );
+            requireText(
+              envContract,
+              rootEnvKey,
+              `production env contract does not reject immutable release input: ${rootEnvKey}`
+            );
+          }
+          requireText(
+            serviceEnvMaterializer,
+            'immutableBackupProvenanceRootEnvKeys.some(key => canonical.has(key))',
+            'materializer accepts backup provenance configuration from root env'
+          );
+          requireText(
+            envContract,
+            'immutableBackupProvenanceRootEnvKeys.some(key => values.has(key))',
+            'production env accepts immutable backup provenance release inputs'
+          );
+          requireText(
+            script,
+            "stat -c '%u:%g:%a:%h' \"$backup_provenance_private_key_file\"",
+            'backup provenance host key metadata gate is missing'
+          );
+          requireText(
+            script,
+            'Backup provenance private key changed during deployment.',
+            'backup provenance host key stability gate is missing'
+          );
+          requireText(
+            script,
+            'git -C "$release_root" ls-files --error-unmatch',
+            'tracked public keyring gate is missing'
+          );
+          requireText(
+            composeContract,
+            "secret.source === 'database-backup-provenance-private-key'",
+            'backup provenance secret scope gate is missing'
+          );
+          for (const evidence of [
+            'backupProvenanceSecretNames',
+            'expectedTopLevelSecrets',
+            'sourceSecret?.file === backupProvenancePrivateKeyHostFile',
+            'isPathEqualOrAncestor(',
+            'mount.source,',
+            'mount.target,'
+          ]) {
+            requireText(
+              composeContract,
+              evidence,
+              `backup provenance secret-alias gate is missing: ${evidence}`
+            );
+          }
+          for (const evidence of [
+            'database-backup-provenance-private-key-source',
+            '/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem',
+            "operationsWorker.user !== '0:0'",
+            '/run/winwidget-operations-secrets:size=64k,mode=0700,uid=0,gid=0,noexec,nosuid,nodev',
+            "Object.hasOwn(operationsWorker, 'init')",
+            "operationsWorker.read_only !== true",
+            "JSON.stringify(['CHOWN', 'SETGID', 'SETUID'].sort())"
+          ]) {
+            requireText(
+              composeContract,
+              evidence,
+              `backup provenance copy/drop contract is missing: ${evidence}`
+            );
+          }
+          requireText(
+            backupProvenanceKeyProbe,
+            'process.getuid?.() !== 1001',
+            'backup provenance key probe does not preserve the worker UID boundary'
+          );
+          requireText(
+            backupProvenanceKeyProbe,
+            'process.pid !== 1',
+            'backup provenance key probe does not require non-root PID 1'
+          );
+          for (const evidence of [
+            "statusValue('Groups') !== '1001'",
+            "statusValue('NoNewPrivs') !== '1'",
+            "['CapInh', 'CapPrm', 'CapEff', 'CapAmb']",
+            'runtimeKeyDirectoryStat.uid !== 0',
+            'runtimeKeyDirectoryStat.gid !== 1001',
+            '(runtimeKeyDirectoryStat.mode & 0o777) !== 0o710'
+          ]) {
+            requireText(
+              backupProvenanceKeyProbe,
+              evidence,
+              `backup provenance privilege-drop probe is missing: ${evidence}`
+            );
+          }
+          requireText(
+            backupProvenanceKeyProbe,
+            'timingSafeEqual(actualPublicKey, expectedPublicKeyDer)',
+            'backup provenance key probe does not bind the private/public pair'
+          );
+          requireText(
+            backupProvenanceKeyProbe,
+            "error?.code !== 'EACCES'",
+            'unprivileged worker can still read the root-only provenance source'
+          );
+          requireText(
+            script,
+            '["/usr/local/bin/operations-entrypoint.sh"]',
+            'Operations image entrypoint identity gate is missing'
+          );
+          for (const evidence of [
+            "fs.readFileSync('/proc/1/status', 'utf8')",
+            "processName !== 'node'",
+            "uidValues.every(value => value === '1001')",
+            "gidValues.every(value => value === '1001')",
+            "statusValue('Groups') !== '1001'",
+            "statusValue('NoNewPrivs') !== '1'",
+            "['CapInh', 'CapPrm', 'CapEff', 'CapAmb']",
+            'runtimeKeyDirectoryStat.uid !== 0',
+            'runtimeKeyDirectoryStat.gid !== 1001',
+            '(runtimeKeyDirectoryStat.mode & 0o777) !== 0o710',
+            '/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem',
+            "error?.code !== 'EACCES'"
+          ]) {
+            requireText(
+              operationsWorkerRuntimeIdentityProbe,
+              evidence,
+              `deployed Operations worker identity gate is missing: ${evidence}`
+            );
+          }
+          requireText(
+            script,
+            'docker exec --user 1001:1001 --interactive "$container_id" node -',
+            'deployed Operations worker is not inspected as its runtime UID/GID'
+          );
+          const backupProvenanceProbeStart = script.indexOf(
+            "<<'VERIFY_BACKUP_PROVENANCE_KEY'"
+          );
+          const infrastructureMutationStart = script.indexOf(
+            'compose_all up -d --no-build "${infrastructure_services[@]}"'
+          );
+          if (
+            backupProvenanceProbeStart < 0 ||
+            infrastructureMutationStart <= backupProvenanceProbeStart
+          ) {
+            fail('backup provenance key probe must precede production mutations');
+          }
+          const operationsWorkerRolloutStart = script.indexOf(
+            'compose_all up -d --no-build --force-recreate api-gateway'
+          );
+          const operationsWorkerRuntimeIdentityCall = script.indexOf(
+            '\nverify_operations_worker_runtime_identity\n',
+            operationsWorkerRolloutStart
+          );
+          if (
+            operationsWorkerRolloutStart < 0 ||
+            operationsWorkerRuntimeIdentityCall <= operationsWorkerRolloutStart
+          ) {
+            fail('deployed Operations worker PID 1 must be verified after rollout');
+          }
+          requireText(
+            script,
+            '\tverify_operations_worker_runtime_identity\n',
+            'steady-state verification omits the Operations worker PID 1 gate'
           );
           requireText(
             script,
@@ -237,11 +524,13 @@ jobs:
           );
           for (const evidence of [
             'изолированном PostgreSQL 18',
-            'DATABASE_RESTORE_ENABLED=false',
+            'literal `true` или `false`',
+            'Безопасный default `.env.example` — `false`',
             'writer-fence evidence',
             'worker-only sealed storage',
             'transport retries не имеют terminal cap',
             'DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64',
+            'Ротация Ed25519 backup provenance',
             'Operations self-restore и Billing отсутствуют'
           ]) {
             requireText(

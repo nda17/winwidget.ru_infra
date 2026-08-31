@@ -99,14 +99,61 @@ Base64-декодирования) и идентификатор ротации
 вывода значений, а resolved Compose — что обе переменные с одинаковыми
 значениями получает ровно `operations-api` и `operations-restore-worker`.
 Другим контейнерам, включая Operations worker/outbox/migrate, signing key не
-передаётся. Обычный deploy требует `DATABASE_RESTORE_ENABLED=false` одновременно
-в Operations API и restore-worker; worker проверяет kill switch до claim
-обычного restore job, не блокируя signed recovery/reconciliation. Первичное
+передаётся. Обычный deploy принимает для `DATABASE_RESTORE_ENABLED` только
+literal `true` или `false` и требует exact одинаковое значение в Operations API
+и restore-worker; безопасный default в `.env.example` остаётся `false`.
+Значение `true` допускается только после provenance/key, PostgreSQL 18 rehearsal
+и operational approval gates. Routine deploy не создаёт restore job, но `true`
+разрешает worker сразу claim уже существующей approved работы, поэтому до
+rollout обязательны exact read-only pending job/permit/queue inventory и
+отдельное recovery change window. Контроллер fail closed проверяет нулевой
+DB/Outbox/RabbitMQ inventory до provisioning/migrations и повторно прямо перед
+recreate restore-worker. В job inventory `RECOVERY_REQUIRED` считается
+активным только пока `recoveryResolvedAt` не установлен: уже завершённое
+recovery не блокирует последующие контролируемые окна. Worker проверяет kill
+switch до claim обычного restore job, не блокируя signed
+recovery/reconciliation. Первичное
 provisioning использует один новый
 случайный ключ и новый key ID. Это не ротация: активный ключ нельзя заменять,
 пока есть выполняющийся restore или незакрытый `RECOVERY_REQUIRED`. До
 реализации keyring с проверкой current/previous key ID старый ключ нельзя
 удалять, иначе ранее созданные immutable receipts станут непроверяемыми.
+
+Backup provenance использует отдельную асимметричную границу. Канонический env
+не содержит provenance key ID или host path: согласованные immutable
+services/infra releases закрепляют literal key ID
+`operations-backup-ed25519-2026-08-31` и literal path
+`/opt/winwidget/deploy/backend/.database-backup-provenance-private-key.pem`
+непосредственно в Compose. Поэтому ротация не меняет canonical env или его
+одобренный SHA-256. Сам PKCS#8 Ed25519 private key не хранится в env, GitHub или
+Git. На VPS это непустой обычный файл `root:root`, mode `0600`, без symlink и
+hardlink.
+Контроллер проверяет его metadata и неизменность под deploy lock, а перед
+миграциями запускает непривилегированный probe, который без вывода key material
+доказывает соответствие private key активному public key из tracked keyring
+`apps/operations/restore-manifests/database-backup-provenance-public-keys.json`.
+Private secret и его file-path environment получает только
+`operations-worker`: root-only source mount
+`/run/secrets/database-backup-provenance-private-key-source` копируется
+проверенным image entrypoint в отдельный tmpfs runtime-файл owner UID/GID
+`1001:1001`, mode `0400`: root entrypoint создаёт temporary copy `root:root`
+mode `0600`, выполняет `cmp`, затем делает final chown/chmod в каталоге
+`root:nodejs` mode `0710` и только после этого атомарно публикует файл. PID 1
+запускается без root-прав. Bootstrap контейнера имеет `cap_drop: ALL` и только
+`CHOWN`, `SETGID`, `SETUID`; `FOWNER`/`DAC_OVERRIDE` не выдаются. API,
+restore-worker и остальные контейнеры используют только public keyring из
+immutable image. После rollout контроллер дополнительно читает только безопасные
+поля `/proc/1/status` работающего worker и fail closed подтверждает имя процесса,
+все real/effective/saved/filesystem UID/GID `1001`, единственную supplemental
+group `1001`, `NoNewPrivs=1` и нулевые inherited, permitted, effective и ambient
+capabilities, не читая private key.
+Ротация выполняется по процедуре раздела Backup/restore в
+[runbook](docs/runbook.md) двумя immutable services/infra releases: первый
+добавляет новый public key, сохраняя старый active ID, второй переключает
+Compose и infra-validator literal ID
+после атомарной замены host key writer-ом, участвующим в том же deploy lock.
+Старый public key сохраняется до окончания restore-retention всех подписанных
+им backup; canonical env и его approved SHA-256 при ротации не меняются.
 
 Restore artifacts разделены на два bind-каталога UID/GID `1001:1001`, mode
 `0700`. `DATABASE_RESTORE_STAGING_DIR` доступен Operations API для upload и
@@ -166,6 +213,9 @@ raw TLS listener на `8443`. Установка и безопасная про�
   записи путями `apps/<service>/.env.production`;
 - канонический env-файл `/opt/winwidget/deploy/backend/.env.production` с
   владельцем `root:root` и режимом `0600`;
+- Ed25519 private key backup provenance по фиксированному пути
+  `/opt/winwidget/deploy/backend/.database-backup-provenance-private-key.pem`,
+  обычный непустой файл `root:root`, mode `0600`, без дополнительных hardlink;
 - все внешние PostgreSQL volumes и файлы секретов с паролями, указанные в
   Compose-манифесте сервисов;
 - production-lock `/opt/winwidget/deploy/backend/.production-deploy.lock`
@@ -205,9 +255,10 @@ lifecycle gate и полной матрицы сервисов release-job ав�
    `git-<revision>` и проверяет OCI label ревизии и неизменяемый ID каждого
    образа;
 7. без вывода значений проверяет точный Gateway manifest без catch-all/Core
-   upstream, выключенный production restore, изоляцию signing key между
-   Operations API/restore-worker и остальными контейнерами, а также усиленную
-   защиту restore-worker;
+   upstream, literal и exact-match production restore gate между Operations
+   API/restore-worker, изоляцию receipt signing key, единственного получателя
+   backup-provenance private secret и соответствие этой Ed25519 пары tracked
+   public keyring, а также усиленную защиту restore-worker;
 8. запускает девять сервисов PostgreSQL и RabbitMQ, затем до изменения
    RabbitMQ users/permissions и до миграций read-only проверяет имя Operations
    DB, schema/role boundaries, текущие critical tables, точный набор работающих
