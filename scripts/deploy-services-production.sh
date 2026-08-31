@@ -1660,14 +1660,19 @@ try {
 		process.getgid?.() !== 1001
 	) fail();
 	const processStatus = fs.readFileSync('/proc/1/status', 'utf8');
-	const statusValue = name =>
-		processStatus.match(new RegExp(`^${name}:\\s+(.+)$`, 'm'))?.[1]?.trim();
+	const statusLineValue = name => {
+		const prefix = `${name}:`;
+		const line = processStatus
+			.split('\n')
+			.find(candidate => candidate.startsWith(prefix));
+		return line?.slice(prefix.length).trim();
+	};
 	const zeroCapability = '0000000000000000';
 	if (
-		statusValue('Groups') !== '1001' ||
-		statusValue('NoNewPrivs') !== '1' ||
+		statusLineValue('Groups') !== '' ||
+		statusLineValue('NoNewPrivs') !== '1' ||
 		['CapInh', 'CapPrm', 'CapEff', 'CapAmb'].some(
-			name => statusValue(name) !== zeroCapability
+			name => statusLineValue(name) !== zeroCapability
 		)
 	) fail();
 	const privateKeyFile =
@@ -2222,8 +2227,13 @@ try {
 	const processName = status.match(/^Name:\s+(.+)$/m)?.[1]?.trim();
 	const uidValues = status.match(/^Uid:\s+(.+)$/m)?.[1]?.trim().split(/\s+/);
 	const gidValues = status.match(/^Gid:\s+(.+)$/m)?.[1]?.trim().split(/\s+/);
-	const statusValue = name =>
-		status.match(new RegExp(`^${name}:\\s+(.+)$`, 'm'))?.[1]?.trim();
+	const statusLineValue = name => {
+		const prefix = `${name}:`;
+		const line = status
+			.split('\n')
+			.find(candidate => candidate.startsWith(prefix));
+		return line?.slice(prefix.length).trim();
+	};
 	const zeroCapability = '0000000000000000';
 	if (
 		processName !== 'node' ||
@@ -2231,10 +2241,10 @@ try {
 		gidValues?.length !== 4 ||
 		!uidValues.every(value => value === '1001') ||
 		!gidValues.every(value => value === '1001') ||
-		statusValue('Groups') !== '1001' ||
-		statusValue('NoNewPrivs') !== '1' ||
+		statusLineValue('Groups') !== '' ||
+		statusLineValue('NoNewPrivs') !== '1' ||
 		['CapInh', 'CapPrm', 'CapEff', 'CapAmb'].some(
-			name => statusValue(name) !== zeroCapability
+			name => statusLineValue(name) !== zeroCapability
 		)
 	) fail();
 

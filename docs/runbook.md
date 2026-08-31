@@ -306,7 +306,7 @@ trailing slash или дополнительным suffix отклоняются
   Ed25519 пары без вывода содержимого или fingerprint. После rollout и в обеих
   steady-state фазах контроллер отдельно проверяет `/proc/1/status` фактически
   работающего worker: PID 1 — `node`, а все real/effective/saved/filesystem
-  UID/GID равны `1001`, supplemental groups содержат только `1001`,
+  UID/GID равны `1001`, supplemental groups отсутствуют,
   `NoNewPrivs=1`, а inherited/permitted/effective/ambient capabilities нулевые;
   runtime-файл доступен, root-only source остаётся недоступным этому UID.
 - `DATABASE_RESTORE_ENABLED` принимает только literal `true` или `false`, а

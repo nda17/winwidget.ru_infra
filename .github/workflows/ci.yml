@@ -424,8 +424,9 @@ jobs:
             'backup provenance key probe does not require non-root PID 1'
           );
           for (const evidence of [
-            "statusValue('Groups') !== '1001'",
-            "statusValue('NoNewPrivs') !== '1'",
+            'candidate.startsWith(prefix)',
+            "statusLineValue('Groups') !== ''",
+            "statusLineValue('NoNewPrivs') !== '1'",
             "['CapInh', 'CapPrm', 'CapEff', 'CapAmb']",
             'runtimeKeyDirectoryStat.uid !== 0',
             'runtimeKeyDirectoryStat.gid !== 1001',
@@ -457,8 +458,9 @@ jobs:
             "processName !== 'node'",
             "uidValues.every(value => value === '1001')",
             "gidValues.every(value => value === '1001')",
-            "statusValue('Groups') !== '1001'",
-            "statusValue('NoNewPrivs') !== '1'",
+            'candidate.startsWith(prefix)',
+            "statusLineValue('Groups') !== ''",
+            "statusLineValue('NoNewPrivs') !== '1'",
             "['CapInh', 'CapPrm', 'CapEff', 'CapAmb']",
             'runtimeKeyDirectoryStat.uid !== 0',
             'runtimeKeyDirectoryStat.gid !== 1001',

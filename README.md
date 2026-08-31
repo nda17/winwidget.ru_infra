@@ -144,8 +144,8 @@ mode `0600`, выполняет `cmp`, затем делает final chown/chmod
 restore-worker и остальные контейнеры используют только public keyring из
 immutable image. После rollout контроллер дополнительно читает только безопасные
 поля `/proc/1/status` работающего worker и fail closed подтверждает имя процесса,
-все real/effective/saved/filesystem UID/GID `1001`, единственную supplemental
-group `1001`, `NoNewPrivs=1` и нулевые inherited, permitted, effective и ambient
+все real/effective/saved/filesystem UID/GID `1001`, отсутствие supplemental
+groups, `NoNewPrivs=1` и нулевые inherited, permitted, effective и ambient
 capabilities, не читая private key.
 Ротация выполняется по процедуре раздела Backup/restore в
 [runbook](docs/runbook.md) двумя immutable services/infra releases: первый
