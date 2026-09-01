@@ -32,10 +32,17 @@ jobs:
           command -v shellcheck >/dev/null
           bash -n scripts/deploy-services-production.sh
           shellcheck -x scripts/deploy-services-production.sh
+          bash -n scripts/run-isolated-restore-rehearsal.sh
+          shellcheck -x scripts/run-isolated-restore-rehearsal.sh
           sed -n "/<<'REMOTE_CONTROLLER'$/,/^REMOTE_CONTROLLER$/p" \
             scripts/deploy-services-production.sh | sed '1d;$d' | bash -n
           sed -n "/<<'REMOTE_CONTROLLER'$/,/^REMOTE_CONTROLLER$/p" \
             scripts/deploy-services-production.sh | sed '1d;$d' | \
+            shellcheck -s bash -
+          sed -n "/<<'REMOTE_CONTROLLER'$/,/^REMOTE_CONTROLLER$/p" \
+            scripts/run-isolated-restore-rehearsal.sh | sed '1d;$d' | bash -n
+          sed -n "/<<'REMOTE_CONTROLLER'$/,/^REMOTE_CONTROLLER$/p" \
+            scripts/run-isolated-restore-rehearsal.sh | sed '1d;$d' | \
             shellcheck -s bash -
           sed -n "/<<'FRONTEND_CONTROLLER'$/,/^FRONTEND_CONTROLLER$/p" \
             scripts/deploy-services-production.sh | sed '1d;$d' | bash -n
@@ -67,6 +74,10 @@ jobs:
       - name: Verify exact production Docker cleanup contract
         shell: bash
         run: node scripts/test-production-docker-cleanup-contract.mjs
+
+      - name: Verify isolated restore rehearsal contract
+        shell: bash
+        run: node scripts/test-isolated-restore-rehearsal-contract.mjs
 
       - name: Verify steady-state-only contracts
         shell: bash

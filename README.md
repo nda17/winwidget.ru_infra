@@ -170,6 +170,29 @@ SUPERUSER и полагается на один global CAS lease. Перед mul
 recovery требуется отдельная proxy/session boundary; обычный `CONNECTION LIMIT`
 не считается защитой SUPERUSER.
 
+Отдельный
+[`run-isolated-restore-rehearsal.sh`](scripts/run-isolated-restore-rehearsal.sh)
+проверяет семь свежих подписанных production backup в временном PostgreSQL 18,
+не включая production restore и не подключаясь к Compose. Локальный controller
+принимает только exact services SHA, заранее подготовленный защищённый каталог
+артефактов и aggregate SHA-256. На backend VPS он удерживает production deploy
+lock, разрешает только локальный Docker socket, закрепляет Operations image по
+OCI revision и PostgreSQL по digest, а затем создаёт два контейнера без
+published ports, capabilities, writable root filesystem, production env,
+Docker socket или persistent volumes. PostgreSQL имеет `--network none`, runner
+делит только его network namespace; БД и рабочие файлы находятся в tmpfs.
+Успех фиксируется после Ed25519/revision/TOC/ledger/ACL/fence и всех executor
+проверок, удаления точных временных контейнеров/секретов/копий и подтверждения,
+что исходные Docker container/volume/network inventories не изменились.
+Sanitized evidence содержит только operational IDs, revisions и hashes.
+
+Это executor-level evidence, а не разрешение на in-place restore. Контроллер не
+монтирует `.env.production`, live `restore-staging`/`restore-sealed`, Telegram
+token, private signing key или receipt HMAC и не меняет
+`DATABASE_RESTORE_ENABLED=false`. Dual approval, permit/Outbox/CAS, signed
+receipts, restart/redelivery, retention и alerts проверяются отдельным
+production control-plane сценарием до любого решения о включении restore.
+
 RabbitMQ identity restore-worker может читать и конфигурировать только exact
 restore queue family. Из write-ресурсов ей разрешён исключительно direct
 exchange `winwidget.retry`: временный сбой публикуется с mandatory/confirm в

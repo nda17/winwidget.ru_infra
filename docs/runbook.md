@@ -401,7 +401,11 @@ trailing slash или дополнительным suffix отклоняются
   restore/ACL rehearsal выполняются только в отдельном платёжном scope.
 - Registry содержит семь остальных active service-owned targets, а каждый
   target имеет актуальный успешный плановый backup job.
-- Размер dump контролируется до приближения к лимиту Telegram.
+- Размер dump контролируется до 20 МБ: официальный
+  [Telegram Bot API](https://core.telegram.org/bots/api#getfile) может отправить
+  до 50 МБ, но стандартный `getFile` автоматически возвращает не более 20 МБ.
+  Поэтому application upload limit 49 МиБ не считается recoverability gate;
+  alert и переход на object storage должны сработать до 20 МБ.
 - Source/safety artifacts нельзя удалять, пока открыто recovery-решение; после
   его закрытия действует закреплённый retention и контролируемая очистка.
   Production enqueue не включается без отдельной approved procedure и exact-SHA
@@ -412,6 +416,57 @@ trailing slash или дополнительным suffix отклоняются
 
 Незавершённые ограничения restore и перехода к object storage/PITR находятся в
 [`backlog.md`](https://github.com/nda17/winwidget.ru_services/blob/prod/docs/backlog.md).
+
+### Изолированный прогон свежих production artifacts
+
+Этот шаг выполняется только после зелёных exact services/infra SHA и создания
+семи свежих пар dump/sidecar на том же services SHA. Он не меняет production
+env, не включает restore и не использует production PostgreSQL credentials.
+
+1. В отдельном одобренном recovery window получить семь dump и семь sidecar из
+   принятого off-VPS канала. Production DB artifacts могут содержать
+   персональные данные: выгрузка требует отдельного явного разрешения. На VPS
+   создать ровно
+   `/var/lib/winwidget-operations/rehearsal-sources/<services-sha>/<set-sha>`
+   как `root:root/0700`; 14 файлов должны быть regular, без symlink/hardlink,
+   `root:root/0600`. Не использовать live `restore-staging` и `restore-sealed`.
+2. Aggregate SHA-256 вычисляется по отсортированным file records
+   `name\0size\0sha256\n`. Зафиксировать только итоговый hash; не выводить
+   file IDs, Telegram token, строки БД или содержимое dump/sidecar.
+3. Из чистого exact infra checkout запустить:
+
+   ```bash
+   INFRA_REVISION=<infra-sha> \
+     scripts/run-isolated-restore-rehearsal.sh \
+     <services-sha> \
+     /var/lib/winwidget-operations/rehearsal-sources/<services-sha>/<set-sha> \
+     <set-sha>
+   ```
+
+   SSH-переменные берутся из обычного защищённого local deploy boundary; script
+   не читает и не передаёт `.env.production`.
+4. Controller удерживает canonical production deploy lock и отдельный
+   rehearsal lock. Operations image ID обязан иметь exact revision label, а
+   pinned PostgreSQL 18 image — exact digest, `PGDATA` и volume contract.
+   Отсутствующий pinned image заранее загружается как отдельная проверяемая
+   подготовительная операция; сам rehearsal не делает network pull.
+5. PostgreSQL запускается без сети, ports и persistent volume; runner имеет
+   только `container:<postgres-id>` network namespace. Оба rootfs read-only,
+   database/work — tmpfs, capabilities dropped, `no-new-privileges`; runner не
+   получает Docker socket, Compose, production env или secrets. Master switch
+   обязан оставаться literal `false`.
+6. `SUCCEEDED` требует ровно семь Ed25519 sidecar с exact SHA/revision/manifest
+   и PostgreSQL tool versions, успешные normal restore + `VERIFY_AS_IS` +
+   `ROLL_BACK_SAFETY` + `ROLL_FORWARD_SOURCE`, exact checkpoints и финальные
+   ACL/ledger/writer-fence проверки. Cleanup failure отменяет успех.
+7. Проверить два sanitized evidence файла и их SHA-256 в
+   `/var/lib/winwidget-operations/rehearsal-evidence/<run-id>`. После доказанного
+   cleanup удалить исходный защищённый artifact set отдельной exact-path
+   операцией; при ошибке оставить его закрытым для расследования/повтора.
+8. Результат не покрывает dual approval, permit/Outbox/worker CAS, signed
+   terminal/recovery receipts, restart/redelivery, retention и alerts. Эти
+   пункты остаются release gates, а `DATABASE_RESTORE_ENABLED` — `false` до
+   отдельного принятого решения.
 
 ### Ротация Ed25519 backup provenance
 
