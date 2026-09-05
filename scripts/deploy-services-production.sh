@@ -114,17 +114,22 @@ esac
 
 scoped_shell_file="$controller_root/scripts/deploy-identity-operations-scoped.sh"
 scoped_node_file="$controller_root/scripts/scoped-service-release.mjs"
+command -v gzip >/dev/null || die 'Scoped payload compression is unavailable.'
 for scoped_file in "$scoped_shell_file" "$scoped_node_file"; do
 	[[ -f "$scoped_file" && ! -L "$scoped_file" ]] ||
 		die 'Tracked scoped deployment verifier is missing or unsafe.'
 	git -C "$controller_root" ls-files --error-unmatch \
 		"${scoped_file#"$controller_root/"}" >/dev/null 2>&1 ||
 		die 'Scoped deployment verifier is not tracked by infra Git.'
+	scoped_file_size="$(wc -c <"$scoped_file" | tr -d '[:space:]')"
+	[[ "$scoped_file_size" =~ ^[0-9]+$ ]] || die 'Scoped payload size is invalid.'
+	(( scoped_file_size > 0 && scoped_file_size <= 131072 )) ||
+		die 'Scoped payload exceeds its bounded uncompressed size.'
 done
 scoped_shell_sha256="$(sha256sum "$scoped_shell_file" | awk '{print $1}')"
-scoped_shell_base64="$(base64 <"$scoped_shell_file" | tr -d '\n')"
+scoped_shell_base64="$(gzip -n -6 -c <"$scoped_shell_file" | base64 | tr -d '\n')"
 scoped_node_sha256="$(sha256sum "$scoped_node_file" | awk '{print $1}')"
-scoped_node_base64="$(base64 <"$scoped_node_file" | tr -d '\n')"
+scoped_node_base64="$(gzip -n -6 -c <"$scoped_node_file" | base64 | tr -d '\n')"
 [[ "$scoped_shell_sha256" =~ ^[a-f0-9]{64}$ && "$scoped_node_sha256" =~ ^[a-f0-9]{64}$ &&
 	"$scoped_shell_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ && "$scoped_node_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
 	die 'Cannot encode the immutable scoped deployment payload.'
@@ -514,8 +519,23 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		rmdir "$scoped_payload_directory"
 	}
 	trap cleanup_scoped_payload EXIT
-	printf '%s' "$scoped_shell_base64" | base64 --decode >"$scoped_payload_directory/controller.sh"
-	printf '%s' "$scoped_node_base64" | base64 --decode >"$scoped_payload_directory/verifier.mjs"
+	scoped_decode_payload() {
+		local encoded="$1" destination="$2" size
+		command -v gzip >/dev/null || die 'Scoped payload decompression is unavailable.'
+		[[ "$encoded" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || die 'Invalid compressed scoped payload.'
+		(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 90000 )) ||
+			die 'Invalid bounded compressed scoped payload.'
+		# The sentinel caps output even for a decompression bomb. pipefail also
+		# rejects truncated archives and gzip errors before any code is exposed.
+		printf '%s' "$encoded" | base64 --decode | gzip -dc | head -c 131073 >"$destination" ||
+			die 'Scoped payload decompression failed.'
+		size="$(wc -c <"$destination" | tr -d '[:space:]')"
+		[[ "$size" =~ ^[0-9]+$ ]] || die 'Scoped payload size is invalid.'
+		(( size > 0 && size <= 131072 )) ||
+			die 'Scoped payload exceeds its bounded uncompressed size.'
+	}
+	scoped_decode_payload "$scoped_shell_base64" "$scoped_payload_directory/controller.sh"
+	scoped_decode_payload "$scoped_node_base64" "$scoped_payload_directory/verifier.mjs"
 	chmod 600 "$scoped_payload_directory/controller.sh" "$scoped_payload_directory/verifier.mjs"
 	[[ "$(sha256sum "$scoped_payload_directory/controller.sh" | awk '{print $1}')" == "$scoped_shell_sha256" &&
 		"$(sha256sum "$scoped_payload_directory/verifier.mjs" | awk '{print $1}')" == "$scoped_node_sha256" ]] ||

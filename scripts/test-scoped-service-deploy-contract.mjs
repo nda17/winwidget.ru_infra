@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
+import { gzipSync, gunzipSync } from 'node:zlib'
 import {
 	NOTES_MIGRATION,
 	OTP_MIGRATION,
@@ -31,8 +33,16 @@ const workerScope = 'workers-bootstrap-recovery'
 
 function payloadMaterialization() {
 	const controller = readFileSync(controllerPath, 'utf8')
-	const start = controller.indexOf('\tprintf \'%s\' "$scoped_shell_base64" | base64 --decode')
+	const start = controller.indexOf('\tscoped_decode_payload() {')
 	const end = controller.indexOf('\t# shellcheck disable=SC1091', start)
+	assert.ok(start > 0 && end > start)
+	return controller.slice(start, end)
+}
+
+function payloadCleanup() {
+	const controller = readFileSync(controllerPath, 'utf8')
+	const start = controller.indexOf('\tcleanup_scoped_payload() {')
+	const end = controller.indexOf('\tscoped_decode_payload() {', start)
 	assert.ok(start > 0 && end > start)
 	return controller.slice(start, end)
 }
@@ -42,8 +52,8 @@ function payloadEnvironment(directory) {
 	const verifier = readFileSync(join(scriptsRoot, 'scoped-service-release.mjs'))
 	return {
 		scoped_payload_directory: directory,
-		scoped_shell_base64: shell.toString('base64'), scoped_shell_sha256: sha256(shell),
-		scoped_node_base64: verifier.toString('base64'), scoped_node_sha256: sha256(verifier)
+		scoped_shell_base64: gzipSync(shell, { level: 6 }).toString('base64'), scoped_shell_sha256: sha256(shell),
+		scoped_node_base64: gzipSync(verifier, { level: 6 }).toString('base64'), scoped_node_sha256: sha256(verifier)
 	}
 }
 
@@ -1272,6 +1282,9 @@ function runTransport(scenario = 'success') {
 			if (scenario === 'missing-payload' && relative === 'scripts/scoped-service-release.mjs') continue
 			writeFileSync(join(checkout, relative), readFileSync(join(scriptsRoot, '..', relative)))
 		}
+		if (scenario === 'oversized-payload') writeFileSync(join(checkout, 'scripts/scoped-service-release.mjs'), Buffer.alloc(131073, 35))
+		if (scenario === 'empty-payload') writeFileSync(join(checkout, 'scripts/scoped-service-release.mjs'), '')
+		if (scenario === 'encoded-envelope') for (const filename of ['deploy-identity-operations-scoped.sh', 'scoped-service-release.mjs']) writeFileSync(join(checkout, 'scripts', filename), randomBytes(64000))
 		const shim = `#!${process.execPath}
 const fs = require('node:fs'), crypto = require('node:crypto'), path = require('node:path');
 const name = path.basename(process.argv[1]), args = process.argv.slice(2), scenario = process.env.TEST_SCENARIO;
@@ -1355,15 +1368,19 @@ test('actual transport sends both exact tracked payloads through one pinned SSH 
 	]) {
 		const original = readFileSync(join(scriptsRoot, filename))
 		assert.equal(parameters[hashIndex], sha256(original))
-		assert.deepEqual(Buffer.from(parameters[encodedIndex], 'base64'), original)
+		const compressed = Buffer.from(parameters[encodedIndex], 'base64')
+		assert.equal(compressed[3], 0, 'gzip transport has no original filename metadata')
+		assert.equal(compressed.readUInt32LE(4), 0, 'gzip transport has no source mtime metadata')
+		assert.deepEqual(gunzipSync(compressed), original)
 	}
+	assert.ok(parameters[11].length + parameters[13].length <= 90000, 'the same two compressed payloads fit the unchanged SSH envelope')
 	assert.ok(stdin.includes('scoped_deploy_main'))
 	assert.ok(stdin.includes('Scoped payload checksum mismatch'))
 	assert.ok(!stdin.includes('FRONTEND_CONTROLLER'))
 })
 
 test('actual transport rejects missing/untracked/malformed payload and optional frontend before SSH', () => {
-	for (const scenario of ['missing-payload', 'untracked-payload', 'invalid-payload-hash', 'forbidden-frontend']) {
+	for (const scenario of ['missing-payload', 'untracked-payload', 'invalid-payload-hash', 'forbidden-frontend', 'oversized-payload', 'empty-payload', 'encoded-envelope']) {
 		const result = runTransport(scenario)
 		assert.notEqual(result.status, 0, scenario)
 		assert.deepEqual(result.calls, [], `${scenario} must fail before any SSH invocation`)
@@ -1405,6 +1422,96 @@ ${payloadMaterialization()}
 		assert.deepEqual(readFileSync(join(directory, 'verifier.mjs')), readFileSync(join(scriptsRoot, 'scoped-service-release.mjs')))
 		for (const name of ['controller.sh', 'synthetic.env']) assert.equal(statSync(join(directory, name)).mode & 0o777, 0o600)
 		assert.equal(statSync(directory).mode & 0o777, 0o700)
+	})
+})
+
+test('bounded gzip receiver rejects corrupt, truncated, oversized and mismatched payloads before source', () => {
+	const shell = Buffer.from('printf executed >"$PAYLOAD_EXECUTION_MARKER"\n')
+	const verifier = Buffer.from('export const harmless = true;\n')
+	const compressed = gzipSync(verifier, { level: 6 })
+	const encode = bytes => gzipSync(bytes, { level: 6 }).toString('base64')
+	const cases = [
+		['invalid base64', { scoped_node_base64: '!not-base64!' }],
+		['not gzip', { scoped_node_base64: Buffer.from('not gzip').toString('base64') }],
+		['truncated trailer', { scoped_node_base64: compressed.subarray(0, -4).toString('base64') }],
+		['corrupt CRC', { scoped_node_base64: Buffer.concat([compressed.subarray(0, -8), Buffer.alloc(8)]).toString('base64') }],
+		['wrong original hash', { scoped_node_sha256: 'f'.repeat(64) }],
+		['wrong shell hash', { scoped_shell_sha256: 'f'.repeat(64) }],
+		['empty raw payload', { scoped_node_base64: encode(Buffer.alloc(0)), scoped_node_sha256: sha256(Buffer.alloc(0)) }],
+		['raw sentinel exceeded', { scoped_node_base64: encode(Buffer.alloc(131073, 35)), scoped_node_sha256: sha256(Buffer.alloc(131073, 35)) }],
+		['decompression bomb', { scoped_node_base64: encode(Buffer.alloc(8 * 1024 * 1024, 35)) }],
+		['encoded envelope exceeded', { scoped_node_base64: 'A'.repeat(90004) }]
+	]
+	for (const [name, patch] of cases) privateFixture(directory => {
+		const payloadDirectory = join(directory, 'payload')
+		mkdirSync(payloadDirectory, { mode: 0o700 })
+		const marker = join(directory, 'executed')
+		const outside = join(directory, 'unrelated')
+		writeFileSync(outside, 'preserve')
+		const result = spawnSync('/bin/bash', ['-c', `
+set -euo pipefail
+umask 077
+die() {
+  local candidate
+  for candidate in controller.sh verifier.mjs; do
+    if [[ -f "$scoped_payload_directory/$candidate" ]]; then
+      printf 'RAW_BYTES=%s\n' "$(wc -c <"$scoped_payload_directory/$candidate" | tr -d '[:space:]')"
+    fi
+  done
+  exit 73
+}
+sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$@"; }
+${payloadCleanup()}
+${payloadMaterialization()}
+source "$scoped_payload_directory/controller.sh"
+`], {
+			encoding: 'utf8', timeout: 5000,
+			env: {
+				PATH: '/usr/bin:/bin', TEST_NODE: process.execPath,
+				PAYLOAD_EXECUTION_MARKER: marker, scoped_payload_directory: payloadDirectory,
+				scoped_shell_base64: encode(shell), scoped_shell_sha256: sha256(shell),
+				scoped_node_base64: encode(verifier), scoped_node_sha256: sha256(verifier),
+				...patch
+			}
+		})
+		assert.equal(result.error, undefined, name)
+		assert.equal(result.signal, null, name)
+		assert.equal(result.status, 73, `${name}: ${result.stderr}`)
+		for (const size of result.stdout.matchAll(/RAW_BYTES=(\d+)/g)) assert.ok(Number(size[1]) <= 131073, `${name}: decompression cannot write beyond the sentinel before cleanup`)
+		assert.equal(existsSync(marker), false, `${name}: shell cannot execute before both hashes pass`)
+		assert.equal(existsSync(payloadDirectory), false, `${name}: actual cleanup removes only its partial payload files`)
+		assert.equal(readFileSync(outside, 'utf8'), 'preserve')
+	})
+})
+
+test('gzip receiver accepts the exact 128 KiB raw boundary without changing the source bytes', () => {
+	privateFixture(directory => {
+		const prefix = Buffer.from('printf executed >"$PAYLOAD_EXECUTION_MARKER"\n#')
+		const shell = Buffer.concat([prefix, Buffer.alloc(131072 - prefix.length - 1, 35), Buffer.from('\n')])
+		const verifier = Buffer.from('export const harmless = true;\n')
+		const marker = join(directory, 'executed')
+		const result = spawnSync('/bin/bash', ['-c', `
+set -euo pipefail
+umask 077
+die() { exit 73; }
+sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$@"; }
+${payloadMaterialization()}
+source "$scoped_payload_directory/controller.sh"
+`], {
+			encoding: 'utf8', timeout: 5000,
+			env: {
+				PATH: '/usr/bin:/bin', TEST_NODE: process.execPath,
+				PAYLOAD_EXECUTION_MARKER: marker, scoped_payload_directory: directory,
+				scoped_shell_base64: gzipSync(shell, { level: 6 }).toString('base64'), scoped_shell_sha256: sha256(shell),
+				scoped_node_base64: gzipSync(verifier, { level: 6 }).toString('base64'), scoped_node_sha256: sha256(verifier)
+			}
+		})
+		assert.equal(result.error, undefined)
+		assert.equal(result.status, 0, result.stderr)
+		assert.deepEqual(readFileSync(join(directory, 'controller.sh')), shell)
+		assert.equal(statSync(join(directory, 'controller.sh')).mode & 0o777, 0o600)
+		assert.equal(statSync(join(directory, 'verifier.mjs')).mode & 0o777, 0o444)
+		assert.equal(readFileSync(marker, 'utf8'), 'executed')
 	})
 })
 
