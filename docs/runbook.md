@@ -157,6 +157,10 @@ bootstrap/restore — отдельные административные опе
 immutable `origin/prod`, canonical env hash, root-owned files и общий deploy
 lock. Два дополнительных tracked payload проходят SHA-256 проверку до SSH и
 после передачи; scoped branch выполняется до общего provisioning/migrations.
+После проверки SHA только несекретный `verifier.mjs` получает `0444`, чтобы
+non-root migration image мог прочитать его через точечный read-only bind.
+Родительская папка остаётся `0700`, shell controller, env и snapshots — `0600`;
+процессы проверки БД не переводятся на root.
 
 Общие дополнительные inputs: `expected_live_revision` (40 hex) и
 `expected_service_env_sha256` (64 hex) выбранного owner. Отдельные service env

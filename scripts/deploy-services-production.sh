@@ -520,6 +520,9 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 	[[ "$(sha256sum "$scoped_payload_directory/controller.sh" | awk '{print $1}')" == "$scoped_shell_sha256" &&
 		"$(sha256sum "$scoped_payload_directory/verifier.mjs" | awk '{print $1}')" == "$scoped_node_sha256" ]] ||
 		die 'Scoped payload checksum mismatch.'
+	# Only hash-verified public code crosses the non-root migration boundary.
+	# The private parent, shell controller, env and snapshots retain their modes.
+	chmod 444 "$scoped_payload_directory/verifier.mjs"
 	# shellcheck disable=SC1091
 	source "$scoped_payload_directory/controller.sh"
 	if [[ "$release_scope" == all ]]; then

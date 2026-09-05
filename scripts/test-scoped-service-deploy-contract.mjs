@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,6 +28,24 @@ const oldRevision = 'b'.repeat(40)
 const envHash = 'c'.repeat(64)
 const identityScope = 'identity-with-operations-manifest'
 const workerScope = 'workers-bootstrap-recovery'
+
+function payloadMaterialization() {
+	const controller = readFileSync(controllerPath, 'utf8')
+	const start = controller.indexOf('\tprintf \'%s\' "$scoped_shell_base64" | base64 --decode')
+	const end = controller.indexOf('\t# shellcheck disable=SC1091', start)
+	assert.ok(start > 0 && end > start)
+	return controller.slice(start, end)
+}
+
+function payloadEnvironment(directory) {
+	const shell = readFileSync(scopedControllerPath)
+	const verifier = readFileSync(join(scriptsRoot, 'scoped-service-release.mjs'))
+	return {
+		scoped_payload_directory: directory,
+		scoped_shell_base64: shell.toString('base64'), scoped_shell_sha256: sha256(shell),
+		scoped_node_base64: verifier.toString('base64'), scoped_node_sha256: sha256(verifier)
+	}
+}
 
 function privateFixture(run) {
 	const directory = mkdtempSync(join(tmpdir(), 'winwidget-scoped-contract-'))
@@ -1326,5 +1344,80 @@ ${helper}
 `], { encoding: 'utf8', timeout: 5_000, env: { PATH: '/usr/bin:/bin', LANG: 'C', SCOPED_LIBRARY: scopedControllerPath } })
 		assert.equal(result.error, undefined)
 		assert.notEqual(result.status, 0, `${helper} cannot silently admit an unreadable neighbor inventory`)
+	}
+})
+
+test('actual payload materialization exposes only checksum-verified code and preserves private files', () => {
+	privateFixture(directory => {
+		writeFileSync(join(directory, 'synthetic.env'), 'fixture only', { mode: 0o600 })
+		const run = checksum => spawnSync('/bin/bash', ['-c', `
+set -euo pipefail
+die() { exit 73; }
+sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$@"; }
+${payloadMaterialization()}
+`], { encoding: 'utf8', timeout: 5000, env: { PATH: '/usr/bin:/bin', TEST_NODE: process.execPath, ...payloadEnvironment(directory), ...(checksum ? { scoped_node_sha256: checksum } : {}) } })
+		const invalid = run('f'.repeat(64))
+		assert.equal(invalid.status, 73)
+		assert.equal(statSync(join(directory, 'verifier.mjs')).mode & 0o777, 0o600, 'unverified code stays private')
+		const valid = run()
+		assert.equal(valid.status, 0, valid.stderr)
+		assert.equal(statSync(join(directory, 'verifier.mjs')).mode & 0o777, 0o444)
+		assert.deepEqual(readFileSync(join(directory, 'verifier.mjs')), readFileSync(join(scriptsRoot, 'scoped-service-release.mjs')))
+		for (const name of ['controller.sh', 'synthetic.env']) assert.equal(statSync(join(directory, name)).mode & 0o777, 0o600)
+		assert.equal(statSync(directory).mode & 0o777, 0o700)
+	})
+})
+
+test('real non-root container imports only read-only verifier code; private controls remain inaccessible', { skip: !process.env.SCOPED_TEST_DOCKER_IMAGE }, () => {
+	const image = process.env.SCOPED_TEST_DOCKER_IMAGE
+	assert.match(image, /^(?:node(?::[a-z0-9.-]+)?@)?sha256:[a-f0-9]{64}$/)
+	assert.equal(process.env.DOCKER_HOST, undefined, 'Docker endpoint overrides are forbidden')
+	assert.equal(process.env.DOCKER_CONTEXT, undefined, 'Docker context overrides are forbidden')
+	const context = spawnSync('docker', ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], { encoding: 'utf8', timeout: 10000 })
+	assert.equal(context.status, 0)
+	const endpoint = context.stdout.trim()
+	assert.match(endpoint, /^unix:\/\/(?:\/var\/run\/docker\.sock|\/Users\/[^/]+\/\.colima\/[^/]+\/docker\.sock)$/, 'only the local runner or Colima socket is allowed')
+	const dockerLocal = (args, options) => spawnSync('docker', ['--host', endpoint, ...args], options)
+	const volume = `winwidget-verifier-permissions-${process.pid}-${Date.now()}`
+	const created = dockerLocal(['volume', 'create', volume], { encoding: 'utf8', timeout: 10000 })
+	assert.equal(created.status, 0)
+	const names = []
+	try {
+		const inspected = dockerLocal(['volume', 'inspect', '--format', '{{.Mountpoint}}', volume], { encoding: 'utf8', timeout: 10000 })
+		assert.equal(inspected.status, 0)
+		const directory = inspected.stdout.trim()
+		assert.ok(directory.endsWith(`/volumes/${volume}/_data`) && directory.startsWith('/'), 'exact disposable local volume only')
+		const docker = (args, options = {}) => {
+			const name = `winwidget-verifier-permissions-${process.pid}-${names.length}-${Date.now()}`
+			names.push(name)
+			return dockerLocal(['run', '--rm', '--name', name, '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', ...args], { encoding: 'utf8', timeout: 120000, ...options })
+		}
+		const setup = docker([
+			'--user', '0:0', '--mount', `type=volume,src=${volume},dst=/fixture`,
+			...Object.entries(payloadEnvironment('/fixture')).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+			'--entrypoint', 'bash', image, '-c', [
+				'set -euo pipefail', 'die() { exit 73; }', 'chmod 700 /fixture', payloadMaterialization(),
+				`node -e 'const f=require("fs"); f.copyFileSync("/fixture/verifier.mjs","/fixture/legacy.mjs"); f.chmodSync("/fixture/legacy.mjs",0o600); for(const n of ["synthetic.env","snapshot.json"]) f.writeFileSync("/fixture/"+n,"fixture only",{mode:0o600});'`
+			].join('\n')
+		])
+		assert.equal(setup.status, 0, setup.stderr)
+		const paths = ['verifier.mjs', 'legacy.mjs', 'controller.sh', 'synthetic.env', 'snapshot.json']
+		const proof = docker([
+			'--user', '1001:1001', ...paths.flatMap(path => ['--mount', `type=bind,src=${join(directory, path)},dst=/run/${path},readonly`]),
+			'--entrypoint', 'node', image, '--input-type=module', '-e', `
+import assert from 'node:assert/strict'; import fs from 'node:fs';
+assert.equal(process.getuid(),1001);
+for(const path of ['verifier.mjs','legacy.mjs','controller.sh','synthetic.env','snapshot.json']) assert.equal(fs.statSync('/run/'+path).uid,0,'root-owned payload inside the actual container');
+const verifier=await import('file:///run/verifier.mjs'); assert.equal(typeof verifier.verifyDatabaseState,'function');
+for(const path of ['legacy.mjs','controller.sh','synthetic.env','snapshot.json']) assert.throws(()=>fs.readFileSync('/run/'+path),error=>error.code==='EACCES');
+assert.throws(()=>fs.writeFileSync('/run/verifier.mjs','modified'),error=>['EROFS','EACCES'].includes(error.code));
+console.log('non_root_verifier_permissions=PASS');`
+		])
+		assert.equal(proof.status, 0, proof.stderr)
+		assert.match(proof.stdout, /non_root_verifier_permissions=PASS/)
+	} finally {
+		for (const name of names) dockerLocal(['rm', '--force', name], { stdio: 'ignore', timeout: 10000 })
+		const removed = dockerLocal(['volume', 'rm', volume], { encoding: 'utf8', timeout: 10000 })
+		assert.equal(removed.status, 0, 'the exact disposable volume must be removed')
 	}
 })

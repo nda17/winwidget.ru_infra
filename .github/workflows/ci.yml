@@ -89,6 +89,8 @@ jobs:
 
       - name: Verify scoped Identity and Operations release contract
         shell: bash
+        env:
+          SCOPED_TEST_DOCKER_IMAGE: node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
         run: node scripts/test-scoped-service-deploy-contract.mjs
 
       - name: Verify steady-state-only contracts
