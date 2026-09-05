@@ -537,20 +537,52 @@ test('Operations companion manifest can append only the reviewed Identity OTP mi
 })
 
 function routesFixture() {
-	const before = Array.from({ length: 43 }, (_, index) => ({ id: `route-${index}`, prefix: `/api/v1/route-${index}`, upstream: 'http://127.0.0.1:4000' }))
-	before[7] = { id: 'operations-notes', prefix: '/api/v1/notes', upstream: 'http://127.0.0.1:4800' }
+	const before = Array.from({ length: 43 }, (_, index) => ({
+		id: `route-${index}`,
+		pathPrefix: `/api/v1/route-${index}`,
+		upstreamUrl: 'http://127.0.0.1:4000',
+		authPolicy: 'required',
+		timeoutMs: 10000
+	}))
+	before[7] = { id: 'operations-notes', pathPrefix: '/api/v1/notes', upstreamUrl: 'http://127.0.0.1:5200', authPolicy: 'required', timeoutMs: 10000 }
 	return { before, after: before.filter(route => route.id !== 'operations-notes') }
 }
 
-test('Gateway is permitted to remove only the exact Notes route without changing remaining routes', () => {
+test('Gateway permits exact Notes removal using the actual five-field route contract', () => {
 	const { before, after } = routesFixture()
 	assertOnlyNotesRouteRemoved(before, after)
-	const changed = structuredClone(after)
-	changed[0].upstream = 'http://unapproved.invalid'
-	assert.throws(() => assertOnlyNotesRouteRemoved(before, changed))
+})
+
+test('Gateway rejects a wrong Notes path or legacy prefix instead of pathPrefix', () => {
+	for (const mutate of [
+		route => { route.pathPrefix = '/api/v1/other' },
+		route => { route.prefix = route.pathPrefix; delete route.pathPrefix }
+	]) {
+		const { before, after } = routesFixture()
+		mutate(before.find(route => route.id === 'operations-notes'))
+		assert.throws(() => assertOnlyNotesRouteRemoved(before, after))
+	}
+})
+
+test('Gateway rejects extra route removal and changed ordering', () => {
+	const { before, after } = routesFixture()
 	assert.throws(() => assertOnlyNotesRouteRemoved(before, after.slice(1)))
 	assert.throws(() => assertOnlyNotesRouteRemoved(before, [...after].reverse()))
-	assert.throws(() => assertOnlyNotesRouteRemoved(before.map(route => ({ ...route, prefix: '/other' })), after))
+})
+
+test('Gateway preserves every field of all remaining routes', () => {
+	const { before, after } = routesFixture()
+	for (const [key, value] of Object.entries({
+		id: 'changed-route',
+		pathPrefix: '/api/v1/changed',
+		upstreamUrl: 'http://unapproved.invalid',
+		authPolicy: 'optional',
+		timeoutMs: 20000
+	})) {
+		const changed = structuredClone(after)
+		changed[0][key] = value
+		assert.throws(() => assertOnlyNotesRouteRemoved(before, changed), undefined, key)
+	}
 })
 
 test('Gateway scoped adapter pins the already running image and changes only route JSON', () => {

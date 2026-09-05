@@ -45,7 +45,7 @@ export function assertOnlyNotesRouteRemoved(before, after) {
 	assert.equal(after.length, 42);
 	const removed = before.filter(route => route.id === 'operations-notes');
 	assert.equal(removed.length, 1);
-	assert.equal(removed[0].prefix, '/api/v1/notes');
+	assert.equal(removed[0].pathPrefix, '/api/v1/notes');
 	same(after, before.filter(route => route.id !== 'operations-notes'));
 }
 
