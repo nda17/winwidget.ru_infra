@@ -140,6 +140,23 @@ scoped_database() {
 	[[ -n "$scoped_database_id" && -n "$scoped_migration_manifest_sha256" ]] || die 'Missing scoped database verification output.'
 }
 
+scoped_collect_identity_migrations() {
+	[[ "$release_scope" == identity-with-operations-manifest && "$scoped_image_id" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+		die 'Invalid Identity migration inventory scope.'
+	# Only public verifier code enters the image-owner process. Root-only Compose,
+	# credentials and manifest snapshots remain outside this container.
+	(
+		umask 077
+		set -o noclobber
+		docker run --rm --network none --read-only --cap-drop ALL \
+			--security-opt no-new-privileges --user 1001:1001 \
+			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			--entrypoint timeout "$scoped_image_id" --signal=TERM --kill-after=5s 30s \
+			node /run/scoped-verifier.mjs identity-migration-inventory \
+			>"$scoped_work_directory/identity-migrations.json"
+	) || die 'Cannot read the exact Identity image migration inventory as its owner.'
+}
+
 scoped_wait_healthy() {
 	local deadline=$((SECONDS + 180)) name id status ready
 	while ((SECONDS < deadline)); do
@@ -456,6 +473,7 @@ scoped_deploy_main() {
 		docker run --rm --network none --entrypoint node "$scoped_operations_image_id" -e \
 			'process.stdout.write(require("node:fs").readFileSync("/app/restore-manifests/database-restore-migrations.json", "utf8"))' \
 			>"$scoped_work_directory/operations-manifest-after.json"
+		scoped_collect_identity_migrations
 		scoped_verifier identity-manifest || die 'Operations companion must change only the exact additive Identity migration manifest.'
 	fi
 	scoped_application_tree="$(git -C "$release_root" rev-parse "HEAD:apps/$scoped_owner")"

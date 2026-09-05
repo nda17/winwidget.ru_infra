@@ -16,6 +16,7 @@ import {
 	assertMigrationLedger,
 	assertOnlyNotesRouteRemoved,
 	migrationFiles,
+	parseIdentityMigrationInventory,
 	prepareScopedCompose,
 	sha256,
 	validateRestoreEvidence,
@@ -546,6 +547,24 @@ test('Operations companion manifest can append only the reviewed Identity OTP mi
 	]))
 })
 
+test('Identity owner inventory accepts only a bounded exact ordered migration envelope', () => {
+	const { files } = migrationFixture()
+	const inventory = { schemaVersion: 1, target: 'identity', migrations: files }
+	assert.deepEqual(parseIdentityMigrationInventory(Buffer.from(JSON.stringify(inventory))), files)
+	for (const mutate of [
+		value => { value.schemaVersion = 2 }, value => { value.target = 'operations' },
+		value => { value.unexpected = true }, value => { value.migrations = [] },
+		value => { value.migrations.reverse() }, value => { value.migrations.push(value.migrations[1]) },
+		value => { value.migrations[0].name = '../foreign' }, value => { value.migrations[0].checksum = 'invalid' },
+		value => { value.migrations[0].unexpected = true }
+	]) {
+		const changed = structuredClone(inventory)
+		mutate(changed)
+		assert.throws(() => parseIdentityMigrationInventory(Buffer.from(JSON.stringify(changed))), undefined, mutate.toString())
+	}
+	for (const bytes of [Buffer.alloc(0), Buffer.from('{'), Buffer.from('null'), Buffer.from('[]'), Buffer.from([0xc3, 0x28]), Buffer.alloc(1024 * 1024 + 1)]) assert.throws(() => parseIdentityMigrationInventory(bytes))
+})
+
 function routesFixture() {
 	const before = Array.from({ length: 43 }, (_, index) => ({
 		id: `route-${index}`,
@@ -864,7 +883,16 @@ docker() {
         *'readFileSync'*)
           if [[ "$TEST_SCENARIO" == mixed-manifest-drift && " $* " == *" $TEST_OLD_API_IMAGE "* ]]; then printf '{"drift":true}\n'; return 0; fi
           if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$TEST_SCENARIO" == manifest-failed && " $* " == *" $TEST_OPERATIONS_IMAGE "* ]]; then printf '{"changed":true}\n'; else printf '{}\n'; fi ;;
-        identity-manifest) [[ "$TEST_SCENARIO" != manifest-failed ]] ;;
+        identity-migration-inventory)
+          [[ "$TEST_SCENARIO" != inventory-read-failed ]] || return 1
+          [[ "$TEST_SCENARIO" != inventory-timeout ]] || return 124
+          [[ " $* " == *' --user 1001:1001 '* && " $* " == *" $TEST_NEW_IMAGE "* ]] || return 1
+          [[ " $* " == *' --entrypoint timeout '* && " $* " == *' --signal=TERM --kill-after=5s 30s node '* ]] || return 1
+          [[ " $* " != *'/run/scoped '* && " $* " != *' --env-file '* ]] || return 1
+          "$TEST_NODE" -e 'const v=JSON.parse(process.env.TEST_IDENTITY_INVENTORY); const c=process.env.TEST_SCENARIO; if(c==="inventory-truncated"){process.stdout.write("{");process.exit(0)} if(c==="inventory-empty")process.exit(0); if(c==="inventory-wrong-checksum")v.migrations[0].checksum="f".repeat(64); if(c==="inventory-wrong-target")v.target="operations"; if(c==="inventory-extra-key")v.unexpected=true; if(c==="inventory-duplicate")v.migrations.push(v.migrations[1]); process.stdout.write(JSON.stringify(v));' ;;
+        identity-manifest)
+          [[ "$TEST_SCENARIO" != manifest-failed ]] || return 1
+          "$TEST_NODE" --input-type=module -e 'import fs from "node:fs"; const {parseIdentityMigrationInventory,assertIdentityManifestCompanion,sha256}=await import(process.env.TEST_VERIFIER_URL); const files=JSON.parse(process.env.TEST_IDENTITY_INVENTORY).migrations; const entry=migrations=>({migrations,manifestSha256:sha256(JSON.stringify({schemaVersion:1,target:"identity",migrations}))}); assertIdentityManifestCompanion({schemaVersion:1,targets:{identity:entry(files.slice(0,-1))}},{schemaVersion:1,targets:{identity:entry(files)}},parseIdentityMigrationInventory(fs.readFileSync(process.argv[1])));' "$scoped_work_directory/identity-migrations.json" ;;
         broker-quiet)
           local sample=0
           [[ ! -f "$SCOPED_FIXTURE/broker-sample" ]] || sample="$(<"$SCOPED_FIXTURE/broker-sample")"
@@ -918,6 +946,8 @@ function runRuntime(scope, scenario = 'success') {
 				PATH: '/usr/bin:/bin', LANG: 'C',
 				SCOPED_LIBRARY: scopedControllerPath, SCOPED_FIXTURE: directory, SCOPED_CALLS: calls, SCOPED_PHASE: phase,
 				TEST_SCOPE: scope, TEST_SCENARIO: scenario, TEST_NODE: process.execPath,
+				TEST_VERIFIER_URL: new URL('./scoped-service-release.mjs', import.meta.url).href,
+				TEST_IDENTITY_INVENTORY: JSON.stringify({ schemaVersion: 1, target: 'identity', migrations: migrationFixture().files }),
 				TEST_REVISION: revision, TEST_PREVIOUS_REVISION: oldRevision,
 				TEST_API_PREVIOUS_REVISION: 'c'.repeat(40), TEST_OLD_API_IMAGE: `sha256:${'2'.repeat(64)}`,
 				TEST_ENV_HASH: sha256(env), TEST_EVIDENCE_HASH: sha256('{}\n'),
@@ -1201,6 +1231,7 @@ test('coordinated Identity deployment builds and verifies both images before fen
 	const stop = result.calls.indexOf('DOCKER <kill>')
 	assert.ok(result.calls.lastIndexOf('DOCKER <build>') < stop)
 	assert.ok(result.calls.indexOf('<identity-manifest>') < stop)
+	assert.ok(result.calls.indexOf('<identity-migration-inventory>') < result.calls.indexOf('<identity-manifest>'))
 	assert.ok(result.calls.indexOf('<prepare>') < stop)
 	assert.ok(result.calls.indexOf('<pre-migration>') < stop)
 	assert.ok(result.calls.indexOf('<operations-drain>') > stop)
@@ -1221,6 +1252,49 @@ test('companion drift or failed manifest validation cannot stop a live process o
 		assert.ok(!result.calls.includes('<up>'), result.calls)
 		assert.ok(!result.calls.includes('MIGRATE '), result.calls)
 	}
+})
+
+test('unreadable or invalid Identity image inventory fails before stopping any process or running DDL', () => {
+	for (const scenario of ['inventory-read-failed', 'inventory-timeout', 'inventory-empty', 'inventory-truncated', 'inventory-wrong-target', 'inventory-extra-key', 'inventory-duplicate', 'inventory-wrong-checksum']) {
+		const result = runRuntime(identityScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(result.calls.includes('<identity-migration-inventory>'), scenario)
+		for (const forbidden of ['DOCKER <kill>', 'DOCKER <stop>', '<up>', 'MIGRATE ']) assert.ok(!result.calls.includes(forbidden), scenario + ': ' + forbidden)
+	}
+})
+
+test('owner collector creates a private inventory regardless of ambient umask and refuses existing files or symlinks', () => {
+	for (const state of ['absent', 'file', 'symlink']) privateFixture(directory => {
+		const path = join(directory, 'identity-migrations.json')
+		const calls = join(directory, 'calls')
+		const retained = join(directory, 'retained.json')
+		if (state === 'file') writeFileSync(path, 'must stay unchanged')
+		if (state === 'symlink') {
+			writeFileSync(retained, 'must stay unchanged')
+			symlinkSync(retained, path)
+		}
+		const result = spawnSync('/bin/bash', ['-c', `
+set -euo pipefail
+umask 022
+source "$SCOPED_LIBRARY"
+release_scope=identity-with-operations-manifest
+scoped_image_id="sha256:$TEST_IMAGE"
+scoped_work_directory="$TEST_DIRECTORY"
+scoped_payload_directory="$TEST_DIRECTORY"
+die() { exit 73; }
+docker() { printf called >"$TEST_CALLS"; printf '{"synthetic":true}'; }
+scoped_collect_identity_migrations
+`], { encoding: 'utf8', timeout: 10000, env: { PATH: '/usr/bin:/bin', SCOPED_LIBRARY: scopedControllerPath, TEST_IMAGE: 'a'.repeat(64), TEST_DIRECTORY: directory, TEST_CALLS: calls } })
+		if (state === 'absent') {
+			assert.equal(result.status, 0, result.stderr)
+			assert.equal(statSync(path).mode & 0o7777, 0o600)
+			assert.equal(readFileSync(path, 'utf8'), '{"synthetic":true}')
+		} else {
+			assert.equal(result.status, 73, result.stderr)
+			assert.equal(existsSync(calls), false, 'existing output must fail before even starting the collector')
+			assert.equal(readFileSync(path, 'utf8'), 'must stay unchanged')
+		}
+	})
 })
 
 test('failed pre-DDL Operations drain resumes only the unchanged four Operations IDs', () => {
@@ -1566,5 +1640,128 @@ console.log('non_root_verifier_permissions=PASS');`
 		for (const name of names) dockerLocal(['rm', '--force', name], { stdio: 'ignore', timeout: 10000 })
 		const removed = dockerLocal(['volume', 'rm', volume], { encoding: 'utf8', timeout: 10000 })
 		assert.equal(removed.status, 0, 'the exact disposable volume must be removed')
+	}
+})
+
+test('real image-owner inventory crosses into root-only validation without weakening 0700/0600 permissions', { skip: !process.env.SCOPED_TEST_DOCKER_IMAGE }, () => {
+	const image = process.env.SCOPED_TEST_DOCKER_IMAGE
+	assert.match(image, /^(?:node(?::[a-z0-9.-]+)?@)?sha256:[a-f0-9]{64}$/)
+	assert.equal(process.env.DOCKER_HOST, undefined)
+	assert.equal(process.env.DOCKER_CONTEXT, undefined)
+	const context = spawnSync('docker', ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], { encoding: 'utf8', timeout: 10000 })
+	assert.equal(context.status, 0)
+	const endpoint = context.stdout.trim()
+	assert.match(endpoint, /^unix:\/\/(?:\/var\/run\/docker\.sock|\/Users\/[^/]+\/\.colima\/[^/]+\/docker\.sock)$/)
+	const local = (args, options) => spawnSync('docker', ['--host', endpoint, ...args], options)
+	const volume = `winwidget-identity-inventory-${process.pid}-${Date.now()}`
+	assert.equal(local(['volume', 'create', volume], { encoding: 'utf8', timeout: 10000 }).status, 0)
+	const names = []
+	const { files } = migrationFixture()
+	const entry = migrations => ({ migrations, manifestSha256: sha256(JSON.stringify({ schemaVersion: 1, target: 'identity', migrations })) })
+	const manifests = {
+		before: { schemaVersion: 1, targets: { identity: entry(files.slice(0, -1)), widgets: { unchanged: true } } },
+		after: { schemaVersion: 1, targets: { identity: entry(files), widgets: { unchanged: true } } }
+	}
+	try {
+		const inspected = local(['volume', 'inspect', '--format', '{{.Mountpoint}}', volume], { encoding: 'utf8', timeout: 10000 })
+		assert.equal(inspected.status, 0)
+		const directory = inspected.stdout.trim()
+		assert.ok(directory.startsWith('/') && directory.endsWith(`/volumes/${volume}/_data`))
+		const docker = (args, options = {}) => {
+			const name = `winwidget-identity-inventory-${process.pid}-${names.length}-${Date.now()}`
+			names.push(name)
+			return local(['run', '--rm', '--name', name, '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', ...args], { encoding: 'utf8', timeout: 45000, ...options })
+		}
+		const publicMount = ['--mount', `type=bind,src=${join(directory, 'verifier.mjs')},dst=/run/scoped-verifier.mjs,readonly`]
+		const appMount = readonly => ['--mount', `type=bind,src=${join(directory, 'app')},dst=/app${readonly ? ',readonly' : ''}`]
+		const privateMount = ['--mount', `type=bind,src=${join(directory, 'snapshots')},dst=/run/scoped,readonly`]
+		const setup = docker([
+			'--user', '0:0', '--mount', `type=volume,src=${volume},dst=/fixture`,
+			'--env', `VERIFIER_BASE64=${readFileSync(join(scriptsRoot, 'scoped-service-release.mjs')).toString('base64')}`,
+			'--env', `MANIFESTS=${JSON.stringify(manifests)}`, '--entrypoint', 'node', image, '-e', `
+const fs=require('node:fs'); fs.chmodSync('/fixture',0o700);
+fs.writeFileSync('/fixture/verifier.mjs',Buffer.from(process.env.VERIFIER_BASE64,'base64'),{mode:0o444,flag:'wx'});
+fs.mkdirSync('/fixture/app'); fs.chmodSync('/fixture/app',0o777);
+fs.mkdirSync('/fixture/snapshots',{mode:0o700});
+for(const [name,value] of Object.entries(JSON.parse(process.env.MANIFESTS))) fs.writeFileSync('/fixture/snapshots/operations-manifest-'+name+'.json',JSON.stringify(value),{mode:0o600,flag:'wx'});`
+		])
+		assert.equal(setup.status, 0, setup.stderr)
+		const ownerSetup = docker([
+			'--user', '1001:1001', ...appMount(false), '--env', `MIGRATIONS=${JSON.stringify(files)}`,
+			'--entrypoint', 'node', image, '-e', `
+const fs=require('node:fs'); fs.mkdirSync('/app/prisma',{mode:0o700}); fs.mkdirSync('/app/prisma/migrations',{mode:0o700});
+for(const [index,file] of JSON.parse(process.env.MIGRATIONS).entries()) { const path='/app/prisma/migrations/'+file.name; fs.mkdirSync(path,{mode:0o700}); fs.writeFileSync(path+'/migration.sql',index===0?'initial migration':'pending migration',{mode:0o600,flag:'wx'}); }`
+		])
+		assert.equal(ownerSetup.status, 0, ownerSetup.stderr)
+		const rootCannotRead = docker([
+			'--user', '0:0', ...publicMount, ...appMount(true), '--entrypoint', 'node', image, '--input-type=module', '-e', `
+import assert from 'node:assert/strict'; import fs from 'node:fs';
+const {migrationFiles}=await import('file:///run/scoped-verifier.mjs');
+assert.equal(process.getuid(),0); const stat=fs.statSync('/app/prisma'); assert.equal(stat.uid,1001); assert.equal(stat.gid,1001); assert.equal(stat.mode&0o7777,0o700);
+assert.throws(()=>migrationFiles('/app/prisma/migrations'),error=>error.code==='EACCES'); process.stdout.write('root_capdrop_denied=PASS');`
+		])
+		assert.equal(rootCannotRead.status, 0, rootCannotRead.stderr)
+		assert.equal(rootCannotRead.stdout, 'root_capdrop_denied=PASS')
+		const collect = () => docker([
+			'--user', '1001:1001', ...publicMount, ...appMount(true), '--entrypoint', 'timeout', image,
+			'--signal=TERM', '--kill-after=5s', '30s', 'node', '/run/scoped-verifier.mjs', 'identity-migration-inventory'
+		])
+		const inventory = collect()
+		assert.equal(inventory.status, 0, inventory.stderr)
+		assert.deepEqual(parseIdentityMigrationInventory(Buffer.from(inventory.stdout)), files)
+		const writeInventory = (bytes, mutation = '') => {
+			const result = docker([
+				'--interactive', '--user', mutation === 'gid' ? '0:1001' : '0:0', '--mount', `type=volume,src=${volume},dst=/fixture`,
+				'--env', `MUTATION=${mutation}`, '--entrypoint', 'node', image, '-e', `
+const fs=require('node:fs'); const path='/fixture/snapshots/identity-migrations.json';
+try { fs.unlinkSync(path); } catch(error) { if(error.code!=='ENOENT') throw error; }
+fs.writeFileSync(path,fs.readFileSync(0),{mode:0o600,flag:'wx'});
+switch(process.env.MUTATION) {
+ case 'mode': fs.chmodSync(path,0o644); break;
+ case 'symlink': fs.renameSync(path,path+'.target'); fs.symlinkSync(path+'.target',path); break;
+ case 'hardlink': fs.linkSync(path,path+'.alias'); break;
+}
+`
+			], { input: bytes })
+			assert.equal(result.status, 0, result.stderr)
+		}
+		const validate = () => docker(['--user', '0:0', ...publicMount, ...privateMount, ...appMount(true), '--entrypoint', 'node', image, '/run/scoped-verifier.mjs', 'identity-manifest'])
+		writeInventory(inventory.stdout)
+		assert.equal(validate().status, 0, 'the strict root validator must succeed without accessing the owner-only image tree')
+		const ownerProof = docker([
+			'--user', '1001:1001', ...privateMount, ...appMount(true), '--entrypoint', 'node', image, '--input-type=module', '-e', `
+import assert from 'node:assert/strict'; import fs from 'node:fs';
+assert.throws(()=>fs.readFileSync('/run/scoped/identity-migrations.json'),error=>error.code==='EACCES');
+for(const name of fs.readdirSync('/app/prisma/migrations')) { const directory='/app/prisma/migrations/'+name; for(const [path,mode] of [[directory,0o700],[directory+'/migration.sql',0o600]]) {const stat=fs.statSync(path);assert.equal(stat.uid,1001);assert.equal(stat.gid,1001);assert.equal(stat.mode&0o7777,mode);}}
+process.stdout.write('owner_tree_private_snapshots=PASS');`
+		])
+		assert.equal(ownerProof.status, 0, ownerProof.stderr)
+		assert.equal(ownerProof.stdout, 'owner_tree_private_snapshots=PASS')
+		for (const mutation of ['mode', 'gid', 'symlink', 'hardlink']) {
+			writeInventory(inventory.stdout, mutation)
+			assert.equal(validate().status, 1, mutation + ' must be rejected before any service action')
+		}
+		for (const bytes of ['', '{', JSON.stringify({ schemaVersion: 1, target: 'identity', migrations: [{ ...files[0], checksum: 'f'.repeat(64) }, files[1]] })]) {
+			writeInventory(bytes)
+			assert.equal(validate().status, 1, 'invalid inventory must fail the real root gate')
+		}
+		const mutateTree = docker([
+			'--user', '1001:1001', ...appMount(false), '--entrypoint', 'node', image, '-e',
+			`require('node:fs').writeFileSync('/app/prisma/migrations/${files[0].name}/migration.sql','unapproved change')`
+		])
+		assert.equal(mutateTree.status, 0, mutateTree.stderr)
+		const changedInventory = collect()
+		assert.equal(changedInventory.status, 0, changedInventory.stderr)
+		writeInventory(changedInventory.stdout)
+		assert.equal(validate().status, 1, 'changed image SQL must fail the unchanged additive manifest contract')
+		const symlinkTree = docker([
+			'--user', '1001:1001', ...appMount(false), '--entrypoint', 'node', image, '-e',
+			`const f=require('node:fs'),p='/app/prisma/migrations/${files[0].name}/migration.sql'; f.renameSync(p,p+'.target'); f.symlinkSync(p+'.target',p)`
+		])
+		assert.equal(symlinkTree.status, 0, symlinkTree.stderr)
+		assert.equal(collect().status, 1, 'the real image-owner collector must reject a symlinked migration')
+	} finally {
+		for (const name of names) local(['rm', '--force', name], { stdio: 'ignore', timeout: 10000 })
+		assert.equal(local(['volume', 'rm', volume], { encoding: 'utf8', timeout: 10000 }).status, 0, 'remove only the exact disposable volume')
 	}
 })

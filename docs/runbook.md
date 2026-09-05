@@ -162,6 +162,14 @@ non-root migration image мог прочитать его через точеч�
 Родительская папка остаётся `0700`, shell controller, env и snapshots — `0600`;
 процессы проверки БД не переводятся на root.
 
+В Identity companion preflight список и SHA-256 миграций читает владелец
+immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
+`cap-drop ALL`, только публичный verifier bind и timeout 30 секунд. Процесс не
+получает production env или snapshots. Root сохраняет результат в новый файл
+`0:0/0600`; root verifier проверяет его размер, тип, владельца, единственную
+ссылку и точный контракт, затем прежнюю additive manifest chain до остановки
+сервисов. Права каталогов/SQL внутри image не расширяются.
+
 Общие дополнительные inputs: `expected_live_revision` (40 hex) и
 `expected_service_env_sha256` (64 hex) выбранного owner. Отдельные service env
 должны быть заранее согласованы и двусторонне синхронизированы: scoped release
