@@ -510,6 +510,10 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		cleanup_scoped_payload
 		trap - EXIT
 	else
+		# Preserve safe recovery diagnostics outside redirected Compose calls.
+		# Dynamic allocation must not collide with the inherited deploy-lock FD.
+		exec {scoped_diagnostic_fd}>&2
+		export scoped_diagnostic_fd
 		scoped_deploy_main
 		exit 0
 	fi

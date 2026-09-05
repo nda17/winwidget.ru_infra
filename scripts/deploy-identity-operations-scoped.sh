@@ -166,6 +166,9 @@ scoped_verify_target_images() {
 
 scoped_cleanup() {
 	local exit_code="$?" name id fence_confirmed=true
+	# Bash 5 can enter EXIT while a signalled function still redirects fd 2.
+	# Restore only diagnostics; raw Docker/Compose output remains suppressed.
+	exec 2>&"$scoped_diagnostic_fd"
 	trap - EXIT
 	trap '' INT TERM HUP
 	set +e
@@ -229,6 +232,8 @@ scoped_assert_backlog_already_finalized() {
 
 scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination
+	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
+		die 'Scoped recovery diagnostic descriptor is invalid.'
 	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-finalize|gateway-remove-notes)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'

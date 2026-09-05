@@ -516,6 +516,8 @@ compose_file="$release_root/compose.yml"
 env_file="$app_root/deploy/backend/.env.production"
 deploy_lock="$app_root/deploy/backend/lock"
 deploy_lock_fd=9
+scoped_diagnostic_fd=8
+exec 8>&2
 scoped_payload_directory="$app_root/payload"
 services_revision="$TEST_REVISION"
 infra_revision="$TEST_REVISION"
@@ -582,7 +584,7 @@ docker() {
       [[ ! -f "$SCOPED_FIXTURE/stopped-$cid" ]] || return 0
       printf '%s\n' "$cid" ;;
     inspect)
-      if [[ "${'${'}2:-}" != --format ]]; then printf '[]\n'; return; fi
+      if [[ "${'${'}2:-}" != --format ]]; then printf '[]\n'; return 0; fi
       format="$3"
       case "$format" in
         '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}') printf '%s %s\n' "$image" "$rev" ;;
@@ -613,7 +615,7 @@ docker() {
         case "$arg" in up|run|config) action="$arg" ;; esac
         previous="$arg"; last="$arg"
       done
-      if [[ "$action" == config ]]; then printf '{}\n'; return; fi
+      if [[ "$action" == config ]]; then printf '{}\n'; return 0; fi
       if [[ "$action" == up ]]; then
         case "$snapshot" in */desired.json) printf desired >"$SCOPED_PHASE" ;; */rollback.json) printf rollback >"$SCOPED_PHASE" ;; *) return 83 ;; esac
         for number in 1 2 3 4; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
@@ -624,7 +626,7 @@ docker() {
         elif [[ "$TEST_SCENARIO" == repeated-term ]]; then
           kill -TERM "$$"
         fi
-        return
+        return 0
       fi
       if [[ "$action" == run && " $* " == *' database '* ]]; then
         if [[ "$TEST_SCENARIO" == ledger-failed && " $* " == *' pre-migration '* ]]; then return 1; fi
@@ -632,13 +634,13 @@ docker() {
         if [[ "$TEST_SCENARIO" == post-migration-failed && " $* " == *' post-migration '* ]]; then return 1; fi
         if [[ "$TEST_SCENARIO" == drain-failed && " $* " == *' operations-drain '* ]]; then return 1; fi
         printf 'DATABASE_ID=11111111-1111-1111-1111-111111111111\nMIGRATION_MANIFEST_SHA256=%s\n' "$TEST_ENV_HASH"
-        return
+        return 0
       fi
       if [[ "$action" == run ]]; then
         printf 'MIGRATE %s\n' "$last" >>"$SCOPED_CALLS"
         [[ "$TEST_SCENARIO" != migration-unknown ]] || return 1
         if [[ "$TEST_SCENARIO" == migration-term ]]; then kill -TERM "$$"; fi
-        return
+        return 0
       fi
       return 84 ;;
     run)
