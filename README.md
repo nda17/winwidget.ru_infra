@@ -3,7 +3,7 @@
 Репозиторий `winwidget.ru_infra` содержит контроллер production-деплоя и
 эксплуатационные инструкции. Исходный код приложений, Dockerfile, схемы Prisma и
 production-манифест Compose остаются в `winwidget.ru_services`, а фронтенд — в
-`winwidget.ru_client`. Канонические Nginx-конфигурации backend и frontend
+`winwidget.ru_frontends`. Канонические Nginx-конфигурации backend и frontend
 хранятся соответственно в `nginx/backend-api.conf` и `nginx/frontend.conf`.
 
 Production-секреты и файлы `.env.production` никогда не хранятся в этом
@@ -67,7 +67,7 @@ key.
 
 Backend release-job не передаёт frontend SSH credentials. Поэтому reusable
 workflow явно пропускает установку frontend Nginx, а frontend image и его Nginx
-выпускаются собственным workflow репозитория `winwidget.ru_client` после push в
+выпускаются собственным workflow репозитория `winwidget.ru_frontends` после push в
 `prod`.
 
 При изменении production env сначала соблюдайте правило двусторонней
@@ -210,8 +210,62 @@ DLX возвращает сообщение в основную очередь. 
 его атомарно, выполняет `nginx -t`, перезагружает Nginx и восстанавливает
 предыдущий файл, если проверка или перезагрузка завершается ошибкой.
 
-`nginx/frontend.conf` — единственный tracked source Nginx для `winwidget.ru` и
-`www.winwidget.ru` на отдельном frontend VPS. Когда настроена полная группа
+`nginx/frontend.conf` — единственный tracked source Nginx для `winwidget.ru`,
+`www.winwidget.ru` и `crm.winwidget.ru` на одном существующем frontend VPS.
+Целевая маршрутизация четырёх самостоятельных frontend-контейнеров:
+
+| Приложение | Loopback upstream | Публичные маршруты |
+| --- | --- | --- |
+| Landing | `127.0.0.1:3000` | `/` и fallback, legal/metadata/public assets |
+| Widgets | `127.0.0.1:3002` | кабинет, подписка, auth/OAuth/logout, заявки и `/page-*` |
+| Admin | `127.0.0.1:3003` | ровно `/admin` и `/admin/**` |
+| CRM | `127.0.0.1:3001` | весь отдельный host `crm.winwidget.ru` |
+
+Widgets сохраняет `/cabinet`, `/payment`, `/login`, `/register`,
+`/restore-password`, `/social-auth`, `/logout`, `/wheels`, `/quizzes`,
+`/callbacks`, `/timers`, `/stop-offers`, `/calculators` и их дочерние пути;
+preview — `/page-wheel`, `/page-quiz`, `/page-callback`, `/page-timer`,
+`/page-stop-offer`, `/page-ai-consultant`, `/page-calculator`. Границы пути
+обязательны: `/administrator` или `/payment-unrelated` не становятся admin
+или Widgets. Статические `/_next/static/` обслуживает Nginx из сохраняемого
+store, описанного ниже. Остальные пути префиксов
+`/_frontends/{landing,widgets,admin-panel}/_next/` обслуживает только
+соответствующий Next runtime, включая image optimizer; Nginx сохраняет
+URI/query, app-local rewrite выполняет Next. Неизвестные
+`/_frontends/` возвращают 404. Встраиваемые JS-виджеты на API-host остаются
+владением backend Widgets и сюда не переносятся.
+
+Immutable static store находится в
+`/opt/winwidget/deploy/frontend/assets/{legacy,landing,widgets,admin-panel,crm}/_next/static/`.
+На основном host старый `/_next/static/` читает только `legacy`, а три
+`/_frontends/{landing,widgets,admin-panel}/_next/static/` — собственные
+namespaces. На CRM-host `/_next/static/` читает только `crm`. Пять точных
+`^~` locations используют `alias` с завершающим `/`, запрещают symlinks и
+listing, задают `expires 1y`. Отсутствующий файл даёт Nginx 404 без proxy
+fallback. В locations нет `add_header`: TLS/security headers наследуются
+с уровня server.
+
+Перед переключением image deploy helper добавляет проверенные static файлы
+в union своего namespace. Совпавший путь допустим только при одинаковом
+содержимом; все коллизии проверяются до первой записи. Не перезаписывать
+старые файлы другой ревизией и не удалять старые chunks автоматически ни
+при deploy, ни при rollback: они нужны открытым вкладкам. Первое переключение
+требует предварительно сохранить legacy chunks из текущего image. Отдельная
+retention-политика требует согласования; заполнение диска не разрешает
+молчаливую очистку старых assets.
+
+Это tracked target, не утверждение о выполненном production cutover.
+До установки обязательны готовность четырёх loopback upstream, проверка
+DNS и выпуск/проверка отдельного сертификата `crm.winwidget.ru` по пути
+`/etc/letsencrypt/live/crm.winwidget.ru/`; его наличие не предполагается.
+Существующий iframe CSP preview остаётся у Next, main-host сохраняет
+`SAMEORIGIN`, CRM — `DENY`. CRM frontend не разрешает rollout CRM backend
+или включение коммерческого функционала без его отдельных gates.
+
+Текущий backend release-job передаёт только backend credentials и не меняет
+frontend Nginx; эту границу сохранять при переходе на frontend-монорепозиторий.
+Само существование secrets в репозитории не передаёт их reusable workflow:
+нужна явная передача полной группы. Когда настроена полная группа
 `FRONTEND_*`, после успешного backend-деплоя контроллер через отдельные pinned
 SSH credentials сравнивает его SHA-256 с
 `/etc/nginx/sites-available/winwidget.ru`, атомарно устанавливает изменение под
@@ -219,6 +273,10 @@ SSH credentials сравнивает его SHA-256 с
 при ошибке и публичную HTTPS-проверку. При отсутствии всей группы frontend Nginx
 не изменяется и не является обязательным gate backend-релиза. Локальная копия
 `deploy/frontend/nginx.conf` больше не является source of truth.
+
+Статический routing contract без сети и Docker:
+`node scripts/test-frontend-nginx-contract.mjs`. Настоящий `nginx -t` с
+production-сертификатами и smoke каждого приложения остаются release gate.
 
 Каталог `nginx/telegram-bridge/` содержит конфигурацию зарубежного VPS для
 входящих Telegram webhook, исходящего трафика Bot API и намеренно публичного

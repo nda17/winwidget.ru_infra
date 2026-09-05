@@ -13,13 +13,14 @@
   конфигурации.
 
 Backend-код расположен в `winwidget.ru_services`, frontend — в
-`winwidget.ru_client`.
+`winwidget.ru_frontends` (переименованный репозиторий `winwidget.ru_client`).
 
 ## Топология
 
 ```text
 Frontend VPS
-  -> Next.js + Nginx
+  -> Nginx
+  -> Landing, Widgets, Admin и WinCRM в четырёх frontend-контейнерах
 
 Backend VPS
   -> system Nginx
@@ -43,7 +44,7 @@ Telegram bridge VPS
 
 Репозитории разделены по ответственности:
 
-- `winwidget.ru_client` — Next.js frontend;
+- `winwidget.ru_frontends` — монорепозиторий четырёх Next.js приложений;
 - `winwidget.ru_services` — API Gateway, независимые backend services и
   production Compose manifest;
 - `winwidget.ru_infra` — Nginx, workflows и deploy scripts.
@@ -150,14 +151,64 @@ bootstrap/restore — отдельные административные опе
 
 ### Frontend
 
-Frontend выпускается из exact green SHA `winwidget.ru_client` через его
-workflow. После релиза проверить:
+Frontend выпускается из exact green SHA собственного репозитория через его
+workflow; при переходе `winwidget.ru_client` → `winwidget.ru_frontends`
+четыре приложения получают независимые image/deploy/rollback. Tracked
+`nginx/frontend.conf` описывает Landing `:3000`, CRM `:3001`, Widgets `:3002`,
+Admin `:3003` только на loopback одного текущего frontend VPS.
+
+Перед первым переключением маршрутов:
+
+1. Проверить текущую конфигурацию/слушающие порты и неизменённый backend
+   caller: он не передаёт группу `FRONTEND_*`. Не включать существующий
+   optional frontend-шаг backend-deploy для выпуска монорепозитория;
+   обновление frontend не требует запуска backend rollout.
+2. Проверить DNS `crm.winwidget.ru` и наличие/валидность отдельного TLS
+   сертификата по указанному в конфигурации пути. До этого новый файл
+   нельзя устанавливать: `nginx -t` не пройдёт с отсутствующим сертификатом.
+3. Собрать и проверить независимые frontend images, их фактические revisions,
+   production env и все четыре loopback upstream. Согласовать точный cutover
+   существующего процесса на `:3000`, не останавливать его заранее без
+   готовой замены и возможности rollback.
+   До первого cutover сохранить `.next/static` действующего дорефакторингового
+   image в namespace `legacy`, затем
+   наполнить независимые namespaces новых приложений в
+   `/opt/winwidget/deploy/frontend/assets/{legacy,landing,widgets,admin-panel,crm}/_next/static/`.
+   Deploy helper должен проверить все коллизии путей и содержимого до первой
+   записи, затем добавить union: одинаковые файлы оставить, новые добавить,
+   изменившийся файл по старому пути отклонить. Store и его родители не должны
+   быть symlinks; Nginx использует `disable_symlinks on` и не обходит их.
+4. Устанавливать только согласованный immutable Nginx artifact атомарно под
+   frontend lock, с сохранением предыдущего файла, `nginx -t` и reload.
+   При ошибке вернуть прежнюю согласованную пару image/config. Сохранить
+   доступность старых hashed assets и проверить уже открытую вкладку при
+   переходе между зонами; одной проверки новой главной страницы недостаточно.
+   Deploy/rollback не удаляет старые chunks автоматически. Retention и
+   контроль диска согласуются отдельно; нельзя освобождать место слепой
+   очисткой assets и ломать ещё открытые вкладки.
+5. Выполнить проверки ниже. Контейнер CRM может быть опубликован до CRM
+   backend только с действующим frontend release gate; это не разрешение
+   развёртывать новые CRM сервисы или включать платежи.
+
+После релиза проверить:
 
 - deployment revision;
 - загрузку главной, кабинета и админки;
+- host `crm.winwidget.ru`, включая frontend billing/invitation routes;
+- CSS/JS/fonts/image optimizer каждого `/_frontends/*/_next/` и отсутствие
+  переписывания URI/query; неизвестные namespaces возвращают 404;
+- static chunks берутся из своего store: main `/_next/static/` → `legacy`,
+  три prefixed static пути → `landing|widgets|admin-panel`, CRM `/_next/static/`
+  → `crm`; старый известный chunk работает после переключения image;
+- отсутствующий static файл даёт Nginx 404 без Next/backend fallback,
+  listing и symlinks недоступны; cache max-age соответствует `expires 1y`,
+  security headers сохраняются на static ответах, включая ошибки;
 - login/refresh/logout;
+- OAuth `/social-auth`, переходы между зонами и iframe всех preview;
 - API requests только через `/api/v1`;
 - отсутствие обращений к retired upstream;
+- iframe CSP main/preview и CRM DENY; порты `3000–3003` не опубликованы
+  напрямую во внешнюю сеть;
 - основные пользовательские сценарии изменённой области.
 
 ## Production env
@@ -169,8 +220,8 @@ workflow. После релиза проверить:
 winwidget.ru_services/apps/<service>/.env.example
 winwidget.ru_services/apps/<service>/.env.production   # ignored
 
-winwidget.ru_client/.env.example
-winwidget.ru_client/.env.production                    # ignored
+winwidget.ru_frontends/.env.example
+winwidget.ru_frontends/.env.production                  # ignored
 
 deploy/backend/.env.production                         # ignored, canonical backend source
 deploy/frontend/.env.production                        # ignored, canonical frontend source

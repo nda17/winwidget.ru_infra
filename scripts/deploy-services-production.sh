@@ -1176,7 +1176,7 @@ try {
 	const expectedRoutes = JSON.parse(
 		exampleValues.get('GATEWAY_ROUTES_JSON') || 'null'
 	);
-	if (!Array.isArray(routes) || routes.length !== 43) fail();
+	if (!Array.isArray(routes) || routes.length !== 42) fail();
 	if (JSON.stringify(routes) !== JSON.stringify(expectedRoutes)) fail();
 	const ids = new Set();
 	const prefixes = new Set();
@@ -1196,7 +1196,6 @@ try {
 		prefixes.add(route.pathPrefix);
 	}
 	const operationsRoutes = new Map([
-		['operations-notes', '/api/v1/notes'],
 		['operations-admin-event-log', '/api/v1/admin-event-log'],
 		['operations-restores', '/api/v1/dev-tools/database-restores'],
 		['operations-telegram', '/api/v1/telegram-bot/admin'],
@@ -1213,7 +1212,7 @@ try {
 			route.upstreamUrl !== 'http://127.0.0.1:5200'
 		) fail();
 	}
-	if (routes.filter(route => route.upstreamUrl === 'http://127.0.0.1:5200').length !== 8) fail();
+	if (routes.filter(route => route.upstreamUrl === 'http://127.0.0.1:5200').length !== 7) fail();
 } catch {
 	process.stderr.write('Production env failed the apps-only services contract.\n');
 	process.exit(1);

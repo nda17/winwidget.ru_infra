@@ -79,6 +79,10 @@ jobs:
         shell: bash
         run: node scripts/test-isolated-restore-rehearsal-contract.mjs
 
+      - name: Verify four-frontend Nginx routing contract
+        shell: bash
+        run: node scripts/test-frontend-nginx-contract.mjs
+
       - name: Verify steady-state-only contracts
         shell: bash
         run: |
@@ -97,7 +101,6 @@ jobs:
           const readme = fs.readFileSync('README.md', 'utf8');
           const runbook = fs.readFileSync('docs/runbook.md', 'utf8');
           const backendNginx = fs.readFileSync('nginx/backend-api.conf', 'utf8');
-          const frontendNginx = fs.readFileSync('nginx/frontend.conf', 'utf8');
           const telegramBridgeNginx = fs.readFileSync(
             'nginx/telegram-bridge/tg.winwidget.ru.conf',
             'utf8'
@@ -1097,20 +1100,6 @@ jobs:
                 );
               }
             }
-          }
-
-          if (
-            (frontendNginx.match(/server 127\.0\.0\.1:3000;/g) ?? []).length !==
-              1 ||
-            (frontendNginx.match(
-              /server_name winwidget\.ru www\.winwidget\.ru;/g
-            ) ?? []).length !== 2 ||
-            (frontendNginx.match(
-              /proxy_pass http:\/\/winwidget_frontend;/g
-            ) ?? []).length !== 1 ||
-            /:4200|api\.winwidget\.ru|winwidget\.ru_server/i.test(frontendNginx)
-          ) {
-            fail('frontend Nginx is not the exact frontend-only contract');
           }
 
           const extractNginxBlock = (source, marker, label) => {
