@@ -391,6 +391,26 @@ FROM pg_roles WHERE rolname=current_user`);
 	}
 }
 
+export function parseIdentityMigrationInventory(bytes) {
+	assert.ok(Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= 1024 * 1024);
+	const text = bytes.toString('utf8');
+	assert.ok(Buffer.from(text).equals(bytes));
+	const inventory = JSON.parse(text);
+	same(Object.keys(inventory).sort(), ['migrations', 'schemaVersion', 'target']);
+	assert.equal(inventory.schemaVersion, 1);
+	assert.equal(inventory.target, 'identity');
+	assert.ok(Array.isArray(inventory.migrations) && inventory.migrations.length > 0 && inventory.migrations.length <= 4096);
+	for (const file of inventory.migrations) {
+		same(Object.keys(file).sort(), ['checksum', 'name']);
+		assert.match(file.name, /^\d{14}_[a-z0-9_]+$/);
+		assert.match(file.checksum, /^[a-f0-9]{64}$/);
+	}
+	const names = inventory.migrations.map(file => file.name);
+	same(names, sorted(names));
+	assert.equal(new Set(names).size, names.length);
+	return inventory.migrations;
+}
+
 export function validateRestoreEvidence(evidence, receipt, acquisition) {
 	validateBackupAcquisition(acquisition, receipt);
 	assert.equal(evidence.schemaVersion, 1);
@@ -631,11 +651,25 @@ async function main() {
 		};
 		const result = prepareScopedCompose(input);
 		for (const key of ['desired', 'rollback']) writeFileSync(`/run/scoped/${key}.json`, `${JSON.stringify(result[key])}\n`, { mode: 0o600, flag: 'wx' });
+	} else if (action === 'identity-migration-inventory') {
+		assert.equal(process.getuid(), 1001);
+		assert.equal(process.getgid(), 1001);
+		const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, target: 'identity', migrations: migrationFiles('/app/prisma/migrations') }));
+		parseIdentityMigrationInventory(bytes);
+		process.stdout.write(bytes);
 	} else if (action === 'identity-manifest') {
+		assert.equal(process.getuid(), 0);
+		const inventoryPath = '/run/scoped/identity-migrations.json';
+		const inventory = lstatSync(inventoryPath);
+		assert.ok(inventory.isFile() && !inventory.isSymbolicLink() && inventory.nlink === 1);
+		assert.equal(inventory.uid, 0);
+		assert.equal(inventory.gid, 0);
+		assert.equal(inventory.mode & 0o7777, 0o600);
+		assert.ok(inventory.size > 0 && inventory.size <= 1024 * 1024);
 		assertIdentityManifestCompanion(
 			JSON.parse(readFileSync('/run/scoped/operations-manifest-before.json', 'utf8')),
 			JSON.parse(readFileSync('/run/scoped/operations-manifest-after.json', 'utf8')),
-			migrationFiles('/app/prisma/migrations')
+			parseIdentityMigrationInventory(readFileSync(inventoryPath))
 		);
 	} else if (action === 'phase-a') {
 		const receipt = {
