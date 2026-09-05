@@ -125,10 +125,14 @@ export function assertServiceConfiguration(service, live, image, allSecrets) {
 	assert.equal(duration(service.stop_grace_period), Number(live.Config.StopTimeout ?? 10) * 1e9);
 }
 
-export function prepareScopedCompose({ scope, revision, previousRevision, operationsPreviousRevision, compose, live, image, operationsImage, supportImage }) {
+export function prepareScopedCompose({ scope, revision, previousRevision, operationsPreviousRevision, operationsApiPreviousRevision, compose, live, image, operationsImage, supportImage }) {
 	assert.ok(Object.hasOwn(SCOPED_SERVICES, scope));
 	assert.match(revision, /^[a-f0-9]{40}$/);
 	assert.match(previousRevision, /^[a-f0-9]{40}$/);
+	if (operationsApiPreviousRevision) {
+		assert.equal(scope, 'identity-with-operations-manifest');
+		assert.match(operationsApiPreviousRevision, /^[a-f0-9]{40}$/);
+	}
 	const targets = SCOPED_SERVICES[scope];
 	assert.ok(targets.length > 0);
 	assert.equal(live.length, targets.length);
@@ -138,7 +142,7 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		const workers = scope === 'workers-bootstrap-recovery';
 		const federation = scope === 'operations-federation-config';
 		const companion = scope === 'identity-with-operations-manifest' && name.startsWith('operations-');
-		const expectedPreviousRevision = companion ? operationsPreviousRevision : previousRevision;
+		const expectedPreviousRevision = companion ? (name === 'operations-api' && operationsApiPreviousRevision ? operationsApiPreviousRevision : operationsPreviousRevision) : previousRevision;
 		const expectedImage = companion || (workers && name.startsWith('operations-')) ? operationsImage
 			: workers && name.startsWith('support-') ? supportImage : image;
 		assert.match(expectedPreviousRevision ?? '', /^[a-f0-9]{40}$/);
@@ -305,6 +309,12 @@ export async function verifyDatabaseState(client, files, action, owner, context 
 			assert.ok([jobs, permits, recovery, outbox].every(count => count === 0));
 			assert.ok(!lease || Object.values(lease).every(value => value === null));
 		};
+		if (action === 'operations-quiet') {
+			assert.equal(owner, 'operations');
+			await assertOperationsIdle(client);
+			for (const model of ['scheduledJobRun', 'outboxEvent', 'auditEventReceipt', 'integrationDeliveryReceipt']) assert.equal(await client[model].count({ where: { status: 'PROCESSING' } }), 0);
+			return; // Quiet sampling never substitutes for the independent ledger gate.
+		}
 		if (['worker-ledger', 'worker-quiet'].includes(action)) {
 			assert.ok(['billing', 'operations', 'support'].includes(owner));
 			assert.ok(files.length > 0);
@@ -385,7 +395,7 @@ async function databaseAction(action, owner) {
 	const client = new PrismaClient(action === 'all-guard'
 		? { datasources: { db: { url: process.env.OPERATIONS_MIGRATION_DATABASE_URL } } }
 		: undefined);
-	const deadline = action === 'worker-quiet' ? setTimeout(() => process.exit(1), 15000) : undefined;
+	const deadline = ['worker-quiet', 'operations-quiet'].includes(action) ? setTimeout(() => process.exit(1), 15000) : undefined;
 	try { await verifyDatabaseState(client, migrationFiles('/app/prisma/migrations'), action, owner); }
 	finally { await client.$disconnect(); clearTimeout(deadline); }
 }
@@ -398,6 +408,7 @@ async function main() {
 			revision: process.env.SCOPED_REVISION,
 			previousRevision: process.env.SCOPED_PREVIOUS_REVISION,
 			operationsPreviousRevision: process.env.SCOPED_OPERATIONS_PREVIOUS_REVISION,
+			operationsApiPreviousRevision: process.env.SCOPED_OPERATIONS_API_PREVIOUS_REVISION,
 			compose: JSON.parse(readFileSync('/run/scoped/compose.json', 'utf8')),
 			live: JSON.parse(readFileSync('/run/scoped/live.json', 'utf8')),
 			image: JSON.parse(readFileSync('/run/scoped/image.json', 'utf8'))[0],

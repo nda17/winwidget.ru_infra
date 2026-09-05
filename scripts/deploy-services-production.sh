@@ -54,6 +54,7 @@ release_scope="${RELEASE_SCOPE:-all}"
 expected_live_revision="${EXPECTED_LIVE_REVISION:-}"
 expected_service_env_sha256="${EXPECTED_SERVICE_ENV_SHA256:-}"
 expected_operations_revision="${EXPECTED_OPERATIONS_REVISION:-}"
+expected_operations_api_revision="${EXPECTED_OPERATIONS_API_REVISION:-}"
 expected_operations_env_sha256="${EXPECTED_OPERATIONS_ENV_SHA256:-}"
 expected_support_env_sha256="${EXPECTED_SUPPORT_ENV_SHA256:-}"
 operations_runtime_revision="${OPERATIONS_RUNTIME_REVISION:-}"
@@ -83,6 +84,10 @@ if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" 
 else
 	[[ -z "$expected_operations_revision$expected_operations_env_sha256" ]] ||
 		die 'Operations companion authorization is only valid for the coordinated Identity release.'
+fi
+if [[ -n "$expected_operations_api_revision" ]]; then
+	[[ "$release_scope" == identity-with-operations-manifest && "$expected_operations_api_revision" =~ ^[a-f0-9]{40}$ ]] ||
+		die 'Operations API baseline is only valid for coordinated Identity.'
 fi
 if [[ "$release_scope" == workers-bootstrap-recovery ]]; then
 	[[ "$expected_support_env_sha256" =~ ^[a-f0-9]{64}$ && "$expected_operations_revision" == "$expected_live_revision" ]] ||
@@ -277,7 +282,8 @@ printf -v remote_controller_arguments ' %q' \
 	"$scoped_node_base64" \
 	"$expected_operations_revision" \
 	"$expected_operations_env_sha256" \
-	"$expected_support_env_sha256"
+	"$expected_support_env_sha256" \
+	"$expected_operations_api_revision"
 # The remote shell, not this local controller, must expand these variables.
 # shellcheck disable=SC2016
 remote_controller_command='set -euo pipefail
@@ -321,6 +327,7 @@ scoped_node_base64="${14}"
 export expected_operations_revision="${15}"
 export expected_operations_env_sha256="${16}"
 export expected_support_env_sha256="${17}"
+export expected_operations_api_revision="${18}"
 
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'

@@ -199,13 +199,15 @@ lock. Два дополнительных tracked payload проходят SHA-2
   также после quiet + graceful-stop проверки; иначе выдаётся CRITICAL без kill.
   Если старые образы снова unhealthy, rollback не объявляется успешным: нужны
   сохранённые recovery snapshots и операторская проверка.
-  **P1 — следующий backend release:** после worker-only cutover Operations
+  **Следующий backend release:** после worker-only cutover Operations
   имеет разные per-role revisions: API остаётся на старом image, три workers
-  получают bootstrap fix. Текущие прежние OTP/Notes candidates и admission с
-  единым Operations revision больше не считаются совместимыми. До их promotion
-  нужны отдельный review точных per-role baselines и backport сохранённого
-  bootstrap fix; нельзя возвращать старые worker images ради прохождения gate.
-  Этот scope намеренно не ослабляет проверки следующих выпусков.
+  получают bootstrap fix. Прежние OTP/Notes candidates без этого исправления
+  несовместимы: OTP candidate нужно собрать от фактически выпущенного worker
+  SHA, сохранив три bootstrap helpers, main/tests и security patch. Следующий
+  Notes candidate строится уже от выпущенного OTP SHA. Нельзя возвращать старые
+  worker images ради прохождения gate. Mixed baseline поддерживает только
+  следующий явно закреплённый Identity scope, описанный ниже; новый controller
+  pin также требует green CI и отдельного review caller.
 - `operations-federation-config`: только `operations-api`, на **точном текущем
   live image** и прежнем `APP_REVISION`, без build, DB probes/migrations и workers.
   Prepared canonical/Operations env hashes должны быть заранее двусторонне
@@ -234,9 +236,21 @@ lock. Два дополнительных tracked payload проходят SHA-2
   требует согласованного companion image. В Operations разрешены только JSON
   restore manifest и точный, проверенный whole-file hashes, security patch
   `qs 6.15.3 -> 6.16.0`; остальной source/package manifest/Dockerfile неизменен.
+  Для mixed baseline после worker recovery дополнительно закрепляется
+  `expected_operations_api_revision`: точный live revision Operations API.
+  `expected_operations_revision` остаётся точным revision трёх workers и базой
+  source diff. Этот optional input запрещён у других scopes; без него действует
+  прежний homogeneous контракт. В mixed варианте все Billing/Support files
+  побайтово совпадают с worker baseline, в Operations отличается только restore
+  JSON; наличие baseline bootstrap helpers обязательно. Проверяются реальные
+  IDs/images всех четырёх ролей и побайтовое совпадение их старых manifests,
+  а не SHA checkout. Rollback snapshots сохраняют исходный image каждой роли.
   Build/probe обоих images и проверка только additive OTP migration выполняются
-  до остановки. Затем останавливаются все четыре Operations процесса,
-  проверяются `Running=false`, `Pid=0`, отсутствие PostgreSQL сессий runtime
+  до остановки. Затем quiet samples и мягкий TERM с ограниченным ожиданием
+  останавливают все четыре Operations процесса без SIGKILL; проверяются
+  отсутствие processing jobs/receipts/Outbox, idle restore и RabbitMQ
+  unacked/unconfirmed. Это не атомарный drain. Дополнительно проверяются
+  `Running=false`, `Pid=0`, отсутствие PostgreSQL сессий runtime
   роли, `SHARE` barrier, ноль `PROCESSING` scheduled jobs (включая expired) и
   незавершённых restore jobs/permits/leases. Только после этого допускается
   Identity DDL и запуск семи runtime. Это короткая пауза admin control plane и
@@ -245,11 +259,17 @@ lock. Два дополнительных tracked payload проходят SHA-2
   Если DDL уже начат, даже неоднозначный результат запрещает автоматический
   возврат старого Operations manifest: `RECOVERY_REQUIRED`, Operations остаётся
   остановлен. Возобновление требует доказанного ledger/manifest match. До DDL
-  можно возобновить только исходные остановленные container IDs.
+  можно возобновить только исходные остановленные container IDs после повторной
+  quiet проверки; неполная graceful остановка требует recovery без auto-restart.
 - `operations-runtime` — фаза A удаления административного Backlog. Только
   четыре Operations runtime, без вызова migration runner. Pending migration
   должна быть ровно `20260910110000_remove_admin_backlog`, предыдущий ledger —
   с точными checksums. Новый runtime не содержит Notes API; таблица сохраняется.
+  До замены четырёх процессов применяются те же Operations quiet samples и
+  graceful-stop проверки; при rollback до fence они также обязательны. Отдельный
+  read-only `operations-quiet` допускает pending Notes лишь для проверки покоя,
+  не заменяя обязательный exact pre-migration ledger gate. `worker-quiet` и
+  `worker-ledger` по-прежнему запрещают любую pending migration.
   После health проверок устанавливается PostgreSQL writer fence (REVOKE Notes
   DML у runtime, drain lock и проверка всех table/column write grants).
   Root-only receipt сохраняется в

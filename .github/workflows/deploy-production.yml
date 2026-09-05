@@ -27,6 +27,10 @@ on:
         description: Approved prepared Operations companion env SHA256
         default: ''
         type: string
+      expected_operations_api_revision:
+        description: Optional distinct live Operations API baseline (coordinated Identity only)
+        default: ''
+        type: string
       expected_support_env_sha256:
         description: Approved prepared Support env SHA256 (worker recovery only)
         default: ''
@@ -112,6 +116,7 @@ jobs:
           EXPECTED_LIVE_REVISION: ${{ inputs.expected_live_revision }}
           EXPECTED_SERVICE_ENV_SHA256: ${{ inputs.expected_service_env_sha256 }}
           EXPECTED_OPERATIONS_REVISION: ${{ inputs.expected_operations_revision }}
+          EXPECTED_OPERATIONS_API_REVISION: ${{ inputs.expected_operations_api_revision }}
           EXPECTED_OPERATIONS_ENV_SHA256: ${{ inputs.expected_operations_env_sha256 }}
           EXPECTED_SUPPORT_ENV_SHA256: ${{ inputs.expected_support_env_sha256 }}
           OPERATIONS_RUNTIME_REVISION: ${{ inputs.operations_runtime_revision }}

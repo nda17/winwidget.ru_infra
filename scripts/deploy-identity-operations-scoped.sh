@@ -107,6 +107,7 @@ scoped_verifier() {
 		--env "SCOPED_SCOPE=$release_scope" --env "SCOPED_REVISION=$verification_revision" \
 		--env "SCOPED_PREVIOUS_REVISION=$expected_live_revision" \
 		--env "SCOPED_OPERATIONS_PREVIOUS_REVISION=${expected_operations_revision:-}" \
+		--env "SCOPED_OPERATIONS_API_PREVIOUS_REVISION=${expected_operations_api_revision:-}" \
 		--env "SCOPED_DATABASE_ID=${scoped_database_id:-}" \
 		--env "SCOPED_MIGRATION_MANIFEST_SHA256=${scoped_migration_manifest_sha256:-}" \
 		--env "SCOPED_APPLICATION_TREE=${scoped_application_tree:-}" \
@@ -204,17 +205,19 @@ scoped_assert_worker_source() {
 }
 
 scoped_workers_quiet() {
-	local owner broker
+	local owner broker action=worker-quiet
+	local -a owners=(billing operations support)
+	if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == operations-runtime ]]; then owners=(operations); action=operations-quiet; fi
 	broker="$(scoped_container_id rabbitmq)" || return 1
 	[[ "$(docker inspect --format '{{.State.Health.Status}}' "$broker")" == healthy ]] || return 1
 	docker exec "$broker" rabbitmq-diagnostics -q check_running >/dev/null 2>&1 || return 1
 	docker exec "$broker" rabbitmq-diagnostics -q check_port_connectivity >/dev/null 2>&1 || return 1
 	docker exec "$broker" rabbitmqctl --quiet --formatter json list_channels consumer_count messages_unacknowledged messages_unconfirmed confirm |
 		scoped_verifier broker-quiet >/dev/null 2>&1 || return 1
-	for owner in billing operations support; do
+	for owner in "${owners[@]}"; do
 		scoped_source_compose run --rm --no-deps --interactive \
 			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
-			--entrypoint node "$owner-migrate" /run/scoped-verifier.mjs database worker-quiet "$owner" >/dev/null 2>&1 || return 1
+			--entrypoint node "$owner-migrate" /run/scoped-verifier.mjs database "$action" "$owner" >/dev/null 2>&1 || return 1
 	done
 }
 
@@ -264,7 +267,7 @@ scoped_cleanup() {
 		for name in operations-api operations-worker operations-outbox-publisher operations-restore-worker; do
 			id="$(docker ps --no-trunc --filter label=com.docker.compose.project=winwidget --filter "label=com.docker.compose.service=$name" --format '{{.ID}}')" || { fence_confirmed=false; continue; }
 			[[ -n "$id" ]] || continue
-			if [[ ! "$id" =~ ^[a-f0-9]{64}$ ]] || ! docker stop --time 90 "$id" >/dev/null 2>&1 ||
+			if [[ ! "$id" =~ ^[a-f0-9]{64}$ ]] || ! scoped_workers_graceful_stop "$id" ||
 				[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" != 'false 0' ]]; then fence_confirmed=false; fi
 		done
 		if [[ "$fence_confirmed" == true ]]; then
@@ -273,20 +276,20 @@ scoped_cleanup() {
 			printf '%s\n' 'RECOVERY_REQUIRED: Operations stop could not be proven; urgently verify its physical fence and Identity ledger/manifest. No old manifest was resumed.' >&2
 		fi
 	elif [[ "$exit_code" != 0 && "${scoped_operations_stopped:-false}" == true && "${scoped_cutover_started:-false}" == false ]]; then
-		if docker start "${scoped_operations_ids[@]}" >/dev/null 2>&1 && scoped_wait_healthy; then
+		if scoped_workers_quiet && docker start "${scoped_operations_ids[@]}" >/dev/null 2>&1 && scoped_wait_healthy; then
 			printf '%s\n' 'Pre-DDL drain failed; unchanged Operations containers were resumed on their original manifests.' >&2
 		else
 			printf '%s\n' 'RECOVERY_REQUIRED: pre-DDL Operations restart needs operator verification.' >&2
 		fi
 	elif [[ "$exit_code" != 0 && "${scoped_cutover_started:-false}" == true && "${scoped_fence_started:-false}" == false ]]; then
-		if { [[ "$release_scope" != workers-bootstrap-recovery ]] || scoped_workers_rollback_ready; } &&
+		if { [[ "$release_scope" != workers-bootstrap-recovery && "$release_scope" != operations-runtime ]] || scoped_workers_rollback_ready; } &&
 			scoped_compose rollback up -d --no-build --no-deps --force-recreate "${scoped_targets[@]}" >/dev/null 2>&1 && scoped_wait_healthy; then
 			printf '%s\n' 'Scoped rollback restored the preserved image/config; additive migrations were not reversed.' >&2
 		else
 			printf '%s\n' 'CRITICAL: scoped rollback requires operator recovery; preserved snapshots were retained.' >&2
 		fi
 	elif [[ "$exit_code" != 0 && "${scoped_workers_stop_started:-false}" == true ]]; then
-		printf '%s\n' 'RECOVERY_REQUIRED: inspect the exact seven worker states; graceful stop/cutover was not completed. No force-kill or automatic old-worker restart was attempted.' >&2
+		printf '%s\n' 'RECOVERY_REQUIRED: inspect scoped processes; graceful stop was incomplete. No force-kill or automatic old-worker restart was attempted.' >&2
 	fi
 	if [[ "$exit_code" == 0 && -n "${scoped_work_directory:-}" ]]; then
 		find "$scoped_work_directory" -mindepth 1 -maxdepth 1 -type f -delete
@@ -320,7 +323,7 @@ scoped_assert_backlog_already_finalized() {
 }
 
 scoped_deploy_main() {
-	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt
+	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
 	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config)$ &&
@@ -352,6 +355,13 @@ scoped_deploy_main() {
 		scoped_env_arguments+=(--env-file "$services_repository/apps/operations/.env.production")
 		[[ "$expected_operations_revision" =~ ^[a-f0-9]{40}$ ]] || die 'Invalid approved Operations companion revision.'
 		companion_files="$(git -C "$release_root" diff --name-only "$expected_operations_revision" "$services_revision" -- apps/operations)"
+		if [[ -n "${expected_operations_api_revision:-}" ]]; then
+			[[ "$expected_operations_api_revision" =~ ^[a-f0-9]{40}$ && "$companion_files" == apps/operations/restore-manifests/database-restore-migrations.json &&
+				-z "$(git -C "$release_root" diff --name-only "$expected_operations_revision" "$services_revision" -- apps/billing apps/support)" ]] || die 'Mixed baseline must preserve worker recovery source.'
+			for owner in billing operations support; do
+				git -C "$release_root" cat-file -e "$expected_operations_revision:apps/$owner/src/runtime/bootstrap-failure.ts" || die 'Worker baseline has no bootstrap recovery.'
+			done
+		fi
 		case "$companion_files" in
 			'apps/operations/restore-manifests/database-restore-migrations.json') ;;
 			$'apps/operations/pnpm-lock.yaml\napps/operations/restore-manifests/database-restore-migrations.json')
@@ -427,14 +437,17 @@ scoped_deploy_main() {
 		for name in operations-api operations-worker operations-outbox-publisher operations-restore-worker; do
 			id="$(scoped_container_id "$name")" || die 'Operations companion process is not uniquely running.'
 			read -r old_image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
-			[[ "$revision" == "$expected_operations_revision" && "$old_image" =~ ^sha256:[a-f0-9]{64}$ ]] || die 'Operations companion revision differs from its approved baseline.'
+			role_revision="$expected_operations_revision"
+			if [[ "$name" == operations-api ]]; then role_revision="${expected_operations_api_revision:-$role_revision}"; fi
+			[[ "$revision" == "$role_revision" && "$old_image" =~ ^sha256:[a-f0-9]{64}$ ]] || die 'Operations role differs from its approved baseline.'
 			scoped_operations_ids+=("$id")
+			docker run --rm --network none --entrypoint node "$old_image" -e \
+				'process.stdout.write(require("node:fs").readFileSync("/app/restore-manifests/database-restore-migrations.json"))' >"$scoped_work_directory/role-manifest.json"
+			if [[ "$name" == operations-api ]]; then cp "$scoped_work_directory/role-manifest.json" "$scoped_work_directory/operations-manifest-before.json";
+			else cmp -s "$scoped_work_directory/role-manifest.json" "$scoped_work_directory/operations-manifest-before.json" || die 'Live Operations manifests disagree.'; fi
 		done
 		scoped_operations_stopped=false
 		scoped_identity_ddl_started=false
-		docker run --rm --network none --entrypoint node "$old_image" -e \
-			'process.stdout.write(require("node:fs").readFileSync("/app/restore-manifests/database-restore-migrations.json", "utf8"))' \
-			>"$scoped_work_directory/operations-manifest-before.json"
 		docker build --build-arg "APP_REVISION=$services_revision" --tag "winwidget-operations:git-$services_revision" "$release_root/apps/operations" >/dev/null 2>&1 || die 'Operations manifest companion image build failed.'
 		read -r scoped_operations_image_id image_revision < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "winwidget-operations:git-$services_revision")
 		[[ "$scoped_operations_image_id" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" ]] || die 'Operations companion immutable image identity is invalid.'
@@ -486,11 +499,20 @@ scoped_deploy_main() {
 	scoped_verifier prepare || die 'Scoped candidate changes unapproved runtime configuration or Gateway routes.'
 	if [[ "$release_scope" == identity-with-operations-manifest ]]; then
 		scoped_database pre-migration
-		scoped_operations_stopped=true
-		docker stop --time 90 "${scoped_operations_ids[@]}" >/dev/null || die 'Cannot stop the approved Operations processes before the Identity migration.'
+		scoped_workers_quiet || die 'Operations is not quiet.'
+		sleep 2
+		scoped_workers_quiet || die 'Operations became busy.'
+		for name in "${!scoped_operations_ids[@]}"; do
+			[[ "$(scoped_container_id "${scoped_targets[$((name + 3))]}")" == "${scoped_operations_ids[$name]}" ]] || die 'Operations identity changed before stop.'
+		done
+		scoped_workers_quiet || die 'Operations became busy before stop.'
+		scoped_workers_stop_started=true
+		scoped_workers_graceful_stop "${scoped_operations_ids[@]}" || die 'Operations graceful stop failed; no force-kill.'
+		scoped_workers_quiet || die 'Operations remains busy after stop.'
 		for id in "${scoped_operations_ids[@]}"; do
 			[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || die 'An old Operations process is not physically stopped.'
 		done
+		scoped_operations_stopped=true
 		scoped_database operations-drain operations
 		scoped_assert_unchanged_neighbors
 		scoped_identity_ddl_started=true
@@ -505,7 +527,7 @@ scoped_deploy_main() {
 		done
 	fi
 	scoped_assert_unchanged_neighbors
-	if [[ "$release_scope" == workers-bootstrap-recovery ]]; then
+	if [[ "$release_scope" == workers-bootstrap-recovery || "$release_scope" == operations-runtime ]]; then
 		# Repeated quiet samples reduce interruption risk; this is NOT an atomic
 		# writer fence. Never clear receipts/leases or force-kill a busy process.
 		scoped_workers_quiet || die 'Worker quiet-window preflight is busy or unavailable.'

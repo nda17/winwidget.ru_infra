@@ -99,6 +99,13 @@ test('worker release requires all three exact owner envs and no foreign authorit
 	rejectBeforeTransport([revision], { RELEASE_SCOPE: 'operations-runtime', EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, EXPECTED_SUPPORT_ENV_SHA256: envHash }, /Support authorization/)
 })
 
+test('distinct Operations API baseline cannot enter another scope or be mutable', () => {
+	for (const scope of ['operations-runtime', workerScope]) {
+		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...(scope === workerScope ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}), EXPECTED_OPERATIONS_API_REVISION: oldRevision }, /Operations API baseline/)
+	}
+	rejectBeforeTransport([revision], { RELEASE_SCOPE: identityScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash, EXPECTED_OPERATIONS_API_REVISION: 'prod' }, /Operations API baseline/)
+})
+
 test('all-services mode cannot inherit scoped or destructive authorization', () => {
 	rejectBeforeTransport([revision], {
 		RELEASE_SCOPE: 'all',
@@ -267,6 +274,26 @@ test('federation config reuses the exact Operations API image and normalizes onl
 		candidate.compose.services['operations-api'].environment.NOTIFICATION_DELIVERY_INTERNAL_URL = url
 		assert.throws(() => prepareScopedCompose(candidate))
 	}
+})
+
+test('Identity mixed Operations baseline preserves each exact old role image and rejects wrong-role revision', () => {
+	const input = composeFixture(identityScope)
+	input.operationsApiPreviousRevision = 'c'.repeat(40)
+	const api = input.live.find(row => row.Config.Labels['com.docker.compose.service'] === 'operations-api')
+	api.Config.Labels['org.opencontainers.image.revision'] = input.operationsApiPreviousRevision
+	api.Config.Env = api.Config.Env.map(value => value.startsWith('APP_REVISION=') ? `APP_REVISION=${input.operationsApiPreviousRevision}` : value)
+	api.Image = `sha256:${'2'.repeat(64)}`
+	const output = prepareScopedCompose(input)
+	assert.equal(output.rollback.services['operations-api'].image, api.Image)
+	assert.equal(output.rollback.services['operations-worker'].image, input.live[4].Image)
+	for (const mutate of [
+		candidate => { candidate.operationsApiPreviousRevision = oldRevision },
+		candidate => { candidate.live[4].Config.Labels['org.opencontainers.image.revision'] = candidate.operationsApiPreviousRevision },
+		candidate => { candidate.operationsPreviousRevision = candidate.operationsApiPreviousRevision },
+		candidate => { candidate.operationsApiPreviousRevision = 'prod' }
+	]) { const candidate = structuredClone(input); mutate(candidate); assert.throws(() => prepareScopedCompose(candidate)) }
+	const other = composeFixture(workerScope); other.operationsApiPreviousRevision = oldRevision
+	assert.throws(() => prepareScopedCompose(other))
 })
 
 test('coordinated Compose adapter binds three Identity and four Operations owners to separate images', () => {
@@ -603,6 +630,8 @@ release_scope="$TEST_SCOPE"
 expected_env_sha256="$TEST_ENV_HASH"
 expected_service_env_sha256="$TEST_ENV_HASH"
 expected_operations_revision="$TEST_PREVIOUS_REVISION"
+expected_operations_api_revision=''
+if [[ "$TEST_SCENARIO" == mixed-* ]]; then expected_operations_api_revision="$TEST_API_PREVIOUS_REVISION"; fi
 expected_operations_env_sha256="$TEST_ENV_HASH"
 expected_support_env_sha256="$TEST_ENV_HASH"
 operations_runtime_revision=''
@@ -621,9 +650,14 @@ stat() {
 flock() { [[ "$TEST_SCENARIO" != lost-lock ]]; }
 sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); for(const p of process.argv.slice(1))console.log(c.createHash("sha256").update(f.readFileSync(p)).digest("hex")+"  "+p)' "$@"; }
 sync() { :; }
-sleep() { if [[ "$TEST_SCENARIO" == stop-timeout ]]; then SECONDS=$((SECONDS + 60)); fi; }
+sleep() { if [[ "$TEST_SCENARIO" == stop-timeout || "$TEST_SCENARIO" == still-running ]]; then SECONDS=$((SECONDS + 60)); fi; }
 git() {
+  if [[ " $* " == *' cat-file '* ]]; then [[ "$TEST_SCENARIO" != mixed-helper-missing ]]; return; fi
   if [[ " $* " == *' diff '* ]]; then
+    if [[ "$TEST_SCENARIO" == mixed-* && " $* " == *' apps/billing apps/support '* ]]; then
+      if [[ "$TEST_SCENARIO" == mixed-source-drift ]]; then printf 'apps/billing/src/main.ts\n'; fi
+      return 0
+    fi
     if [[ "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
       for owner in billing operations support; do printf 'apps/%s/src/main.ts\napps/%s/src/runtime/bootstrap-failure.ts\n' "$owner" "$owner"; done
       if [[ "$TEST_SCENARIO" == source-drift ]]; then printf 'apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql\n'; fi
@@ -645,6 +679,11 @@ docker() {
   for arg in "$@"; do last="$arg"; done
   current="$(<"$SCOPED_PHASE")"
   image="$TEST_OLD_IMAGE"; rev="$TEST_PREVIOUS_REVISION"
+  if [[ "$current" == old && "$TEST_SCENARIO" == mixed-* ]]; then
+    if [[ "$last" =~ ^0+1$ ]]; then image="$TEST_OLD_API_IMAGE"; rev="$TEST_API_PREVIOUS_REVISION"; fi
+    if [[ "$TEST_SCENARIO" == mixed-api-wrong && "$last" =~ ^0+1$ ]]; then rev="$TEST_PREVIOUS_REVISION"; fi
+    if [[ "$TEST_SCENARIO" == mixed-worker-wrong && "$last" =~ ^0+2$ ]]; then rev="$TEST_API_PREVIOUS_REVISION"; fi
+  fi
   if [[ "$current" == desired && "$TEST_SCOPE" != gateway-remove-notes && "$TEST_SCOPE" != operations-federation-config ]]; then image="$TEST_NEW_IMAGE"; rev="$TEST_REVISION"; fi
   if [[ "$current" == desired && "$TEST_SCOPE" == identity-with-operations-manifest && "$last" =~ ^0+[1-4]$ ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
   if [[ "$current" == desired && "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
@@ -731,7 +770,7 @@ docker() {
         return 0
       fi
       if [[ "$action" == run && " $* " == *' database '* ]]; then
-        if [[ " $* " == *' worker-quiet '* ]]; then
+        if [[ " $* " == *' worker-quiet '* || " $* " == *' operations-quiet '* ]]; then
           if [[ "$TEST_SCENARIO" == database-busy ]]; then return 1; fi
           if [[ "$TEST_SCENARIO" == stop-busy && -f "$SCOPED_FIXTURE/stopped-$(printf '%064d' 9)" ]]; then return 1; fi
           if [[ "$TEST_SCENARIO" == rollback-busy && "$current" == desired ]]; then return 1; fi
@@ -756,6 +795,7 @@ docker() {
       for arg in "$@"; do last="$arg"; done
       case "$last" in
         *'readFileSync'*)
+          if [[ "$TEST_SCENARIO" == mixed-manifest-drift && " $* " == *" $TEST_OLD_API_IMAGE "* ]]; then printf '{"drift":true}\n'; return 0; fi
           if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$TEST_SCENARIO" == manifest-failed && " $* " == *" $TEST_OPERATIONS_IMAGE "* ]]; then printf '{"changed":true}\n'; else printf '{}\n'; fi ;;
         identity-manifest) [[ "$TEST_SCENARIO" != manifest-failed ]] ;;
         broker-quiet)
@@ -812,6 +852,7 @@ function runRuntime(scope, scenario = 'success') {
 				SCOPED_LIBRARY: scopedControllerPath, SCOPED_FIXTURE: directory, SCOPED_CALLS: calls, SCOPED_PHASE: phase,
 				TEST_SCOPE: scope, TEST_SCENARIO: scenario, TEST_NODE: process.execPath,
 				TEST_REVISION: revision, TEST_PREVIOUS_REVISION: oldRevision,
+				TEST_API_PREVIOUS_REVISION: 'c'.repeat(40), TEST_OLD_API_IMAGE: `sha256:${'2'.repeat(64)}`,
 				TEST_ENV_HASH: sha256(env), TEST_EVIDENCE_HASH: sha256('{}\n'),
 				TEST_OLD_IMAGE: `sha256:${'e'.repeat(64)}`, TEST_NEW_IMAGE: `sha256:${'d'.repeat(64)}`,
 				TEST_OPERATIONS_IMAGE: `sha256:${'f'.repeat(64)}`, TEST_SUPPORT_IMAGE: `sha256:${'1'.repeat(64)}`
@@ -960,6 +1001,20 @@ test('worker ledger proof reads only the exact owner identity and already applie
 		}
 		await verifyDatabaseState(fake(), files, 'worker-ledger', owner)
 		await verifyDatabaseState(fake(), files, 'worker-quiet', owner)
+		if (owner === 'operations') {
+			const pendingNotes = [...files, { name: NOTES_MIGRATION, checksum: 'd'.repeat(64) }]
+			await verifyDatabaseState(fake(), pendingNotes, 'operations-quiet', owner)
+			await assert.rejects(() => verifyDatabaseState(fake(), pendingNotes, 'worker-quiet', owner))
+			const beforeNotes = fake()
+			beforeNotes.$queryRaw = async () => [{ notes: 'operations.notes' }]
+			await verifyDatabaseState(beforeNotes, pendingNotes, 'pre-migration', owner)
+			await assert.rejects(() => verifyDatabaseState(beforeNotes, [{ ...files[0], checksum: 'e'.repeat(64) }, pendingNotes[1]], 'pre-migration', owner))
+			for (const model of ['scheduledJobRun', 'auditEventReceipt', 'integrationDeliveryReceipt', 'outboxEvent']) {
+				const busy = fake()
+				busy[model].count = async input => { assert.equal(input.where.status, 'PROCESSING'); return 1 }
+				await assert.rejects(() => verifyDatabaseState(busy, pendingNotes, 'operations-quiet', owner))
+			}
+		} else await assert.rejects(() => verifyDatabaseState(fake(), files, 'operations-quiet', owner))
 		for (const model of owner === 'billing' ? ['providerOperation', 'outboxEvent', 'integrationDeliveryReceipt'] : owner === 'operations' ? ['scheduledJobRun', 'auditEventReceipt', 'integrationDeliveryReceipt', 'outboxEvent'] : ['telegramWebhookInbox', 'telegramOutboundDelivery', 'outboxEvent', 'consumerReceipt']) {
 			const busy = fake()
 			busy[model].count = async input => { assert.deepEqual(input.where.status.in, model === 'providerOperation' ? ['PENDING', 'PROCESSING'] : ['PROCESSING']); return 1 }
@@ -1075,7 +1130,7 @@ test('coordinated Identity deployment builds and verifies both images before fen
 	assert.equal(builds.length, 2)
 	assert.ok(builds[0].includes('winwidget-identity:'))
 	assert.ok(builds[1].includes('winwidget-operations:'))
-	const stop = result.calls.indexOf('DOCKER <stop>')
+	const stop = result.calls.indexOf('DOCKER <kill>')
 	assert.ok(result.calls.lastIndexOf('DOCKER <build>') < stop)
 	assert.ok(result.calls.indexOf('<identity-manifest>') < stop)
 	assert.ok(result.calls.indexOf('<prepare>') < stop)
@@ -1083,9 +1138,10 @@ test('coordinated Identity deployment builds and verifies both images before fen
 	assert.ok(result.calls.indexOf('<operations-drain>') > stop)
 	assert.ok(result.calls.indexOf('MIGRATE identity-migrate') > result.calls.indexOf('<operations-drain>'))
 	assert.ok(result.calls.indexOf('<up>') > result.calls.indexOf('<post-migration>'))
-	const stops = result.calls.split('\n').filter(line => line.startsWith('DOCKER <stop>'))
-	assert.equal(stops.length, 1)
-	assert.ok(stops[0].endsWith([1, 2, 3, 4].map(number => `<${String(number).padStart(64, '0')}>`).join(' ')))
+	const stops = result.calls.split('\n').filter(line => line.startsWith('DOCKER <kill>'))
+	assert.equal(stops.length, 4)
+	for (const [index, line] of stops.entries()) assert.equal(line, `DOCKER <kill> <--signal=TERM> <${String(index + 1).padStart(64, '0')}>`)
+	assert.ok(!result.calls.includes('DOCKER <stop>'))
 	assert.deepEqual(result.stopped, [])
 })
 
@@ -1100,7 +1156,7 @@ test('companion drift or failed manifest validation cannot stop a live process o
 })
 
 test('failed pre-DDL Operations drain resumes only the unchanged four Operations IDs', () => {
-	for (const scenario of ['drain-failed', 'still-running']) {
+	for (const scenario of ['drain-failed']) {
 		const result = runRuntime(identityScope, scenario)
 		assert.notEqual(result.status, 0)
 		assert.ok(!result.calls.includes('MIGRATE '), result.calls)
@@ -1108,6 +1164,27 @@ test('failed pre-DDL Operations drain resumes only the unchanged four Operations
 		const starts = result.calls.split('\n').filter(line => line.startsWith('DOCKER <start>'))
 		assert.deepEqual(starts, [`DOCKER <start> ${[1, 2, 3, 4].map(number => `<${String(number).padStart(64, '0')}>`).join(' ')}`])
 		assert.deepEqual(result.stopped, [])
+	}
+})
+
+test('mixed Identity release requires preserved recovery source and identical old role manifests', () => {
+	const good = runRuntime(identityScope, 'mixed-success')
+	assert.equal(good.status, 0, good.stderr)
+	assertOnlyScopedUp(good, SCOPED_SERVICES[identityScope])
+	for (const scenario of ['mixed-source-drift', 'mixed-helper-missing', 'mixed-api-wrong', 'mixed-worker-wrong', 'mixed-manifest-drift']) {
+		const bad = runRuntime(identityScope, scenario)
+		assert.notEqual(bad.status, 0, scenario)
+		assert.ok(!bad.calls.includes('MIGRATE ') && !bad.calls.includes('<up>') && !bad.calls.includes('DOCKER <kill>'), bad.calls)
+	}
+})
+
+test('Operations quiet and graceful-stop failures never apply Identity DDL or Notes phase-A runtime', () => {
+	for (const scope of [identityScope, 'operations-runtime']) {
+		for (const scenario of ['database-busy', 'quiet-second', 'quiet-last', 'stop-timeout', 'still-running', 'stop-interrupted']) {
+			const bad = runRuntime(scope, scenario)
+			assert.notEqual(bad.status, 0, scenario)
+			assert.ok(!bad.calls.includes('MIGRATE ') && !bad.calls.includes('<up>') && !bad.calls.includes('DOCKER <start>') && !bad.calls.includes('DOCKER <stop>'), bad.calls)
+		}
 	}
 })
 
@@ -1211,10 +1288,10 @@ test('actual transport sends both exact tracked payloads through one pinned SSH 
 	// All admitted parameters are hex/base64, scope names, or empty shell tokens.
 	// Decode only this constrained argument list; never evaluate the SSH command.
 	const parameters = encodedArguments[1].split(' ').map(value => value === "''" ? '' : value)
-	assert.equal(parameters.length, 17)
+	assert.equal(parameters.length, 18)
 	assert.deepEqual(parameters.slice(0, 3), [revision, revision, envHash])
 	assert.deepEqual(parameters.slice(5, 10), [identityScope, oldRevision, envHash, '', ''])
-	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, ''])
+	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, '', ''])
 	for (const [hashIndex, encodedIndex, filename] of [
 		[10, 11, 'deploy-identity-operations-scoped.sh'], [12, 13, 'scoped-service-release.mjs']
 	]) {
