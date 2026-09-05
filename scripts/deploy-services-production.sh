@@ -63,7 +63,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config)
+	identity-with-operations-manifest | operations-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -72,6 +72,9 @@ case "$release_scope" in
 				"$operations_evidence_sha256" =~ ^[0-9a-f]{64}$ &&
 				"$expected_live_revision" == "$operations_runtime_revision" ]] ||
 				die 'Operations finalization requires exact phase-A and restore evidence identities.'
+		elif [[ "$release_scope" == operations-backlog-backup ]]; then
+			[[ "$operations_runtime_revision" =~ ^[0-9a-f]{40}$ && "$expected_live_revision" == "$operations_runtime_revision" && -z "$operations_evidence_sha256" ]] ||
+				die 'Operations backup requires the exact phase-A live revision and no restore evidence input.'
 		else
 			[[ -z "$operations_runtime_revision$operations_evidence_sha256" ]] ||
 				die 'Destructive authorization is only valid for Operations finalization.'

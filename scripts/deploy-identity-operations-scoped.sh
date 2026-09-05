@@ -101,6 +101,8 @@ scoped_compose() {
 
 scoped_verifier() {
 	local verification_revision="${operations_runtime_revision:-$services_revision}"
+	local -a verifier_mounts=(--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro")
+	if [[ -n "${scoped_backup_artifact:-}" ]]; then verifier_mounts+=(--volume "$scoped_backup_artifact:/run/scoped-artifact.dump:ro"); fi
 	if [[ "$release_scope" == operations-federation-config ]]; then verification_revision="$expected_live_revision"; fi
 	docker run --rm --interactive --network none --read-only --cap-drop ALL \
 		--security-opt no-new-privileges --user 0:0 \
@@ -113,9 +115,110 @@ scoped_verifier() {
 		--env "SCOPED_APPLICATION_TREE=${scoped_application_tree:-}" \
 		--env "SCOPED_INFRA_REVISION=$infra_revision" \
 		--env "SCOPED_NOTES_CHECKSUM=${scoped_notes_checksum:-}" \
-		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--env "SCOPED_SOURCE_WORKER_ID=${scoped_source_worker_id:-}" --env "SCOPED_SOURCE_WORKER_IMAGE=${scoped_source_worker_image:-}" \
+		--env "SCOPED_BACKUP_EXECUTOR_ID=${scoped_backup_executor_id:-}" --env "SCOPED_BACKUP_EXECUTOR_IMAGE=${scoped_backup_executor_image:-}" \
 		--volume "$scoped_work_directory:/run/scoped" \
+		"${verifier_mounts[@]}" \
 		--entrypoint node "$scoped_image_id" /run/scoped-verifier.mjs "$@"
+}
+
+scoped_backup_load() {
+	local file
+	assert_root_owned_directory "$scoped_state_directory/backup"
+	for file in acquisition.json operations.dump; do
+		assert_root_owned_file "$scoped_state_directory/backup/$file"
+		[[ "$(stat -c '%a' "$scoped_state_directory/backup/$file")" == 600 ]] || die 'Unsafe sealed backup file mode.'
+	done
+	install -m 600 "$scoped_state_directory/backup/acquisition.json" "$scoped_work_directory/acquisition.json"
+	scoped_backup_artifact="$scoped_state_directory/backup/operations.dump"
+	scoped_verifier backup-verify || die 'Sealed backup differs from its phase-A acquisition receipt.'
+}
+
+scoped_backup_acquire() {
+	local name id key value credential_count=0 deadline state available staging file
+	local -a live_ids=()
+	[[ "$operations_runtime_revision" == "$expected_live_revision" ]] || die 'Backup requires the exact live phase-A revision.'
+	scoped_state_directory="$app_root/deploy/backend/scoped-releases/operations-backlog/$operations_runtime_revision"
+	assert_root_owned_directory "$scoped_state_directory"
+	assert_root_owned_file "$scoped_state_directory/phase-a.json"
+	[[ "$(stat -c '%a' "$scoped_state_directory/phase-a.json")" == 600 ]] || die 'Unsafe phase-A receipt mode.'
+	install -m 600 "$scoped_state_directory/phase-a.json" "$scoped_work_directory/phase-a.json"
+	for name in operations-api operations-worker operations-outbox-publisher operations-restore-worker; do
+		id="$(scoped_container_id "$name")" || die 'A phase-A Operations role is not uniquely running.'
+		live_ids+=("$id")
+	done
+	docker inspect "${live_ids[@]}" >"$scoped_work_directory/backup-live.json"
+	chmod 600 "$scoped_work_directory/backup-live.json"
+	scoped_verifier backup-admission || die 'Backup requires matching phase-A runtime, source worker, database fence and restore-disabled configuration.'
+	if [[ -e "$scoped_state_directory/backup" || -L "$scoped_state_directory/backup" ]]; then
+		scoped_backup_load
+		scoped_assert_unchanged_neighbors
+		printf '%s\n' 'Existing sealed Operations backup verified read-only; no acquisition or phase-A replay performed.'
+		return
+	fi
+	available="$(df -Pk "$scoped_state_directory" | awk 'NR==2 {print $4}')"
+	[[ "$available" =~ ^[0-9]+$ && "$available" -ge 3145728 ]] || die 'Operations backup requires at least 3 GiB free local storage.'
+	# Extract exactly one already-hash-approved owner key, never source an env
+	# file and never expose its value in argv, Docker Env, logs or diagnostics.
+	while IFS='=' read -r key value; do
+		[[ "$key" == OPERATIONS_BACKUP_URL ]] || continue
+		credential_count=$((credential_count + 1))
+		[[ "$credential_count" == 1 && -n "$value" && ${#value} -le 4096 ]] || die 'Invalid owner backup credential structure.'
+		if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then value="${value:1:${#value}-2}"; fi
+		printf '%s' "$value" >"$scoped_work_directory/backup-url"
+	done <"$scoped_owner_env"
+	unset value
+	[[ "$credential_count" == 1 ]] || die 'Operations backup credential is absent.'
+	install -d -m 700 "$scoped_work_directory/backup-output"
+	install -m 400 "$scoped_work_directory/phase-a.json" "$scoped_work_directory/backup-phase-a.json"
+	chmod 400 "$scoped_work_directory/backup-url"
+	chown 1001:1001 "$scoped_work_directory/backup-url" "$scoped_work_directory/backup-phase-a.json" "$scoped_work_directory/backup-output"
+	scoped_backup_executor_image="$scoped_image_id"
+	scoped_backup_executor_id="$(docker create --network host --read-only --cap-drop ALL --security-opt no-new-privileges \
+		--user 1001:1001 --memory 512m --cpus 1 --pids-limit 64 --ulimit fsize=1073741824:1073741824 \
+		--label "winwidget.scoped-backup=$scoped_work_directory" \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--volume "$scoped_work_directory/backup-url:/run/operations-backup-url:ro" \
+		--volume "$scoped_work_directory/backup-phase-a.json:/run/phase-a.json:ro" \
+		--volume "$scoped_work_directory/backup-output:/run/backup" \
+		--entrypoint node "$scoped_backup_executor_image" /run/scoped-verifier.mjs backup-capture)" || die 'Owned backup executor creation failed.'
+	[[ "$scoped_backup_executor_id" =~ ^[a-f0-9]{64}$ ]] || die 'Invalid owned backup executor identity.'
+	docker start "$scoped_backup_executor_id" >/dev/null 2>&1 || die 'Owned backup executor start failed.'
+	deadline=$((SECONDS + 240))
+	while ((SECONDS < deadline)); do
+		state="$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}} {{.State.Pid}} {{.State.OOMKilled}}' "$scoped_backup_executor_id")" || die 'Owned backup executor state unavailable.'
+		[[ "$state" != 'exited 0 0 false' ]] || break
+		[[ "$state" == running\ * ]] || die 'Owned backup executor failed; no receipt was sealed.'
+		sleep 1
+	done
+	[[ "$state" == 'exited 0 0 false' ]] || die 'Owned backup deadline exceeded; no receipt was sealed.'
+	[[ "$(docker inspect --format '{{.Image}} {{index .Config.Labels "winwidget.scoped-backup"}}' "$scoped_backup_executor_id")" == "$scoped_backup_executor_image $scoped_work_directory" ]] || die 'Owned backup executor identity changed.'
+	for file in operations.dump capture.json; do
+		[[ -f "$scoped_work_directory/backup-output/$file" && ! -L "$scoped_work_directory/backup-output/$file" &&
+			"$(stat -c '%h' "$scoped_work_directory/backup-output/$file")" == 1 ]] || die 'Invalid owned backup output boundary.'
+		chown 0:0 "$scoped_work_directory/backup-output/$file"
+		chmod 600 "$scoped_work_directory/backup-output/$file"
+	done
+	install -m 600 "$scoped_work_directory/backup-output/capture.json" "$scoped_work_directory/capture.json"
+	scoped_backup_artifact="$scoped_work_directory/backup-output/operations.dump"
+	scoped_verifier backup-seal || die 'Owned backup output failed independent hash/identity validation.'
+	scoped_assert_unchanged_neighbors
+	# Only root writes the sealed chain. Atomic directory install makes a retry
+	# either verify the complete immutable pair or find no sealed artifact.
+	staging="$(mktemp -d "$scoped_state_directory/.backup.XXXXXX")"
+	chmod 700 "$staging"
+	mv -- "$scoped_backup_artifact" "$staging/operations.dump"
+	install -m 600 "$scoped_work_directory/acquisition.json" "$staging/acquisition.json"
+	sync -f "$staging/operations.dump"
+	sync -f "$staging/acquisition.json"
+	sync -f "$staging"
+	[[ ! -e "$scoped_state_directory/backup" && ! -L "$scoped_state_directory/backup" ]] || die 'A sealed backup appeared; refuse overwrite.'
+	mv -T -- "$staging" "$scoped_state_directory/backup"
+	sync -f "$scoped_state_directory"
+	scoped_backup_artifact="$scoped_state_directory/backup/operations.dump"
+	scoped_verifier backup-verify || die 'Installed backup failed final byte verification.'
+	scoped_assert_unchanged_neighbors
+	printf '%s\n' 'Operations file-only safety backup sealed; restore rehearsal remains a separate mandatory gate.'
 }
 
 scoped_database() {
@@ -261,6 +364,21 @@ scoped_cleanup() {
 	trap - EXIT
 	trap '' INT TERM HUP
 	set +e
+	if [[ "${scoped_backup_executor_id:-}" =~ ^[a-f0-9]{64}$ ]]; then
+		if [[ "$(docker inspect --format '{{.Image}} {{index .Config.Labels "winwidget.scoped-backup"}}' "$scoped_backup_executor_id" 2>/dev/null)" == "$scoped_backup_executor_image $scoped_work_directory" ]]; then
+			# Only this disposable, read-only dump executor; never a live worker.
+			docker rm --force "$scoped_backup_executor_id" >/dev/null 2>&1
+		fi
+	fi
+	if [[ -n "${scoped_work_directory:-}" ]]; then
+		for name in backup-url backup-phase-a.json; do
+			if [[ -f "$scoped_work_directory/$name" && ! -L "$scoped_work_directory/$name" ]]; then rm -- "$scoped_work_directory/$name"; fi
+		done
+		if [[ "$exit_code" == 0 && -d "$scoped_work_directory/backup-output" && ! -L "$scoped_work_directory/backup-output" ]]; then
+			find "$scoped_work_directory/backup-output" -mindepth 1 -maxdepth 1 -type f -delete
+			rmdir "$scoped_work_directory/backup-output"
+		fi
+	fi
 	if [[ "$exit_code" != 0 && "${scoped_identity_ddl_started:-false}" == true ]]; then
 		# A failed migration process does not prove PostgreSQL rolled back. Never
 		# let an old manifest sign a backup after a successful/unknown Identity DDL.
@@ -326,7 +444,7 @@ scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
-	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config)$ &&
+	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'
 	[[ "$(stat -Lc '%d:%i' "/proc/self/fd/$deploy_lock_fd")" == "$(stat -c '%d:%i' "$deploy_lock")" ]] ||
@@ -337,7 +455,7 @@ scoped_deploy_main() {
 		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-api billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
 		identity-with-operations-manifest) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-runtime) scoped_owner=operations; scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
-		operations-backlog-finalize) scoped_owner=operations; scoped_targets=() ;;
+		operations-backlog-backup | operations-backlog-finalize) scoped_owner=operations; scoped_targets=() ;;
 		gateway-remove-notes) scoped_owner=api-gateway; scoped_targets=(api-gateway) ;;
 	esac
 	scoped_owner_env="$services_repository/apps/$scoped_owner/.env.production"
@@ -460,8 +578,12 @@ scoped_deploy_main() {
 	fi
 	scoped_application_tree="$(git -C "$release_root" rev-parse "HEAD:apps/$scoped_owner")"
 	[[ "$scoped_application_tree" =~ ^[a-f0-9]{40}$ ]] || die 'Invalid scoped application tree identity.'
-	if [[ "$release_scope" == operations-runtime || "$release_scope" == operations-backlog-finalize ]]; then
+	if [[ "$release_scope" == operations-runtime || "$release_scope" == operations-backlog-backup || "$release_scope" == operations-backlog-finalize ]]; then
 		scoped_notes_checksum="$(sha256sum "$release_root/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql" | awk '{print $1}')"
+	fi
+	if [[ "$release_scope" == operations-backlog-backup ]]; then
+		scoped_backup_acquire
+		return
 	fi
 	if [[ "$release_scope" == operations-backlog-finalize ]]; then
 		[[ "$operations_runtime_revision" == "$expected_live_revision" && "$operations_evidence_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Invalid Operations finalization authority.'
@@ -471,6 +593,7 @@ scoped_deploy_main() {
 		assert_root_owned_file "$scoped_state_directory/phase-a.json"
 		install -m 600 "$scoped_state_directory/phase-a.json" "$scoped_work_directory/phase-a.json"
 		install -m 600 "$scoped_state_directory/restore-evidence.json" "$scoped_work_directory/restore-evidence.json"
+		scoped_backup_load
 		scoped_database pre-finalize
 		scoped_verifier evidence || die 'Operations safety backup has no matching successful isolated restore evidence.'
 		scoped_assert_unchanged_neighbors
@@ -562,6 +685,9 @@ scoped_deploy_main() {
 		# has begun. The relation remains present; this is not the drop migration.
 		scoped_fence_started=true
 		scoped_database fence
+		scoped_source_worker_id="$(scoped_container_id operations-worker)" || die 'Phase-A source worker is not uniquely running.'
+		scoped_source_worker_image="$(docker inspect --format '{{.Image}}' "$scoped_source_worker_id")"
+		[[ "$scoped_source_worker_image" == "$scoped_image_id" ]] || die 'Phase-A source worker image identity changed.'
 		scoped_verifier phase-a
 		for scoped_state_directory in "$app_root/deploy/backend/scoped-releases" "$app_root/deploy/backend/scoped-releases/operations-backlog" "$app_root/deploy/backend/scoped-releases/operations-backlog/$services_revision"; do
 			if [[ ! -e "$scoped_state_directory" && ! -L "$scoped_state_directory" ]]; then install -d -m 700 "$scoped_state_directory"; fi

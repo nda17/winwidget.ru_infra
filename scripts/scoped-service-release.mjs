@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, lstatSync, realpathSync, openSync, closeSync, fsyncSync, createReadStream } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,7 @@ export const SCOPED_SERVICES = Object.freeze({
 	'workers-bootstrap-recovery': ['billing-api', 'billing-worker', 'billing-outbox-publisher', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker', 'support-worker', 'support-outbox-publisher'],
 	'identity-with-operations-manifest': ['identity-api', 'identity-worker', 'identity-outbox-publisher', 'operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-runtime': ['operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
+	'operations-backlog-backup': [],
 	'operations-backlog-finalize': [],
 	'gateway-remove-notes': ['api-gateway']
 });
@@ -229,7 +231,168 @@ export function assertIdentityManifestCompanion(before, after, identityFiles) {
 	}
 }
 
-export function validateRestoreEvidence(evidence, receipt) {
+const BACKUP_LIMIT = 1024 ** 3;
+const instant = value => {
+	assert.equal(typeof value, 'string');
+	assert.equal(new Date(value).toISOString(), value);
+	return Date.parse(value);
+};
+function validatePhaseA(receipt) {
+	assert.equal(receipt.schemaVersion, 1);
+	assert.equal(receipt.kind, 'winwidget.operations.backlog-phase-a.v1');
+	assert.equal(receipt.notesWriteFenceApplied, true);
+	assert.match(receipt.databaseId ?? '', /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+	for (const key of ['operationsRuntimeRevision', 'operationsApplicationTree', 'infraRevision']) assert.match(receipt[key] ?? '', /^[a-f0-9]{40}$/);
+	for (const key of ['migrationManifestSha256', 'notesMigrationChecksum']) assert.match(receipt[key] ?? '', /^[a-f0-9]{64}$/);
+	assert.match(receipt.sourceWorkerContainerId ?? '', /^[a-f0-9]{64}$/);
+	assert.match(receipt.sourceWorkerImageId ?? '', /^sha256:[a-f0-9]{64}$/);
+	instant(receipt.fencedAt);
+}
+export function validateBackupAcquisition(acquisition, receipt) {
+	validatePhaseA(receipt);
+	assert.equal(acquisition.schemaVersion, 1);
+	assert.equal(acquisition.kind, 'winwidget.operations.backlog-backup-acquisition.v1');
+	assert.equal(acquisition.phaseAReceiptSha256, sha256(JSON.stringify(receipt)));
+	for (const key of ['databaseId', 'operationsRuntimeRevision', 'migrationManifestSha256', 'sourceWorkerContainerId', 'sourceWorkerImageId']) assert.equal(acquisition[key], receipt[key]);
+	assert.match(acquisition.executorContainerId ?? '', /^[a-f0-9]{64}$/);
+	assert.notEqual(acquisition.executorContainerId, acquisition.sourceWorkerContainerId);
+	assert.equal(acquisition.executorImageId, receipt.sourceWorkerImageId);
+	assert.equal(acquisition.backupRole, 'winwidget_operations_backup');
+	for (const key of ['artifactSha256', 'aclSha256']) assert.match(acquisition[key] ?? '', /^[a-f0-9]{64}$/);
+	assert.ok(Number.isSafeInteger(acquisition.artifactSize) && acquisition.artifactSize > 0 && acquisition.artifactSize <= BACKUP_LIMIT);
+	assert.match(acquisition.pgDumpVersion ?? '', /^pg_dump \(PostgreSQL\) 18\.\d+(?: .*)?$/);
+	assert.ok(instant(receipt.fencedAt) <= instant(acquisition.startedAt));
+	assert.ok(instant(acquisition.startedAt) <= instant(acquisition.completedAt));
+}
+
+// Role names/owners and normalized effective ACL, never role OIDs or customer
+// rows. The same statement runs under the read-only backup principal and in a
+// network-isolated restore. Database names deliberately stay outside acl.
+export const OPERATIONS_BACKUP_METADATA_SQL = `
+SELECT json_build_object(
+ 'databaseId', (SELECT database_id::text FROM operations.service_identity WHERE id='singleton' AND service_name='operations-service'),
+ 'identityRows', (SELECT count(*) FROM operations.service_identity),
+ 'database', current_database(), 'schema', 'operations',
+ 'notesPresent', to_regclass('operations.notes') IS NOT NULL,
+ 'runtimeCanWriteNotes', has_table_privilege('winwidget_operations_runtime','operations.notes','INSERT,UPDATE,DELETE,TRUNCATE') OR has_any_column_privilege('winwidget_operations_runtime','operations.notes','INSERT,UPDATE'),
+ 'runtimeCanReadNotes', has_table_privilege('winwidget_operations_runtime','operations.notes','SELECT'),
+ 'migrations', (SELECT json_agg(json_build_object('name',migration_name,'checksum',checksum) ORDER BY migration_name) FROM operations._prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL),
+ 'migrationRows', (SELECT count(*) FROM operations._prisma_migrations),
+ 'acl', json_build_object(
+  'schemas', (SELECT json_agg(json_build_array(nspname,pg_get_userbyid(nspowner),ARRAY(SELECT x::text FROM unnest(COALESCE(nspacl,acldefault('n',nspowner))) x ORDER BY x::text)) ORDER BY nspname) FROM pg_namespace WHERE nspname='operations'),
+  'relations', (SELECT json_agg(json_build_array(c.relname,c.relkind,pg_get_userbyid(c.relowner),ARRAY(SELECT x::text FROM unnest(COALESCE(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 's'::\"char\" ELSE 'r'::\"char\" END,c.relowner))) x ORDER BY x::text)) ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='operations' AND c.relkind IN ('r','p','v','m','S','f')),
+  'columns', (SELECT json_agg(json_build_array(c.relname,a.attname,ARRAY(SELECT x::text FROM unnest(a.attacl) x ORDER BY x::text)) ORDER BY c.relname,a.attname) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='operations' AND a.attacl IS NOT NULL AND a.attnum>0 AND NOT a.attisdropped),
+  'routines', (SELECT json_agg(json_build_array(p.proname,pg_get_function_identity_arguments(p.oid),pg_get_userbyid(p.proowner),ARRAY(SELECT x::text FROM unnest(COALESCE(p.proacl,acldefault('f',p.proowner))) x ORDER BY x::text)) ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='operations'),
+  'types', (SELECT json_agg(json_build_array(t.typname,t.typtype,pg_get_userbyid(t.typowner),ARRAY(SELECT x::text FROM unnest(COALESCE(t.typacl,acldefault('T',t.typowner))) x ORDER BY x::text)) ORDER BY t.typname) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace LEFT JOIN pg_class c ON c.oid=t.typrelid WHERE n.nspname='operations' AND (t.typtype IN ('e','d','r','m') OR (t.typtype='c' AND c.relkind='c'))),
+  'defaults', (SELECT json_agg(json_build_array(pg_get_userbyid(a.defaclrole),a.defaclobjtype,ARRAY(SELECT x::text FROM unnest(a.defaclacl) x ORDER BY x::text)) ORDER BY pg_get_userbyid(a.defaclrole),a.defaclobjtype) FROM pg_default_acl a JOIN pg_namespace n ON n.oid=a.defaclnamespace WHERE n.nspname='operations')
+ )) AS metadata;`;
+
+export function validateBackupMetadata(metadata, receipt) {
+	assert.equal(metadata.database, 'winwidget_operations');
+	assert.equal(metadata.schema, 'operations');
+	assert.equal(metadata.databaseId, receipt.databaseId);
+	assert.equal(metadata.identityRows, 1);
+	assert.equal(metadata.notesPresent, true);
+	assert.equal(metadata.runtimeCanWriteNotes, false);
+	assert.equal(metadata.runtimeCanReadNotes, true);
+	assert.ok(Array.isArray(metadata.migrations) && metadata.migrations.length > 0);
+	assert.equal(metadata.migrationRows, metadata.migrations.length);
+	assert.equal(metadata.migrations.some(row => row.name === NOTES_MIGRATION), false);
+	assert.equal(sha256(JSON.stringify({ schemaVersion: 1, target: 'operations', migrations: metadata.migrations })), receipt.migrationManifestSha256);
+	assert.ok(metadata.acl && Array.isArray(metadata.acl.schemas) && Array.isArray(metadata.acl.relations));
+}
+
+export async function backupArtifact(filename) {
+	assert.equal(realpathSync(filename), resolve(filename));
+	const before = lstatSync(filename);
+	assert.ok(before.isFile() && !before.isSymbolicLink() && before.nlink === 1 && before.size > 0 && before.size <= BACKUP_LIMIT);
+	const hash = createHash('sha256');
+	for await (const chunk of createReadStream(filename)) hash.update(chunk);
+	const after = lstatSync(filename);
+	for (const key of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) assert.equal(after[key], before[key]);
+	return { artifactSha256: hash.digest('hex'), artifactSize: before.size };
+}
+
+// This entrypoint is NOT the ordinary maintenance bootstrap: it receives only
+// one read-only backup URL file. No HTTP server, Rabbit/JWT/admin/migration,
+// provider or provenance signing credential enters this disposable executor.
+async function captureOperationsBackup() {
+	assert.equal(process.getuid(), 1001);
+	for (const key of Object.keys(process.env)) assert.equal(/DATABASE_URL|BACKUP_URL|TOKEN|PASSWORD|SECRET|PRIVATE_KEY|RABBIT|SMTP|TELEGRAM/i.test(key), false);
+	const credentialPath = '/run/operations-backup-url';
+	const credential = lstatSync(credentialPath);
+	assert.ok(credential.isFile() && !credential.isSymbolicLink() && credential.nlink === 1 && credential.uid === 1001 && (credential.mode & 0o777) === 0o400 && credential.size <= 4096);
+	const url = new URL(readFileSync(credentialPath, 'utf8').trim());
+	assert.ok(['postgres:', 'postgresql:'].includes(url.protocol));
+	assert.equal(url.hostname, '127.0.0.1');
+	assert.equal(url.port, '55441');
+	assert.equal(url.pathname, '/winwidget_operations');
+	assert.equal(decodeURIComponent(url.username), 'winwidget_operations_backup');
+	assert.ok(url.password && !url.hash);
+	for (const key of url.searchParams.keys()) assert.ok(['schema', 'connection_limit', 'pool_timeout', 'connect_timeout'].includes(key));
+	assert.equal(url.searchParams.get('schema'), 'operations');
+	url.searchParams.set('connection_limit', '1');
+	url.searchParams.set('pool_timeout', '5');
+	url.searchParams.set('connect_timeout', '5');
+	const receipt = JSON.parse(readFileSync('/run/phase-a.json', 'utf8'));
+	validatePhaseA(receipt);
+	const startedAt = new Date().toISOString();
+	assert.ok(instant(startedAt) >= instant(receipt.fencedAt));
+	const files = migrationFiles('/app/prisma/migrations');
+	assert.equal(files.at(-1).name, NOTES_MIGRATION);
+	assert.equal(files.at(-1).checksum, receipt.notesMigrationChecksum);
+	assert.equal(sha256(JSON.stringify({ schemaVersion: 1, target: 'operations', migrations: files.slice(0, -1) })), receipt.migrationManifestSha256);
+	const require = createRequire('/app/package.json');
+	const { PrismaClient } = require('@prisma/operations-client');
+	const client = new PrismaClient({ datasources: { db: { url: url.toString() } }, log: [] });
+	const childEnv = { PATH: process.env.PATH, LC_ALL: 'C', PGHOST: url.hostname, PGPORT: url.port,
+		PGDATABASE: 'winwidget_operations', PGUSER: 'winwidget_operations_backup', PGPASSWORD: decodeURIComponent(url.password),
+		PGSSLMODE: 'disable', PGCONNECT_TIMEOUT: '5', PGOPTIONS: '-c statement_timeout=180000 -c lock_timeout=10000 -c default_transaction_read_only=on' };
+	let child;
+	let descriptor;
+	const deadline = setTimeout(() => { child?.kill('SIGKILL'); process.exit(1); }, 210000);
+	const run = (args, fd) => new Promise((resolveRun, reject) => {
+		let output = '';
+		child = spawn('pg_dump', args, { env: childEnv, stdio: ['ignore', fd ?? 'pipe', 'ignore'] });
+		const timer = setTimeout(() => child.kill('SIGKILL'), 180000);
+		child.stdout?.on('data', chunk => { output += chunk; if (output.length > 256) child.kill('SIGKILL'); });
+		child.once('error', () => { clearTimeout(timer); reject(new Error('Backup client failed')); });
+		child.once('close', code => { clearTimeout(timer); code === 0 ? resolveRun(output.trim()) : reject(new Error('Backup client failed')); });
+	});
+	try {
+		const principal = await client.$queryRawUnsafe(`SELECT current_user AS username, current_database() AS database, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication,
+pg_has_role(current_user,'winwidget_operations_migration','MEMBER') AS migration_member, pg_has_role(current_user,'winwidget_operations_runtime','MEMBER') AS runtime_member,
+has_schema_privilege(current_user,'operations','CREATE') AS schema_create, has_database_privilege(current_user,current_database(),'CREATE') AS database_create,
+EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='operations' AND c.relkind IN ('r','p','v','m','f') AND (has_table_privilege(current_user,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR has_any_column_privilege(current_user,c.oid,'INSERT,UPDATE,REFERENCES'))) AS table_write,
+EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='operations' AND c.relkind='S' AND has_sequence_privilege(current_user,c.oid,'USAGE,UPDATE')) AS sequence_write
+FROM pg_roles WHERE rolname=current_user`);
+		assert.equal(principal.length, 1);
+		assert.equal(principal[0].username, 'winwidget_operations_backup');
+		assert.equal(principal[0].database, 'winwidget_operations');
+		for (const key of ['rolsuper', 'rolbypassrls', 'rolcreaterole', 'rolcreatedb', 'rolreplication', 'migration_member', 'runtime_member', 'schema_create', 'database_create', 'table_write', 'sequence_write']) assert.equal(principal[0][key], false);
+		const before = (await client.$queryRawUnsafe(OPERATIONS_BACKUP_METADATA_SQL))[0].metadata;
+		validateBackupMetadata(before, receipt);
+		const pgDumpVersion = await run(['--version']);
+		assert.match(pgDumpVersion, /^pg_dump \(PostgreSQL\) 18\.\d+(?: .*)?$/);
+		descriptor = openSync('/run/backup/operations.dump', 'wx', 0o600);
+		await run(['--format=custom', '--no-password', '--schema=operations', '--strict-names', '--lock-wait-timeout=10s'], descriptor);
+		fsyncSync(descriptor);
+		closeSync(descriptor); descriptor = undefined;
+		const artifact = await backupArtifact('/run/backup/operations.dump');
+		const after = (await client.$queryRawUnsafe(OPERATIONS_BACKUP_METADATA_SQL))[0].metadata;
+		same(after, before);
+		writeFileSync('/run/backup/capture.json', JSON.stringify({ ...artifact, aclSha256: sha256(JSON.stringify(before.acl)), pgDumpVersion,
+			startedAt, completedAt: new Date().toISOString(), databaseId: before.databaseId,
+			migrationManifestSha256: receipt.migrationManifestSha256 }), { mode: 0o600, flag: 'wx' });
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+		await client.$disconnect();
+		clearTimeout(deadline);
+	}
+}
+
+export function validateRestoreEvidence(evidence, receipt, acquisition) {
+	validateBackupAcquisition(acquisition, receipt);
 	assert.equal(evidence.schemaVersion, 1);
 	assert.equal(evidence.kind, 'winwidget.operations.backlog-backup-restore.v1');
 	assert.equal(receipt.schemaVersion, 1);
@@ -239,6 +402,10 @@ export function validateRestoreEvidence(evidence, receipt) {
 	assert.equal(evidence.phaseAReceiptSha256, sha256(JSON.stringify(receipt)));
 	for (const key of ['databaseId', 'operationsRuntimeRevision', 'migrationManifestSha256']) assert.equal(evidence[key], receipt[key]);
 	assert.match(evidence.artifactSha256, /^[a-f0-9]{64}$/);
+	assert.equal(evidence.artifactSha256, acquisition.artifactSha256);
+	assert.equal(evidence.artifactSize, acquisition.artifactSize);
+	assert.equal(evidence.acquisitionReceiptSha256, sha256(JSON.stringify(acquisition)));
+	assert.equal(evidence.restoredAclSha256, acquisition.aclSha256);
 	assert.match(evidence.restoreImageId, /^sha256:[a-f0-9]{64}$/);
 	assert.equal(evidence.postgresMajor, 18);
 	assert.equal(evidence.restoreExitCode, 0);
@@ -248,7 +415,7 @@ export function validateRestoreEvidence(evidence, receipt) {
 	assert.equal(evidence.unrelatedAuditRoundTripEqual, true);
 	assert.ok(Number.isSafeInteger(evidence.notesRows) && evidence.notesRows >= 0);
 	assert.ok(Number.isSafeInteger(evidence.backlogAuditRows) && evidence.backlogAuditRows >= 0);
-	assert.ok(Date.parse(evidence.restoredAt) >= Date.parse(receipt.fencedAt));
+	assert.ok(instant(evidence.restoredAt) >= instant(acquisition.completedAt));
 }
 
 export function migrationFiles(root) {
@@ -402,7 +569,54 @@ async function databaseAction(action, owner) {
 
 async function main() {
 	const action = process.argv[2];
-	if (action === 'prepare') {
+	if (action === 'backup-capture') await captureOperationsBackup();
+	else if (action === 'backup-admission') {
+		const receipt = JSON.parse(readFileSync('/run/scoped/phase-a.json', 'utf8'));
+		validatePhaseA(receipt);
+		assert.equal(receipt.operationsRuntimeRevision, process.env.SCOPED_REVISION);
+		assert.equal(receipt.operationsApplicationTree, process.env.SCOPED_APPLICATION_TREE);
+		assert.equal(receipt.notesMigrationChecksum, process.env.SCOPED_NOTES_CHECKSUM);
+		const live = JSON.parse(readFileSync('/run/scoped/backup-live.json', 'utf8'));
+		assert.equal(live.length, 4);
+		for (const name of SCOPED_SERVICES['operations-runtime']) {
+			const found = live.filter(item => item.Config.Labels['com.docker.compose.service'] === name);
+			assert.equal(found.length, 1);
+			const item = found[0];
+			assert.equal(item.Config.Labels['com.docker.compose.project'], 'winwidget');
+			assert.equal(item.Config.Labels['org.opencontainers.image.revision'], receipt.operationsRuntimeRevision);
+			assert.equal(item.Image, receipt.sourceWorkerImageId);
+			assert.equal(item.State.Status, 'running');
+			assert.equal(item.State.Health?.Status, 'healthy');
+			if (name === 'operations-worker') assert.equal(item.Id, receipt.sourceWorkerContainerId);
+			if (['operations-api', 'operations-restore-worker'].includes(name)) assert.equal(envObject(item.Config.Env).DATABASE_RESTORE_ENABLED, 'false');
+		}
+	} else if (action === 'backup-seal') {
+		assert.equal(process.getuid(), 0);
+		const receipt = JSON.parse(readFileSync('/run/scoped/phase-a.json', 'utf8'));
+		const capture = JSON.parse(readFileSync('/run/scoped/capture.json', 'utf8'));
+		const artifact = await backupArtifact('/run/scoped-artifact.dump');
+		for (const key of ['artifactSha256', 'artifactSize']) assert.equal(capture[key], artifact[key]);
+		for (const key of ['databaseId', 'migrationManifestSha256']) assert.equal(capture[key], receipt[key]);
+		const acquisition = {
+			schemaVersion: 1, kind: 'winwidget.operations.backlog-backup-acquisition.v1',
+			phaseAReceiptSha256: sha256(JSON.stringify(receipt)), databaseId: receipt.databaseId,
+			operationsRuntimeRevision: receipt.operationsRuntimeRevision, migrationManifestSha256: receipt.migrationManifestSha256,
+			sourceWorkerContainerId: receipt.sourceWorkerContainerId, sourceWorkerImageId: receipt.sourceWorkerImageId,
+			executorContainerId: process.env.SCOPED_BACKUP_EXECUTOR_ID, executorImageId: process.env.SCOPED_BACKUP_EXECUTOR_IMAGE,
+			backupRole: 'winwidget_operations_backup', startedAt: capture.startedAt, completedAt: capture.completedAt,
+			...artifact, aclSha256: capture.aclSha256, pgDumpVersion: capture.pgDumpVersion
+		};
+		validateBackupAcquisition(acquisition, receipt);
+		writeFileSync('/run/scoped/acquisition.json', JSON.stringify(acquisition), { mode: 0o600, flag: 'wx' });
+	} else if (action === 'backup-verify') {
+		const receipt = JSON.parse(readFileSync('/run/scoped/phase-a.json', 'utf8'));
+		const bytes = readFileSync('/run/scoped/acquisition.json');
+		const acquisition = JSON.parse(bytes);
+		assert.equal(bytes.toString(), JSON.stringify(acquisition));
+		validateBackupAcquisition(acquisition, receipt);
+		const artifact = await backupArtifact('/run/scoped-artifact.dump');
+		for (const key of ['artifactSha256', 'artifactSize']) assert.equal(acquisition[key], artifact[key]);
+	} else if (action === 'prepare') {
 		const input = {
 			scope: process.env.SCOPED_SCOPE,
 			revision: process.env.SCOPED_REVISION,
@@ -436,6 +650,9 @@ async function main() {
 			fencedAt: new Date().toISOString(),
 			notesWriteFenceApplied: true
 		};
+		receipt.sourceWorkerContainerId = process.env.SCOPED_SOURCE_WORKER_ID;
+		receipt.sourceWorkerImageId = process.env.SCOPED_SOURCE_WORKER_IMAGE;
+		validatePhaseA(receipt);
 		assert.match(receipt.databaseId ?? '', /^[a-f0-9-]{36}$/);
 		for (const key of ['operationsRuntimeRevision', 'operationsApplicationTree', 'infraRevision']) assert.match(receipt[key] ?? '', /^[a-f0-9]{40}$/);
 		assert.match(receipt.migrationManifestSha256 ?? '', /^[a-f0-9]{64}$/);
@@ -443,7 +660,7 @@ async function main() {
 		writeFileSync('/run/scoped/phase-a.json', JSON.stringify(receipt), { mode: 0o600, flag: 'wx' });
 	} else if (action === 'evidence') {
 		const receipt = JSON.parse(readFileSync('/run/scoped/phase-a.json', 'utf8'));
-		validateRestoreEvidence(JSON.parse(readFileSync('/run/scoped/restore-evidence.json', 'utf8')), receipt);
+		validateRestoreEvidence(JSON.parse(readFileSync('/run/scoped/restore-evidence.json', 'utf8')), receipt, JSON.parse(readFileSync('/run/scoped/acquisition.json', 'utf8')));
 		assert.equal(receipt.operationsRuntimeRevision, process.env.SCOPED_REVISION);
 		assert.equal(receipt.operationsApplicationTree, process.env.SCOPED_APPLICATION_TREE);
 		assert.equal(receipt.databaseId, process.env.SCOPED_DATABASE_ID);
@@ -452,7 +669,7 @@ async function main() {
 	} else if (action === 'finalized') {
 		const receipt = JSON.parse(readFileSync('/run/scoped/phase-a.json', 'utf8'));
 		const evidence = JSON.parse(readFileSync('/run/scoped/restore-evidence.json', 'utf8'));
-		validateRestoreEvidence(evidence, receipt);
+		validateRestoreEvidence(evidence, receipt, JSON.parse(readFileSync('/run/scoped/acquisition.json', 'utf8')));
 		const result = {
 			schemaVersion: 1, kind: 'winwidget.operations.backlog-finalized.v1',
 			databaseId: receipt.databaseId,

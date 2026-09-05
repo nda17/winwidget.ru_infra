@@ -292,12 +292,38 @@ non-root migration image мог прочитать его через точеч�
   Root-only receipt сохраняется в
   `/opt/winwidget/deploy/backend/scoped-releases/operations-backlog/<runtime-sha>/phase-a.json`.
   После начала fence старый Notes-capable runtime автоматически не возвращается.
+- `operations-backlog-backup` — отдельный file-only этап после фазы A. Передаются
+  точные live `expected_live_revision=operations_runtime_revision`, owner env SHA
+  и тот же immutable services source. Существующий deploy lock, env/neighbor
+  inventory, phase-A application tree и четыре healthy Operations процесса
+  обязательны. Source maintenance-worker ID/image записаны в phase-A receipt;
+  его подмена или пересоздание требует отдельного согласования, не нового dump.
+  Этот scope не выполняет build, Compose up, DDL, API/provider calls или повтор
+  фазы A. Live worker не исполняет capture: отдельный disposable executor на том
+  же image ID получает только `OPERATIONS_BACKUP_URL` в RO0400-файле, UID1001,
+  read-only rootfs, dropped capabilities, no-new-privileges и лимиты ресурсов.
+  Ни JWT, Rabbit, Telegram, admin/migration URL, ни signing key в него не входят.
+  URL допускает только собственную backup-роль, Operations DB/schema и приватный
+  loopback endpoint. `pg_dump` 18 сохраняет owners и ACL; Notes должны оставаться
+  read-only для runtime. До/после проверяются UUID, ledger и schema ACL, не PII.
+  После exit0/root hash+size verification атомарно устанавливается root0700
+  `backup/` с `operations.dump` и `acquisition.json` (оба root0600) рядом с
+  `phase-a.json`. Receipt связывает source worker и отдельный executor, image,
+  phase-A hash, UUID/ledger, время capture после fence, dump SHA/size и ACL SHA.
+  Размер ограничен 1 GiB, capture — 210 секундами, начальный free disk — 3 GiB.
+  Повтор scope только read-only проверяет уже sealed pair, не перезаписывает его.
+  При ошибке секрет удаляется, собственный executor убирается; частичные private
+  файлы сохраняются для проверки, receipt не подделывается. Этот artifact не
+  объявляется обычным signed Telegram backup. Обычный maintenance flow неизменён.
 - `operations-backlog-finalize` — фаза B, без пересоздания runtime.
   `operations_runtime_revision` должен совпасть с live phase-A revision;
   `operations_evidence_sha256` закрепляет файл `restore-evidence.json` рядом с
   receipt. Обязательны свежий service-owned safety backup после fence,
   проверенный hash артефакта, реальный isolated restore, совпадение database UUID,
   phase-A/application tree, migration checksum/ledger и повторный writer fence.
+  Controller сам повторно проверяет root-sealed acquisition и байты dump;
+  restore evidence обязано совпасть с их SHA/size и восстановленным schema ACL.
+  Старые receipts без acquisition/source-worker binding не принимаются.
   Только затем запускается Operations migration. Она атомарно удаляет
   `operations.notes` и точные старые Backlog audit rows, не остальные журналы.
   После проверки создаётся `finalized.json`. При прерывании после DDL требуется
@@ -322,6 +348,8 @@ SQL migration используется существующий immutable Postgr
 node scripts/verify-operations-backlog-backup.mjs \
   --artifact /absolute/private/operations-safety.dump \
   --artifact-sha256 APPROVED_64_HEX \
+  --acquisition /absolute/private/acquisition.json \
+  --acquisition-sha256 APPROVED_64_HEX \
   --phase-a /absolute/private/phase-a.json \
   --migration /absolute/release/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql \
   --image sha256:APPROVED_64_HEX \
@@ -329,11 +357,16 @@ node scripts/verify-operations-backlog-backup.mjs \
 ```
 
 Producer принимает только локальный Unix-socket Docker context, создаёт
-уникальный network-isolated PostgreSQL 18 с tmpfs, восстанавливает dump с ACL,
+уникальный network-isolated PostgreSQL 18 с tmpfs, восстанавливает dump с owners
+и ACL (без `--no-owner`/`--no-privileges`), сравнивает fingerprint schema,
+relations/columns/routines/types/default ACL с acquisition,
 проверяет fence/ledger/database UUID, выполняет именно данный SQL и доказывает
 сохранение остальных audit rows. Повторный restore исходного dump доказывает
 восстановимость удаляемых данных. После exact cleanup выводится только hash
 evidence; synthetic CI proof не заменяет этот прогон production backup.
+Выгрузка production artifact и isolated restore остаются отдельными действиями:
+сохраняются существующие privacy/capacity gates, включая 6 GiB MemAvailable для
+production restore rehearsal. File-only capture на backend этот gate не отменяет.
 Backup copies сохраняются до обычного retention; удаление активного Backlog
 не означает мгновенное уничтожение всех архивных копий.
 

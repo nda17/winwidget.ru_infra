@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, or operations-federation-config
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, or operations-federation-config
         default: all
         type: string
       expected_live_revision:

@@ -18,6 +18,7 @@ import {
 	migrationFiles,
 	prepareScopedCompose,
 	sha256,
+	validateBackupAcquisition,
 	validateRestoreEvidence,
 	verifyDatabaseState
 } from './scoped-service-release.mjs'
@@ -626,8 +627,21 @@ function restoreFixture() {
 		operationsRuntimeRevision: oldRevision,
 		migrationManifestSha256: envHash,
 		notesMigrationChecksum: 'e'.repeat(64),
+		operationsApplicationTree: revision,
+		infraRevision: revision,
+		sourceWorkerContainerId: '2'.repeat(64),
+		sourceWorkerImageId: `sha256:${'3'.repeat(64)}`,
 		fencedAt: '2026-09-05T20:00:00.000Z',
 		notesWriteFenceApplied: true
+	}
+	const acquisition = {
+		schemaVersion: 1, kind: 'winwidget.operations.backlog-backup-acquisition.v1',
+		phaseAReceiptSha256: sha256(JSON.stringify(receipt)), databaseId: receipt.databaseId,
+		operationsRuntimeRevision: receipt.operationsRuntimeRevision, migrationManifestSha256: receipt.migrationManifestSha256,
+		sourceWorkerContainerId: receipt.sourceWorkerContainerId, sourceWorkerImageId: receipt.sourceWorkerImageId,
+		executorContainerId: '4'.repeat(64), executorImageId: receipt.sourceWorkerImageId,
+		backupRole: 'winwidget_operations_backup', startedAt: '2026-09-05T20:01:00.000Z', completedAt: '2026-09-05T20:02:00.000Z',
+		artifactSha256: 'f'.repeat(64), artifactSize: 42, aclSha256: '5'.repeat(64), pgDumpVersion: 'pg_dump (PostgreSQL) 18.4 (Debian 18.4-1.pgdg12+1)'
 	}
 	const evidence = {
 		schemaVersion: 1,
@@ -637,6 +651,9 @@ function restoreFixture() {
 		operationsRuntimeRevision: receipt.operationsRuntimeRevision,
 		migrationManifestSha256: receipt.migrationManifestSha256,
 		artifactSha256: 'f'.repeat(64),
+		artifactSize: acquisition.artifactSize,
+		acquisitionReceiptSha256: sha256(JSON.stringify(acquisition)),
+		restoredAclSha256: acquisition.aclSha256,
 		restoreImageId: `sha256:${'1'.repeat(64)}`,
 		postgresMajor: 18,
 		restoreExitCode: 0,
@@ -648,12 +665,12 @@ function restoreFixture() {
 		backlogAuditRows: 4,
 		restoredAt: '2026-09-05T20:10:00.000Z'
 	}
-	return { receipt, evidence }
+	return { receipt, evidence, acquisition }
 }
 
 test('restore admission binds actual restore, Notes fence, database and phase-A identity', () => {
-	const { receipt, evidence } = restoreFixture()
-	validateRestoreEvidence(evidence, receipt)
+	const { receipt, evidence, acquisition } = restoreFixture()
+	validateRestoreEvidence(evidence, receipt, acquisition)
 	for (const patch of [
 		{ schemaVersion: 2 }, { phaseAReceiptSha256: envHash }, { databaseId: 'another-database' },
 		{ operationsRuntimeRevision: revision }, { migrationManifestSha256: 'f'.repeat(64) },
@@ -661,14 +678,29 @@ test('restore admission binds actual restore, Notes fence, database and phase-A 
 		{ artifactSha256: 'mutable' }, { restoreImageId: 'postgres:latest' },
 		{ notesTablePresent: false }, { restoredNotesWriteFence: false },
 		{ unrelatedAuditRoundTripEqual: false }, { notesRows: -1 }, { backlogAuditRows: 1.1 },
+		{ acquisitionReceiptSha256: envHash }, { restoredAclSha256: envHash }, { artifactSize: 43 },
 		{ restoredAt: '2026-09-05T19:00:00.000Z' }, { restoredAt: 'not-a-date' }
 	]) {
-		assert.throws(() => validateRestoreEvidence({ ...evidence, ...patch }, receipt), undefined, JSON.stringify(patch))
+		assert.throws(() => validateRestoreEvidence({ ...evidence, ...patch }, receipt, acquisition), undefined, JSON.stringify(patch))
 	}
-	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesWriteFenceApplied: false }))
-	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesMigrationChecksum: undefined }))
-	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesMigrationChecksum: 'not-a-hash' }))
-	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesMigrationChecksum: 'f'.repeat(64) }))
+	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesWriteFenceApplied: false }, acquisition))
+	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesMigrationChecksum: undefined }, acquisition))
+	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesMigrationChecksum: 'not-a-hash' }, acquisition))
+	assert.throws(() => validateRestoreEvidence(evidence, { ...receipt, notesMigrationChecksum: 'f'.repeat(64) }, acquisition))
+})
+
+test('acquisition rejects old receipts, wrong executor/owner and pre-fence or inverted time', () => {
+	const { receipt, acquisition } = restoreFixture()
+	validateBackupAcquisition(acquisition, receipt)
+	for (const patch of [
+		{ schemaVersion: 2 }, { kind: 'untrusted' }, { phaseAReceiptSha256: envHash },
+		{ databaseId: '22222222-2222-2222-2222-222222222222' }, { sourceWorkerContainerId: '6'.repeat(64) },
+		{ executorContainerId: receipt.sourceWorkerContainerId }, { executorImageId: `sha256:${'6'.repeat(64)}` },
+		{ backupRole: 'winwidget_operations_migration' }, { artifactSize: 0 }, { artifactSize: 1024 ** 3 + 1 },
+		{ artifactSha256: 'invalid' }, { aclSha256: 'invalid' }, { pgDumpVersion: 'pg_dump (PostgreSQL) 17.9' },
+		{ startedAt: '2026-09-05T19:00:00.000Z' }, { completedAt: '2026-09-05T20:00:30.000Z' }, { startedAt: 'invalid' }
+	]) assert.throws(() => validateBackupAcquisition({ ...acquisition, ...patch }, receipt), undefined, JSON.stringify(patch))
+	assert.throws(() => validateBackupAcquisition(acquisition, { ...receipt, sourceWorkerContainerId: undefined }))
 })
 
 // Execute the real sourced Bash coordinator. Only process/host boundaries are
@@ -701,21 +733,24 @@ expected_operations_env_sha256="$TEST_ENV_HASH"
 expected_support_env_sha256="$TEST_ENV_HASH"
 operations_runtime_revision=''
 operations_evidence_sha256=''
-if [[ "$release_scope" == operations-backlog-finalize ]]; then
+if [[ "$release_scope" == operations-backlog-finalize || "$release_scope" == operations-backlog-backup ]]; then
   operations_runtime_revision="$expected_live_revision"
-  operations_evidence_sha256="$TEST_EVIDENCE_HASH"
+  if [[ "$release_scope" == operations-backlog-finalize ]]; then operations_evidence_sha256="$TEST_EVIDENCE_HASH"; fi
 fi
 die() { printf '%s\n' "$1" >&2; exit 1; }
 assert_root_owned_file() { [[ -f "$1" && ! -L "$1" ]] || die 'Synthetic file boundary'; }
 assert_root_owned_directory() { [[ -d "$1" && ! -L "$1" ]] || die 'Synthetic directory boundary'; }
 cleanup_scoped_payload() { printf 'CLEANUP_PAYLOAD\n' >>"$SCOPED_CALLS"; }
 stat() {
-  case "$2" in '%d:%i') printf '11:22\n' ;; '%a') printf '600\n' ;; *) return 81 ;; esac
+  case "$2" in '%d:%i') printf '11:22\n' ;; '%a') printf '600\n' ;; '%h') printf '1\n' ;; *) return 81 ;; esac
 }
+chown() { :; }
+df() { printf 'Filesystem blocks used available capacity mount\nfixture 9000000 1 8000000 1%% /\n'; }
+mv() { if [[ "$1" == -T ]]; then shift; fi; command mv "$@"; }
 flock() { [[ "$TEST_SCENARIO" != lost-lock ]]; }
 sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); for(const p of process.argv.slice(1))console.log(c.createHash("sha256").update(f.readFileSync(p)).digest("hex")+"  "+p)' "$@"; }
 sync() { :; }
-sleep() { if [[ "$TEST_SCENARIO" == stop-timeout || "$TEST_SCENARIO" == still-running ]]; then SECONDS=$((SECONDS + 60)); fi; }
+sleep() { if [[ "$TEST_SCENARIO" == stop-timeout || "$TEST_SCENARIO" == still-running || "$TEST_SCENARIO" == fresh-timeout ]]; then SECONDS=$((SECONDS + 60)); fi; }
 git() {
   if [[ " $* " == *' cat-file '* ]]; then [[ "$TEST_SCENARIO" != mixed-helper-missing ]]; return; fi
   if [[ " $* " == *' diff '* ]]; then
@@ -786,6 +821,10 @@ docker() {
       if [[ "${'${'}2:-}" != --format ]]; then printf '[]\n'; return 0; fi
       format="$3"
       case "$format" in
+        '{{.Image}}') printf '%s\n' "$image" ;;
+        '{{.Image}} {{index .Config.Labels "winwidget.scoped-backup"}}') printf '%s %s\n' "$image" "$scoped_work_directory" ;;
+        '{{.State.Status}} {{.State.ExitCode}} {{.State.Pid}} {{.State.OOMKilled}}')
+          case "$TEST_SCENARIO" in fresh-exit-failed) printf 'exited 1 0 false\n' ;; fresh-timeout) printf 'running 0 123 false\n' ;; *) printf 'exited 0 0 false\n' ;; esac ;;
         '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}') printf '%s %s\n' "$image" "$rev" ;;
         '{{.State.Running}} {{.State.Pid}}')
           if [[ -f "$SCOPED_FIXTURE/stopped-$last" && "$TEST_SCENARIO" != still-running ]]; then printf 'false 0\n'; else printf 'true 123\n'; fi ;;
@@ -813,7 +852,15 @@ docker() {
       for arg in "$@"; do
         if [[ "$arg" =~ ^[a-f0-9]{64}$ ]]; then printf stopped >"$SCOPED_FIXTURE/stopped-$arg"; fi
       done ;;
+    create) printf '%064d\n' 99 ;;
+    rm) : ;;
     start)
+      if [[ "$TEST_SCOPE" == operations-backlog-backup ]]; then
+        if [[ "$TEST_SCENARIO" == fresh-hup ]]; then kill -HUP "$$"; fi
+        if [[ "$TEST_SCENARIO" == fresh-term ]]; then kill -TERM "$$"; fi
+        printf synthetic >"$scoped_work_directory/backup-output/operations.dump"
+        printf '{}' >"$scoped_work_directory/backup-output/capture.json"
+      fi
       for arg in "$@"; do
         if [[ "$arg" =~ ^[a-f0-9]{64}$ ]]; then rm -f -- "$SCOPED_FIXTURE/stopped-$arg"; fi
       done ;;
@@ -877,6 +924,11 @@ docker() {
           printf '{}\n' >"$scoped_work_directory/desired.json"
           printf '{}\n' >"$scoped_work_directory/rollback.json" ;;
         phase-a) printf '{}\n' >"$scoped_work_directory/phase-a.json" ;;
+        backup-admission) [[ "$TEST_SCENARIO" != backup-admission-failed ]] ;;
+        backup-verify) [[ "$TEST_SCENARIO" != backup-corrupt ]] ;;
+        backup-seal)
+          [[ "$TEST_SCENARIO" != fresh-seal-failed ]] || return 1
+          printf '{}' >"$scoped_work_directory/acquisition.json" ;;
         evidence) [[ "$TEST_SCENARIO" != evidence-failed ]] ;;
         finalized) printf '{}\n' >"$scoped_work_directory/finalized.json" ;;
         *) return 85 ;;
@@ -895,7 +947,7 @@ function runRuntime(scope, scenario = 'success') {
 			'services/apps/operations', 'services/apps/api-gateway', 'services/apps/identity', 'services/apps/billing', 'services/apps/support',
 			`deploy/backend/scoped-releases/operations-backlog/${oldRevision}`
 		]) mkdirSync(join(root, relative), { recursive: true })
-		const env = 'SYNTHETIC_ONLY=true\n'
+		const env = 'SYNTHETIC_ONLY=true\n' + (scope === 'operations-backlog-backup' ? 'OPERATIONS_BACKUP_URL=synthetic-only-private-backup-url\n' : '')
 		for (const relative of [
 			'deploy/backend/.env.production', 'services/apps/operations/.env.production',
 			'services/apps/api-gateway/.env.production', 'services/apps/identity/.env.production', 'services/apps/billing/.env.production', 'services/apps/support/.env.production'
@@ -906,6 +958,11 @@ function runRuntime(scope, scenario = 'success') {
 		}
 		for (const name of ['phase-a.json', 'restore-evidence.json']) {
 			writeFileSync(join(root, `deploy/backend/scoped-releases/operations-backlog/${oldRevision}`, name), '{}\n', { mode: 0o600 })
+		}
+		const backupDirectory = join(root, `deploy/backend/scoped-releases/operations-backlog/${oldRevision}/backup`)
+		if (!scenario.startsWith('fresh-')) {
+			mkdirSync(backupDirectory)
+			for (const name of ['acquisition.json', 'operations.dump']) writeFileSync(join(backupDirectory, name), '{}', { mode: 0o600 })
 		}
 		writeFileSync(join(root, 'release/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql'), '-- synthetic, never executed\n')
 		const calls = join(directory, 'calls')
@@ -927,7 +984,9 @@ function runRuntime(scope, scenario = 'success') {
 		})
 		assert.equal(result.error, undefined, result.stderr)
 		assert.equal(result.signal, null, result.stderr)
-		return { ...result, calls: readFileSync(calls, 'utf8'), phase: readFileSync(phase, 'utf8'), stopped: readdirSync(directory).filter(name => name.startsWith('stopped-')).sort() }
+		const retainedSecrets = readdirSync(join(root, 'deploy/backend')).filter(name => name.startsWith('.scoped-release.'))
+			.flatMap(name => ['backup-url', 'backup-phase-a.json'].filter(file => existsSync(join(root, 'deploy/backend', name, file))))
+		return { ...result, calls: readFileSync(calls, 'utf8'), phase: readFileSync(phase, 'utf8'), stopped: readdirSync(directory).filter(name => name.startsWith('stopped-')).sort(), retainedSecrets, sealedBackup: existsSync(join(backupDirectory, 'acquisition.json')) }
 	})
 }
 
@@ -1182,11 +1241,41 @@ test('real finalization requires evidence before the single Notes migration and 
 	assert.ok(!result.calls.includes('<up>'), result.calls)
 	assert.deepEqual(result.calls.split('\n').filter(line => line.startsWith('MIGRATE ')), ['MIGRATE operations-migrate'])
 	assert.ok(result.calls.indexOf('<evidence>') < result.calls.indexOf('MIGRATE operations-migrate'))
+	assert.ok(result.calls.indexOf('<backup-verify>') < result.calls.indexOf('<evidence>'))
 	assert.ok(result.calls.indexOf('<post-migration>') > result.calls.indexOf('MIGRATE operations-migrate'))
 	const failed = runRuntime('operations-backlog-finalize', 'post-migration-failed')
 	assert.notEqual(failed.status, 0)
 	assert.ok(!failed.calls.includes('<up>'), failed.calls)
 	assert.match(failed.stderr, /recovery snapshots retained/)
+})
+
+test('file-only backup scope verifies a sealed retry without cutover, migration, providers or phase-A replay', () => {
+	for (const scenario of ['success', 'backup-admission-failed', 'backup-corrupt']) {
+		const result = runRuntime('operations-backlog-backup', scenario)
+		assert.equal(result.status === 0, scenario === 'success', result.stderr)
+		for (const forbidden of ['<build>', '<up>', 'MIGRATE ', '<database>', '<kill>', '<start>', '<backup-capture>', '<phase-a>']) assert.ok(!result.calls.includes(forbidden), result.calls)
+		assert.ok(result.calls.includes('<backup-admission>'))
+		if (scenario === 'success') assert.match(result.stdout, /verified read-only/)
+	}
+})
+
+test('fresh file-only coordinator seals only exit0 and cleans its executor/secret on failure or signal', () => {
+	for (const scenario of ['fresh-success', 'fresh-exit-failed', 'fresh-timeout', 'fresh-seal-failed', 'fresh-hup', 'fresh-term']) {
+		const result = runRuntime('operations-backlog-backup', scenario)
+		assert.equal(result.status === 0, scenario === 'fresh-success', `${scenario}\n${result.stderr}`)
+		assert.equal(result.sealedBackup, scenario === 'fresh-success', scenario)
+		assert.deepEqual(result.retainedSecrets, [], scenario)
+		assert.ok(result.calls.includes('DOCKER <create>'), result.calls)
+		assert.ok(result.calls.includes('DOCKER <rm> <--force> <' + String(99).padStart(64, '0') + '>'), result.calls)
+		for (const forbidden of ['<build>', '<up>', 'MIGRATE ', '<database>', '<phase-a>', '<--env-file>', 'synthetic-only-private-backup-url']) assert.ok(!result.calls.includes(forbidden), result.calls)
+		const create = result.calls.split('\n').find(line => line.startsWith('DOCKER <create>'))
+		for (const required of ['<--network> <host>', '<--user> <1001:1001>', '<--read-only>', '<--cap-drop> <ALL>', '<--security-opt> <no-new-privileges>', '<--memory> <512m>', '<--ulimit> <fsize=1073741824:1073741824>', '/run/operations-backup-url:ro>', '<backup-capture>']) assert.ok(create.includes(required), create)
+		assert.ok(!create.includes('<--env>'), create)
+		if (scenario === 'fresh-success') {
+			assert.ok(result.calls.indexOf('<backup-seal>') > result.calls.indexOf('DOCKER <start>'))
+			assert.ok(result.calls.indexOf('<backup-verify>') > result.calls.indexOf('<backup-seal>'))
+		}
+	}
 })
 
 test('coordinated Identity deployment builds and verifies both images before fencing four Operations processes', () => {
