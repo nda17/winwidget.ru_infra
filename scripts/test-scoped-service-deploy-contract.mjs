@@ -231,22 +231,27 @@ function composeFixture(scope = identityScope) {
 	return { scope, revision, previousRevision: oldRevision, operationsPreviousRevision: oldRevision, compose: { services }, live, image, operationsImage, supportImage }
 }
 
-test('worker Compose admits exactly seven running workers, three images and no API or scheduler', () => {
+test('worker Compose requires its healthy same-revision Billing API companion and excludes all other APIs/schedulers', () => {
 	const input = composeFixture(workerScope)
-	input.live.forEach((container, index) => { container.State.Health.Status = index % 2 ? 'healthy' : 'unhealthy' })
+	for (const name of ['billing-scheduler', 'operations-api', 'support-api']) input.compose.services[name] = { image: 'preserve-this-neighbor' }
+	input.live.forEach((container, index) => { container.State.Health.Status = index % 2 ? 'unhealthy' : 'healthy' })
 	const { desired, rollback } = prepareScopedCompose(input)
 	assert.deepEqual(Object.keys(desired.services), SCOPED_SERVICES[workerScope])
 	assert.deepEqual(Object.keys(rollback.services), SCOPED_SERVICES[workerScope])
+	assert.equal(Object.keys(desired.services).length, 8)
+	assert.equal(desired.services['billing-api'].image, desired.services['billing-worker'].image)
+	assert.equal(desired.services['billing-api'].environment.APP_REVISION, desired.services['billing-worker'].environment.APP_REVISION)
 	for (const [name, service] of Object.entries(desired.services)) {
 		assert.equal(service.image, name.startsWith('operations-') ? input.operationsImage.Id : name.startsWith('support-') ? input.supportImage.Id : input.image.Id)
 		assert.equal(service.build, undefined)
 		assert.equal(service.depends_on, undefined)
-		assert.ok(!name.endsWith('-api') && !name.endsWith('-scheduler'))
+		assert.ok((!name.endsWith('-api') || name === 'billing-api') && !name.endsWith('-scheduler'))
 		assert.equal(rollback.services[name].image, input.live.find(container => container.Config.Labels['com.docker.compose.service'] === name).Image)
 	}
 	for (const mutate of [
 		candidate => { candidate.live[0].State.Status = 'exited' },
 		candidate => { candidate.live[0].State.Health.Status = 'starting' },
+		candidate => { candidate.live[0].State.Health.Status = 'unhealthy' },
 		candidate => { candidate.live[0].Config.Labels['org.opencontainers.image.revision'] = revision },
 		candidate => { candidate.supportImage.Config.Labels['org.opencontainers.image.revision'] = oldRevision },
 		candidate => { candidate.operationsImage = undefined },
@@ -707,6 +712,8 @@ docker() {
   if [[ "$current" == desired && "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
     if [[ "$last" =~ ^0+[1-4]$ ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
     if [[ "$last" =~ ^0+(10|11|12)$ ]]; then image="$TEST_SUPPORT_IMAGE"; fi
+    if [[ "$last" =~ ^0+8$ && "$TEST_SCENARIO" == billing-api-image-drift ]]; then image="$TEST_OLD_IMAGE"; fi
+    if [[ "$last" =~ ^0+8$ && "$TEST_SCENARIO" == billing-api-revision-drift ]]; then rev="$TEST_PREVIOUS_REVISION"; fi
   fi
   case "$1" in
     ps)
@@ -777,7 +784,7 @@ docker() {
       if [[ "$action" == config ]]; then printf '{}\n'; return 0; fi
       if [[ "$action" == up ]]; then
         case "$snapshot" in */desired.json) printf desired >"$SCOPED_PHASE" ;; */rollback.json) printf rollback >"$SCOPED_PHASE" ;; *) return 83 ;; esac
-        for number in 1 2 3 4 9 11 12 13; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
+        for number in 1 2 3 4 8 9 11 12 13; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
         if [[ "$snapshot" == */desired.json ]]; then
           if [[ "$TEST_SCENARIO" == term || "$TEST_SCENARIO" == repeated-term ]]; then kill -TERM "$$"; fi
           if [[ "$TEST_SCENARIO" == hup ]]; then kill -HUP "$$"; fi
@@ -893,7 +900,7 @@ function assertOnlyScopedUp(result, names, rollback = false) {
 	if (rollback) assert.ok(updates[1].includes('/rollback.json>'), updates[1])
 }
 
-test('worker runtime builds three images and proves all owner ledgers before seven-only replacement without DDL', () => {
+test('worker runtime builds three images and proves all owner ledgers before its exact eight-role replacement without DDL', () => {
 	const result = runRuntime(workerScope)
 	assert.equal(result.status, 0, result.stderr)
 	assertOnlyScopedUp(result, SCOPED_SERVICES[workerScope])
@@ -909,7 +916,8 @@ test('worker runtime builds three images and proves all owner ledgers before sev
 	}
 	for (const build of builds) assert.ok(result.calls.indexOf(build) < result.calls.indexOf('<up>'))
 	const graceful = lines.filter(line => line.startsWith('DOCKER <kill>'))
-	assert.equal(graceful.length, 7)
+	assert.equal(graceful.length, 8)
+	assert.ok(graceful[0].endsWith(`<${'8'.padStart(64, '0')}>`), 'Billing API receives TERM before workers')
 	for (const line of graceful) assert.ok(line.includes('<--signal=TERM>') && result.calls.indexOf(line) < result.calls.indexOf('<up>'))
 	assert.ok(result.calls.indexOf('<worker-quiet>') < result.calls.indexOf('DOCKER <kill>'))
 	assert.ok(!result.calls.includes('MIGRATE ') && !result.calls.includes('DOCKER <stop>'), result.calls)
@@ -948,8 +956,8 @@ test('worker source, manifest, configuration or ledger drift cannot mutate runni
 	}
 })
 
-test('worker health, interruption and post-ledger failures roll back only the preserved seven images', () => {
-	for (const scenario of ['replace-failed', 'unhealthy', 'term', 'hup', 'repeated-term', 'ledger-post-failed', 'neighbor-drift']) {
+test('worker health, interruption and post-ledger failures roll back only the eight preserved role images', () => {
+	for (const scenario of ['replace-failed', 'unhealthy', 'term', 'hup', 'repeated-term', 'ledger-post-failed', 'neighbor-drift', 'billing-api-image-drift', 'billing-api-revision-drift']) {
 		const result = runRuntime(workerScope, scenario)
 		assert.notEqual(result.status, 0, scenario)
 		assertOnlyScopedUp(result, SCOPED_SERVICES[workerScope], true)

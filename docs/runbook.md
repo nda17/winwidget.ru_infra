@@ -168,19 +168,23 @@ non-root migration image мог прочитать его через точеч�
 их не пересоздаёт. Все соседние container IDs/images и hashes env проверяются
 до и после; `--no-deps` запрещает косвенное пересоздание соседних сервисов.
 
-- `workers-bootstrap-recovery`: только `billing-worker`,
+- `workers-bootstrap-recovery`: только `billing-api`, `billing-worker`,
   `billing-outbox-publisher`, `operations-worker`,
   `operations-outbox-publisher`, `operations-restore-worker`, `support-worker`,
   `support-outbox-publisher`. `expected_service_env_sha256` относится к Billing;
   дополнительно нужны `expected_operations_env_sha256`,
   `expected_support_env_sha256` и `expected_operations_revision`, равный общему
-  `expected_live_revision` всех семи процессов. Выпуск разрешает только изменения
+  `expected_live_revision` всех восьми процессов. Billing API — обязательный
+  companion: его provider-readiness contract требует тот же revision, что у
+  Billing worker. Проверка revision не ослабляется, `APP_REVISION` не подменяется.
+  Выпуск разрешает только изменения
   трёх `src/main.ts`, `src/runtime/bootstrap-failure.ts` и их unit tests; восемь
   ранее согласованных qs-only lockfiles сверяются по точным old/new SHA-256.
   Billing dependencies, Prisma/schema/migrations, Dockerfiles, package manifests,
   API/domain source и Operations restore catalog неизменны. Три immutable image
-  собираются и проверяются до замены. Initial state семи targets допускает только
-  running healthy/unhealthy; после выпуска все семь обязаны стать healthy на
+  собираются и проверяются до замены. Initial state семи workers допускает только
+  running healthy/unhealthy, Billing API обязательно running healthy; после
+  выпуска все восемь обязаны стать healthy на
   проверенных новых image IDs. Health-правило остальных scopes не ослабляется.
   Metadata probes трёх owner DB до и после используют существующую migration
   роль только для SELECT: проверяют database UUID и полностью применённый ledger
@@ -188,18 +192,27 @@ non-root migration image мог прочитать его через точеч�
   переопределённый на Node verifier, **не** запуск Prisma migration runner.
   Operations restore jobs/permits/leases должны быть idle,
   `DATABASE_RESTORE_ENABLED=false`; старый/новый bundled restore catalog побайтово
-  совпадает. Нет DDL, API/scheduler/Gateway/CRM rollout, очистки очередей или leases.
+  совпадает. Нет DDL, других API/scheduler/Gateway/CRM rollout, очистки очередей
+  или leases. Mixed revisions не разрешают включать restore: для него по-прежнему
+  нужны отдельные согласованные revision/manifest gates всех restore targets.
+  Новые backup sidecars нового Operations worker содержат его revision и не
+  authorizable старым Operations API. Restore остаётся выключенным до отдельно
+  согласованного API/worker/provenance rollout; idle guards не отменяются.
   До замены нужны два quiet samples с интервалом и повтор непосредственно перед
   SIGTERM: ноль RabbitMQ unacked/unconfirmed, активных Billing ProviderOperations,
   Operations jobs/restore и processing receipts/Outbox трёх owners. Каждая DB quiet
   probe ограничена 15 секундами. Проверяются точные container IDs, затем только
-  мягкий TERM и не более 45 секунд ожидания `Running=false`, `Pid=0`; SIGKILL и
+  мягкий TERM (Billing API первым) и не более 45 секунд ожидания
+  `Running=false`, `Pid=0`; SIGKILL и
   `docker stop` с принудительным timeout не используются. После выхода — ещё
   quiet sample и неизменность соседей. Это **не атомарный drain**: обычные
   at-least-once риски сохраняются, известный Operations busy-lease ACK риск не
   объявляется исправленным. Busy/неизвестное состояние или неполный выход
   запрещает replacement и автоматический рестарт остановленных старых workers.
-  Ошибка или сигнал после замены возвращает только семь сохранённых image/config,
+  Короткая пауза Billing API входит в scope; Billing scheduler не останавливается.
+  До завершения релиза отдельно проверить read-only provider-readiness через
+  настоящий compiled consumer, не инициируя платежи или запросы провайдеру.
+  Ошибка или сигнал после замены возвращает только восемь сохранённых image/config,
   также после quiet + graceful-stop проверки; иначе выдаётся CRITICAL без kill.
   Если старые образы снова unhealthy, rollback не объявляется успешным: нужны
   сохранённые recovery snapshots и операторская проверка.

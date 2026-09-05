@@ -334,7 +334,7 @@ scoped_deploy_main() {
 	flock -n "$deploy_lock_fd" || die 'Scoped deployment lost the canonical production lock.'
 	case "$release_scope" in
 		operations-federation-config) scoped_owner=operations; scoped_targets=(operations-api) ;;
-		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
+		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-api billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
 		identity-with-operations-manifest) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-runtime) scoped_owner=operations; scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-backlog-finalize) scoped_owner=operations; scoped_targets=() ;;

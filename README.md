@@ -50,8 +50,9 @@ users. После migrations и до rollout он требует единств�
 `workers-bootstrap-recovery` и `operations-federation-config`. Это ранние ветки того
 же controller с общими env/lock/CI gates, не отдельный SSH release path.
 Они не выполняют общий provisioning и не пересоздают Widgets/CRM.
-Worker recovery заменяет только семь Billing/Operations/Support workers,
-без API, scheduler, DDL и изменения restore manifests. Federation config
+Worker recovery заменяет семь Billing/Operations/Support workers и Billing API:
+его provider-readiness contract требует один revision с Billing worker.
+Другие API, scheduler, DDL и restore manifests не меняются. Federation config
 пересоздаёт только Operations API на прежнем image с нормализованным ND origin.
 Identity сопровождается Operations manifest/security-only image и короткой
 остановкой четырёх Operations процессов до additive DDL; после неоднозначного

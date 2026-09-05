@@ -9,7 +9,7 @@ export const NOTES_MIGRATION = '20260910110000_remove_admin_backlog';
 export const OTP_MIGRATION = '20260910010000_add_login_otp';
 export const SCOPED_SERVICES = Object.freeze({
 	'operations-federation-config': ['operations-api'],
-	'workers-bootstrap-recovery': ['billing-worker', 'billing-outbox-publisher', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker', 'support-worker', 'support-outbox-publisher'],
+	'workers-bootstrap-recovery': ['billing-api', 'billing-worker', 'billing-outbox-publisher', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker', 'support-worker', 'support-outbox-publisher'],
 	'identity-with-operations-manifest': ['identity-api', 'identity-worker', 'identity-outbox-publisher', 'operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-runtime': ['operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-backlog-finalize': [],
@@ -153,7 +153,7 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		assert.equal(container.Config.Labels['com.docker.compose.project'], 'winwidget');
 		assert.equal(container.Config.Labels['org.opencontainers.image.revision'], expectedPreviousRevision);
 		assert.equal(container.State.Status, 'running');
-		if (workers) assert.ok(['healthy', 'unhealthy'].includes(container.State.Health?.Status));
+		if (workers && name !== 'billing-api') assert.ok(['healthy', 'unhealthy'].includes(container.State.Health?.Status));
 		else assert.equal(container.State.Health?.Status, 'healthy');
 		assert.match(container.Id, /^[a-f0-9]{64}$/);
 		assert.match(container.Image, /^sha256:[a-f0-9]{64}$/);
