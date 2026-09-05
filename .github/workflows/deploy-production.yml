@@ -7,6 +7,34 @@ on:
         description: Immutable lowercase 40-hex winwidget.ru_services commit
         required: true
         type: string
+      release_scope:
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-finalize, or gateway-remove-notes
+        default: all
+        type: string
+      expected_live_revision:
+        description: Approved currently running owner revision for a scoped release
+        default: ''
+        type: string
+      expected_service_env_sha256:
+        description: Approved byte-identical prepared owner env for a scoped release
+        default: ''
+        type: string
+      expected_operations_revision:
+        description: Approved live Operations companion revision for the coordinated Identity release
+        default: ''
+        type: string
+      expected_operations_env_sha256:
+        description: Approved prepared Operations companion env SHA256
+        default: ''
+        type: string
+      operations_runtime_revision:
+        description: Exact successfully fenced Operations phase-A revision
+        default: ''
+        type: string
+      operations_evidence_sha256:
+        description: SHA256 of the independently restored Operations safety backup evidence
+        default: ''
+        type: string
     secrets:
       BACKEND_PRODUCTION_SSH_HOST:
         required: true
@@ -76,6 +104,13 @@ jobs:
         env:
           INFRA_REVISION: ${{ job.workflow_sha }}
           SERVICES_REVISION: ${{ inputs.services_revision }}
+          RELEASE_SCOPE: ${{ inputs.release_scope }}
+          EXPECTED_LIVE_REVISION: ${{ inputs.expected_live_revision }}
+          EXPECTED_SERVICE_ENV_SHA256: ${{ inputs.expected_service_env_sha256 }}
+          EXPECTED_OPERATIONS_REVISION: ${{ inputs.expected_operations_revision }}
+          EXPECTED_OPERATIONS_ENV_SHA256: ${{ inputs.expected_operations_env_sha256 }}
+          OPERATIONS_RUNTIME_REVISION: ${{ inputs.operations_runtime_revision }}
+          OPERATIONS_EVIDENCE_SHA256: ${{ inputs.operations_evidence_sha256 }}
           PRODUCTION_SSH_HOST: ${{ secrets.BACKEND_PRODUCTION_SSH_HOST }}
           PRODUCTION_SSH_PORT: ${{ secrets.BACKEND_PRODUCTION_SSH_PORT }}
           PRODUCTION_SSH_USER: ${{ secrets.BACKEND_PRODUCTION_SSH_USER }}

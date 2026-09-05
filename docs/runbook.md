@@ -149,6 +149,99 @@ PostgreSQL-контейнеры и RabbitMQ обычно остаются зап
 конфигурации. Данные при этом сохраняются во внешних volumes. Database
 bootstrap/restore — отдельные административные операции.
 
+### Узкие выпуски Identity и Operations
+
+`release_scope` reusable workflow по умолчанию равен `all`. Для согласованного
+узкого выпуска caller закрепляет scope вместе с green services/infra SHA;
+ручной SSH или локальный запуск скрипта не заменяет CI. Контроллер сохраняет
+immutable `origin/prod`, canonical env hash, root-owned files и общий deploy
+lock. Два дополнительных tracked payload проходят SHA-256 проверку до SSH и
+после передачи; scoped branch выполняется до общего provisioning/migrations.
+
+Общие дополнительные inputs: `expected_live_revision` (40 hex) и
+`expected_service_env_sha256` (64 hex) выбранного owner. Отдельные service env
+должны быть заранее согласованы и двусторонне синхронизированы: scoped release
+их не пересоздаёт. Все соседние container IDs/images и hashes env проверяются
+до и после; `--no-deps` запрещает косвенное пересоздание соседних сервисов.
+
+- `identity-with-operations-manifest`: три Identity и четыре Operations
+  runtime; дополнительно `expected_operations_revision` и
+  `expected_operations_env_sha256`. Это не Identity-only rollout: Operations
+  подписывает backup manifests, поэтому обновление bundled Identity ledger
+  требует согласованного companion image. В Operations разрешены только JSON
+  restore manifest и точный, проверенный whole-file hashes, security patch
+  `qs 6.15.3 -> 6.16.0`; остальной source/package manifest/Dockerfile неизменен.
+  Build/probe обоих images и проверка только additive OTP migration выполняются
+  до остановки. Затем останавливаются все четыре Operations процесса,
+  проверяются `Running=false`, `Pid=0`, отсутствие PostgreSQL сессий runtime
+  роли, `SHARE` barrier, ноль `PROCESSING` scheduled jobs (включая expired) и
+  незавершённых restore jobs/permits/leases. Только после этого допускается
+  Identity DDL и запуск семи runtime. Это короткая пауза admin control plane и
+  audit projection; durable queues не очищаются, Widgets/Billing не
+  останавливаются. `DATABASE_RESTORE_ENABLED=false` обязателен до и после.
+  Если DDL уже начат, даже неоднозначный результат запрещает автоматический
+  возврат старого Operations manifest: `RECOVERY_REQUIRED`, Operations остаётся
+  остановлен. Возобновление требует доказанного ledger/manifest match. До DDL
+  можно возобновить только исходные остановленные container IDs.
+- `operations-runtime` — фаза A удаления административного Backlog. Только
+  четыре Operations runtime, без вызова migration runner. Pending migration
+  должна быть ровно `20260910110000_remove_admin_backlog`, предыдущий ledger —
+  с точными checksums. Новый runtime не содержит Notes API; таблица сохраняется.
+  После health проверок устанавливается PostgreSQL writer fence (REVOKE Notes
+  DML у runtime, drain lock и проверка всех table/column write grants).
+  Root-only receipt сохраняется в
+  `/opt/winwidget/deploy/backend/scoped-releases/operations-backlog/<runtime-sha>/phase-a.json`.
+  После начала fence старый Notes-capable runtime автоматически не возвращается.
+- `operations-backlog-finalize` — фаза B, без пересоздания runtime.
+  `operations_runtime_revision` должен совпасть с live phase-A revision;
+  `operations_evidence_sha256` закрепляет файл `restore-evidence.json` рядом с
+  receipt. Обязательны свежий service-owned safety backup после fence,
+  проверенный hash артефакта, реальный isolated restore, совпадение database UUID,
+  phase-A/application tree, migration checksum/ledger и повторный writer fence.
+  Только затем запускается Operations migration. Она атомарно удаляет
+  `operations.notes` и точные старые Backlog audit rows, не остальные журналы.
+  После проверки создаётся `finalized.json`. При прерывании после DDL требуется
+  проверка ledger и восстановление receipt chain; `prisma resolve`, скрытие
+  миграций и повторный старый writer запрещены. Обычный `all` fail closed
+  запрещён при наличии этой миграции в source, пока её применение, отсутствие
+  Notes и matching finalized receipt не доказаны. Этот read-only ledger probe
+  использует существующую migration роль; доступ runtime к Prisma ledger не
+  расширяется. Неожиданные migration directories или symlinks отвергаются,
+  а не исключаются из проверки фильтром имени.
+- `gateway-remove-notes` — отдельный config-only шаг на точном live Gateway
+  image, без build/migrations. Разрешено только удалить `operations-notes` из
+  43 routes; остальные 42 ordered records должны совпадать. Identity и фаза A
+  могут завершиться, пока старая запись ещё существует. Общий `all` contract
+  остаётся на 42 маршрутах; этот scoped шаг не ослабляет его.
+
+Локальный proof producer не принимает production URL и не восстанавливает
+Operations поверх неё самой. Для проверенной копии backup, receipt и точной
+SQL migration используется существующий immutable PostgreSQL 18 image:
+
+```sh
+node scripts/verify-operations-backlog-backup.mjs \
+  --artifact /absolute/private/operations-safety.dump \
+  --artifact-sha256 APPROVED_64_HEX \
+  --phase-a /absolute/private/phase-a.json \
+  --migration /absolute/release/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql \
+  --image sha256:APPROVED_64_HEX \
+  --output /absolute/private/restore-evidence.json
+```
+
+Producer принимает только локальный Unix-socket Docker context, создаёт
+уникальный network-isolated PostgreSQL 18 с tmpfs, восстанавливает dump с ACL,
+проверяет fence/ledger/database UUID, выполняет именно данный SQL и доказывает
+сохранение остальных audit rows. Повторный restore исходного dump доказывает
+восстановимость удаляемых данных. После exact cleanup выводится только hash
+evidence; synthetic CI proof не заменяет этот прогон production backup.
+Backup copies сохраняются до обычного retention; удаление активного Backlog
+не означает мгновенное уничтожение всех архивных копий.
+
+`node scripts/test-scoped-service-deploy-contract.mjs` проверяет реальные Bash
+ветки с fake Docker/Git/SSH и fail-closed/rollback/signal scenarios. Они не
+заменяют проверки PostgreSQL или final production smoke. Новые CRM services
+не входят ни в один из этих scope.
+
 ### Frontend
 
 Frontend выпускается из exact green SHA собственного репозитория через его

@@ -44,6 +44,18 @@ users. После migrations и до rollout он требует единств�
 `operations.service_identity` с именем `operations-service` и валидным
 `database_id` UUID.
 
+Для согласованных узких релизов тот же immutable workflow поддерживает
+`identity-with-operations-manifest`, `operations-runtime`,
+`operations-backlog-finalize` и `gateway-remove-notes`. Это ранние ветки того
+же controller с общими env/lock/CI gates, не отдельный SSH release path.
+Они не выполняют общий provisioning и не пересоздают Widgets/Billing/CRM.
+Identity сопровождается Operations manifest/security-only image и короткой
+остановкой четырёх Operations процессов до additive DDL; после неоднозначного
+DDL старый manifest автоматически не возобновляется. Удаление Notes разделено
+на runtime + writer fence и отдельную DDL фазу после реального backup/restore
+proof. Точные inputs, rollback и ограничения описаны в
+[runbook](docs/runbook.md#узкие-выпуски-identity-и-operations).
+
 ## Production-окружение GitHub
 
 В репозитории `winwidget.ru_services` настройте следующие repository-level

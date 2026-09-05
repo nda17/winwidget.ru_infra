@@ -23,6 +23,13 @@ Optional environment (all five values or none):
   FRONTEND_PRODUCTION_SSH_USER
   FRONTEND_PRODUCTION_SSH_IDENTITY_FILE
   FRONTEND_PRODUCTION_SSH_KNOWN_HOSTS_FILE
+
+Scoped release inputs (only from the pinned reusable workflow):
+  RELEASE_SCOPE (default all)
+  EXPECTED_LIVE_REVISION
+  EXPECTED_SERVICE_ENV_SHA256
+  OPERATIONS_RUNTIME_REVISION (finalize only)
+  OPERATIONS_EVIDENCE_SHA256 (finalize only)
 USAGE
 	exit 2
 }
@@ -42,6 +49,40 @@ infra_revision="${INFRA_REVISION:-}"
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Infra revision must be an immutable lowercase 40-hex commit.'
 
+release_scope="${RELEASE_SCOPE:-all}"
+expected_live_revision="${EXPECTED_LIVE_REVISION:-}"
+expected_service_env_sha256="${EXPECTED_SERVICE_ENV_SHA256:-}"
+expected_operations_revision="${EXPECTED_OPERATIONS_REVISION:-}"
+expected_operations_env_sha256="${EXPECTED_OPERATIONS_ENV_SHA256:-}"
+operations_runtime_revision="${OPERATIONS_RUNTIME_REVISION:-}"
+operations_evidence_sha256="${OPERATIONS_EVIDENCE_SHA256:-}"
+case "$release_scope" in
+	all)
+		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256" ]] ||
+			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
+	identity-with-operations-manifest | operations-runtime | operations-backlog-finalize | gateway-remove-notes)
+		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
+			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
+		if [[ "$release_scope" == operations-backlog-finalize ]]; then
+			[[ "$operations_runtime_revision" =~ ^[0-9a-f]{40}$ &&
+				"$operations_evidence_sha256" =~ ^[0-9a-f]{64}$ &&
+				"$expected_live_revision" == "$operations_runtime_revision" ]] ||
+				die 'Operations finalization requires exact phase-A and restore evidence identities.'
+		else
+			[[ -z "$operations_runtime_revision$operations_evidence_sha256" ]] ||
+				die 'Destructive authorization is only valid for Operations finalization.'
+		fi ;;
+	*) die 'Unsupported production release scope.' ;;
+esac
+if [[ "$release_scope" == identity-with-operations-manifest ]]; then
+	[[ "$expected_operations_revision" =~ ^[a-f0-9]{40}$ && "$expected_operations_env_sha256" =~ ^[a-f0-9]{64}$ ]] ||
+		die 'Coordinated Identity release requires the exact Operations companion identities.'
+else
+	[[ -z "$expected_operations_revision$expected_operations_env_sha256" ]] ||
+		die 'Operations companion authorization is only valid for the coordinated Identity release.'
+fi
+
 controller_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 [[ -d "$controller_root/.git" && ! -L "$controller_root" ]] ||
 	die 'Infrastructure controller must run from its canonical Git checkout.'
@@ -57,6 +98,25 @@ case "$infra_repository_origin" in
 		ssh://git@github.com/nda17/winwidget.ru_infra | ssh://git@github.com/nda17/winwidget.ru_infra.git) ;;
 	*) die 'Infrastructure controller origin is not the approved GitHub repository.' ;;
 esac
+
+scoped_shell_file="$controller_root/scripts/deploy-identity-operations-scoped.sh"
+scoped_node_file="$controller_root/scripts/scoped-service-release.mjs"
+for scoped_file in "$scoped_shell_file" "$scoped_node_file"; do
+	[[ -f "$scoped_file" && ! -L "$scoped_file" ]] ||
+		die 'Tracked scoped deployment verifier is missing or unsafe.'
+	git -C "$controller_root" ls-files --error-unmatch \
+		"${scoped_file#"$controller_root/"}" >/dev/null 2>&1 ||
+		die 'Scoped deployment verifier is not tracked by infra Git.'
+done
+scoped_shell_sha256="$(sha256sum "$scoped_shell_file" | awk '{print $1}')"
+scoped_shell_base64="$(base64 <"$scoped_shell_file" | tr -d '\n')"
+scoped_node_sha256="$(sha256sum "$scoped_node_file" | awk '{print $1}')"
+scoped_node_base64="$(base64 <"$scoped_node_file" | tr -d '\n')"
+[[ "$scoped_shell_sha256" =~ ^[a-f0-9]{64}$ && "$scoped_node_sha256" =~ ^[a-f0-9]{64}$ &&
+	"$scoped_shell_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ && "$scoped_node_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+	die 'Cannot encode the immutable scoped deployment payload.'
+(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 90000 )) ||
+	die 'Scoped payload exceeds the bounded SSH argument envelope.'
 
 backend_nginx_file="$controller_root/nginx/backend-api.conf"
 [[ -f "$backend_nginx_file" && ! -L "$backend_nginx_file" ]] ||
@@ -120,6 +180,8 @@ deploy_frontend_nginx='false'
 if ((frontend_environment_count == ${#frontend_environment[@]})); then
 	deploy_frontend_nginx='true'
 fi
+[[ "$release_scope" == all || "$deploy_frontend_nginx" == false ]] ||
+	die 'Scoped backend deployment cannot change frontend Nginx.'
 
 [[ "$PRODUCTION_SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
 	die 'Production SSH host is invalid.'
@@ -195,7 +257,18 @@ printf -v remote_controller_arguments ' %q' \
 	"$services_revision" \
 	"$EXPECTED_PRODUCTION_ENV_SHA256" \
 	"$backend_nginx_sha256" \
-	"$backend_nginx_base64"
+	"$backend_nginx_base64" \
+	"$release_scope" \
+	"$expected_live_revision" \
+	"$expected_service_env_sha256" \
+	"$operations_runtime_revision" \
+	"$operations_evidence_sha256" \
+	"$scoped_shell_sha256" \
+	"$scoped_shell_base64" \
+	"$scoped_node_sha256" \
+	"$scoped_node_base64" \
+	"$expected_operations_revision" \
+	"$expected_operations_env_sha256"
 # The remote shell, not this local controller, must expand these variables.
 # shellcheck disable=SC2016
 remote_controller_command='set -euo pipefail
@@ -227,6 +300,17 @@ services_revision="$2"
 expected_env_sha256="$3"
 backend_nginx_sha256="$4"
 backend_nginx_base64="$5"
+release_scope="$6"
+export expected_live_revision="$7"
+export expected_service_env_sha256="$8"
+export operations_runtime_revision="$9"
+export operations_evidence_sha256="${10}"
+scoped_shell_sha256="${11}"
+scoped_shell_base64="${12}"
+scoped_node_sha256="${13}"
+scoped_node_base64="${14}"
+export expected_operations_revision="${15}"
+export expected_operations_env_sha256="${16}"
 
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'
@@ -396,6 +480,40 @@ fi
 readonly compose_file="$release_root/deploy/docker-compose.prod.yml"
 [[ -f "$compose_file" && ! -L "$compose_file" ]] ||
 	die 'Release Compose manifest is missing or unsafe.'
+
+# Branch before any all-app env materialization, build, infrastructure changes,
+# broker provisioning or migrations. The old all-services path stays intact.
+# Even an accidental all caller must not bypass the destructive Notes gates.
+if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql" ]]; then
+	[[ "$scoped_shell_sha256" =~ ^[0-9a-f]{64}$ &&
+		"$scoped_node_sha256" =~ ^[0-9a-f]{64}$ &&
+		"$scoped_shell_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ &&
+		"$scoped_node_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+		die 'Invalid immutable scoped payload.'
+	scoped_payload_directory="$(mktemp -d "$app_root/deploy/backend/.scoped-controller.XXXXXX")"
+	chmod 700 "$scoped_payload_directory"
+	cleanup_scoped_payload() {
+		rm -f -- "$scoped_payload_directory/controller.sh" "$scoped_payload_directory/verifier.mjs"
+		rmdir "$scoped_payload_directory"
+	}
+	trap cleanup_scoped_payload EXIT
+	printf '%s' "$scoped_shell_base64" | base64 --decode >"$scoped_payload_directory/controller.sh"
+	printf '%s' "$scoped_node_base64" | base64 --decode >"$scoped_payload_directory/verifier.mjs"
+	chmod 600 "$scoped_payload_directory/controller.sh" "$scoped_payload_directory/verifier.mjs"
+	[[ "$(sha256sum "$scoped_payload_directory/controller.sh" | awk '{print $1}')" == "$scoped_shell_sha256" &&
+		"$(sha256sum "$scoped_payload_directory/verifier.mjs" | awk '{print $1}')" == "$scoped_node_sha256" ]] ||
+		die 'Scoped payload checksum mismatch.'
+	# shellcheck disable=SC1091
+	source "$scoped_payload_directory/controller.sh"
+	if [[ "$release_scope" == all ]]; then
+		scoped_assert_backlog_already_finalized
+		cleanup_scoped_payload
+		trap - EXIT
+	else
+		scoped_deploy_main
+		exit 0
+	fi
+fi
 
 retired_root_runtime_paths=(
 	"$release_root/src"
