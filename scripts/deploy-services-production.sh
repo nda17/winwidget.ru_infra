@@ -28,6 +28,7 @@ Scoped release inputs (only from the pinned reusable workflow):
   RELEASE_SCOPE (default all)
   EXPECTED_LIVE_REVISION
   EXPECTED_SERVICE_ENV_SHA256
+  EXPECTED_SUPPORT_ENV_SHA256 (workers-bootstrap-recovery only)
   OPERATIONS_RUNTIME_REVISION (finalize only)
   OPERATIONS_EVIDENCE_SHA256 (finalize only)
 USAGE
@@ -54,13 +55,14 @@ expected_live_revision="${EXPECTED_LIVE_REVISION:-}"
 expected_service_env_sha256="${EXPECTED_SERVICE_ENV_SHA256:-}"
 expected_operations_revision="${EXPECTED_OPERATIONS_REVISION:-}"
 expected_operations_env_sha256="${EXPECTED_OPERATIONS_ENV_SHA256:-}"
+expected_support_env_sha256="${EXPECTED_SUPPORT_ENV_SHA256:-}"
 operations_runtime_revision="${OPERATIONS_RUNTIME_REVISION:-}"
 operations_evidence_sha256="${OPERATIONS_EVIDENCE_SHA256:-}"
 case "$release_scope" in
 	all)
-		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256" ]] ||
+		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backlog-finalize | gateway-remove-notes)
+	identity-with-operations-manifest | operations-runtime | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -75,12 +77,18 @@ case "$release_scope" in
 		fi ;;
 	*) die 'Unsupported production release scope.' ;;
 esac
-if [[ "$release_scope" == identity-with-operations-manifest ]]; then
+if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == workers-bootstrap-recovery ]]; then
 	[[ "$expected_operations_revision" =~ ^[a-f0-9]{40}$ && "$expected_operations_env_sha256" =~ ^[a-f0-9]{64}$ ]] ||
 		die 'Coordinated Identity release requires the exact Operations companion identities.'
 else
 	[[ -z "$expected_operations_revision$expected_operations_env_sha256" ]] ||
 		die 'Operations companion authorization is only valid for the coordinated Identity release.'
+fi
+if [[ "$release_scope" == workers-bootstrap-recovery ]]; then
+	[[ "$expected_support_env_sha256" =~ ^[a-f0-9]{64}$ && "$expected_operations_revision" == "$expected_live_revision" ]] ||
+		die 'Worker recovery requires the exact Support env hash and a common approved live revision.'
+else
+	[[ -z "$expected_support_env_sha256" ]] || die 'Support authorization is only valid for worker recovery.'
 fi
 
 controller_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -268,7 +276,8 @@ printf -v remote_controller_arguments ' %q' \
 	"$scoped_node_sha256" \
 	"$scoped_node_base64" \
 	"$expected_operations_revision" \
-	"$expected_operations_env_sha256"
+	"$expected_operations_env_sha256" \
+	"$expected_support_env_sha256"
 # The remote shell, not this local controller, must expand these variables.
 # shellcheck disable=SC2016
 remote_controller_command='set -euo pipefail
@@ -311,6 +320,7 @@ scoped_node_sha256="${13}"
 scoped_node_base64="${14}"
 export expected_operations_revision="${15}"
 export expected_operations_env_sha256="${16}"
+export expected_support_env_sha256="${17}"
 
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'

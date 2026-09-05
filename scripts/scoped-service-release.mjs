@@ -8,12 +8,22 @@ import { fileURLToPath } from 'node:url';
 export const NOTES_MIGRATION = '20260910110000_remove_admin_backlog';
 export const OTP_MIGRATION = '20260910010000_add_login_otp';
 export const SCOPED_SERVICES = Object.freeze({
+	'operations-federation-config': ['operations-api'],
+	'workers-bootstrap-recovery': ['billing-worker', 'billing-outbox-publisher', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker', 'support-worker', 'support-outbox-publisher'],
 	'identity-with-operations-manifest': ['identity-api', 'identity-worker', 'identity-outbox-publisher', 'operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-runtime': ['operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-backlog-finalize': [],
 	'gateway-remove-notes': ['api-gateway']
 });
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
+export function assertBrokerQuiet(rows) {
+	assert.ok(Array.isArray(rows) && rows.length >= 7);
+	for (const row of rows) {
+		for (const key of ['consumer_count', 'messages_unacknowledged', 'messages_unconfirmed']) assert.ok(Number.isSafeInteger(row[key]) && row[key] >= 0);
+		assert.equal(row.messages_unacknowledged, 0);
+		assert.equal(row.messages_unconfirmed, 0);
+	}
+}
 const same = (left, right) => assert.deepEqual(left, right);
 const sorted = value => [...(value ?? [])].sort();
 const capabilities = values => sorted(values).map(value => value.replace(/^CAP_/, '')).sort();
@@ -115,7 +125,7 @@ export function assertServiceConfiguration(service, live, image, allSecrets) {
 	assert.equal(duration(service.stop_grace_period), Number(live.Config.StopTimeout ?? 10) * 1e9);
 }
 
-export function prepareScopedCompose({ scope, revision, previousRevision, operationsPreviousRevision, compose, live, image, operationsImage }) {
+export function prepareScopedCompose({ scope, revision, previousRevision, operationsPreviousRevision, compose, live, image, operationsImage, supportImage }) {
 	assert.ok(Object.hasOwn(SCOPED_SERVICES, scope));
 	assert.match(revision, /^[a-f0-9]{40}$/);
 	assert.match(previousRevision, /^[a-f0-9]{40}$/);
@@ -125,9 +135,12 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 	const desired = { name: 'winwidget', services: {}, volumes: {}, secrets: {} };
 	const rollback = structuredClone(desired);
 	for (const name of targets) {
+		const workers = scope === 'workers-bootstrap-recovery';
+		const federation = scope === 'operations-federation-config';
 		const companion = scope === 'identity-with-operations-manifest' && name.startsWith('operations-');
 		const expectedPreviousRevision = companion ? operationsPreviousRevision : previousRevision;
-		const expectedImage = companion ? operationsImage : image;
+		const expectedImage = companion || (workers && name.startsWith('operations-')) ? operationsImage
+			: workers && name.startsWith('support-') ? supportImage : image;
 		assert.match(expectedPreviousRevision ?? '', /^[a-f0-9]{40}$/);
 		assert.ok(expectedImage);
 		const current = live.filter(container => container.Config.Labels['com.docker.compose.service'] === name);
@@ -136,7 +149,8 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		assert.equal(container.Config.Labels['com.docker.compose.project'], 'winwidget');
 		assert.equal(container.Config.Labels['org.opencontainers.image.revision'], expectedPreviousRevision);
 		assert.equal(container.State.Status, 'running');
-		assert.equal(container.State.Health?.Status, 'healthy');
+		if (workers) assert.ok(['healthy', 'unhealthy'].includes(container.State.Health?.Status));
+		else assert.equal(container.State.Health?.Status, 'healthy');
 		assert.match(container.Id, /^[a-f0-9]{64}$/);
 		assert.match(container.Image, /^sha256:[a-f0-9]{64}$/);
 		const service = structuredClone(compose.services[name]);
@@ -151,6 +165,10 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		for (const [key, value] of Object.entries(after)) {
 			if (scope === 'gateway-remove-notes' && key === 'GATEWAY_ROUTES_JSON') {
 				assertOnlyNotesRouteRemoved(JSON.parse(before[key]), JSON.parse(value));
+			} else if (federation && key === 'NOTIFICATION_DELIVERY_INTERNAL_URL') {
+				// One reviewed legacy configuration, not a general private-URL rewrite.
+				assert.equal(before[key], 'http://127.0.0.1:4401/internal/notification-delivery');
+				assert.equal(value, 'http://127.0.0.1:4401');
 			} else if (key === 'APP_REVISION' && scope !== 'gateway-remove-notes') {
 				assert.equal(value, revision);
 			} else if (scope === 'identity-with-operations-manifest' && name === 'identity-api' && key === 'IDENTITY_LOGIN_OTP_ENABLED') {
@@ -159,11 +177,15 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 				assert.equal(value, before[key]);
 			}
 		}
-		if (scope === 'gateway-remove-notes') {
+		if (scope === 'gateway-remove-notes' || federation) {
 			assert.equal(image.Id, container.Image);
 			assert.equal(after.APP_REVISION, previousRevision);
 		} else assert.equal(expectedImage.Config.Labels['org.opencontainers.image.revision'], revision);
-		if (companion && ['operations-api', 'operations-restore-worker'].includes(name)) {
+		if (federation) {
+			assert.equal(revision, previousRevision);
+			assert.equal(after.NOTIFICATION_DELIVERY_INTERNAL_URL, 'http://127.0.0.1:4401');
+		}
+		if (federation || (companion && ['operations-api', 'operations-restore-worker'].includes(name)) || (workers && name === 'operations-restore-worker')) {
 			assert.equal(before.DATABASE_RESTORE_ENABLED, 'false');
 			assert.equal(after.DATABASE_RESTORE_ENABLED, 'false');
 		}
@@ -246,7 +268,7 @@ export function migrationFiles(root) {
 }
 
 export async function verifyDatabaseState(client, files, action, owner, context = {}) {
-	assert.ok(['identity', 'operations'].includes(owner));
+	assert.ok(['identity', 'operations'].includes(owner) || (['worker-ledger', 'worker-quiet'].includes(action) && ['billing', 'support'].includes(owner)));
 	{
 		const identity = await client.$queryRawUnsafe(`SELECT current_database() AS database, current_user AS username, current_schema() AS schema, pg_is_in_recovery() AS recovery`);
 		same(identity.map(row => [row.database, row.schema, row.recovery]), [[`winwidget_${owner}`, owner, false]]);
@@ -283,6 +305,27 @@ export async function verifyDatabaseState(client, files, action, owner, context 
 			assert.ok([jobs, permits, recovery, outbox].every(count => count === 0));
 			assert.ok(!lease || Object.values(lease).every(value => value === null));
 		};
+		if (['worker-ledger', 'worker-quiet'].includes(action)) {
+			assert.ok(['billing', 'operations', 'support'].includes(owner));
+			assert.ok(files.length > 0);
+			same(ledger.map(row => ({ name: row.migration_name, checksum: row.checksum })), files);
+			assert.ok(ledger.every(row => row.finished_at && !row.rolled_back_at));
+			assert.equal(files.some(file => [OTP_MIGRATION, NOTES_MIGRATION].includes(file.name)), false);
+			if (owner === 'operations') await assertOperationsIdle(client);
+			if (action === 'worker-quiet') {
+				const models = {
+					billing: ['providerOperation', 'outboxEvent', 'integrationDeliveryReceipt'],
+					operations: ['scheduledJobRun', 'outboxEvent', 'auditEventReceipt', 'integrationDeliveryReceipt'],
+					support: ['telegramWebhookInbox', 'telegramOutboundDelivery', 'outboxEvent', 'consumerReceipt']
+				};
+				for (const model of models[owner]) {
+					const statuses = model === 'providerOperation' ? ['PENDING', 'PROCESSING'] : ['PROCESSING'];
+					assert.equal(await client[model].count({ where: { status: { in: statuses } } }), 0);
+				}
+			}
+			process.stdout.write(`DATABASE_ID=${serviceIdentity[0].database_id}\nMIGRATION_MANIFEST_SHA256=${sha256(JSON.stringify({ schemaVersion: 1, target: owner, migrations: files }))}\n`);
+			return;
+		}
 		if (action === 'operations-drain') {
 			assert.equal(owner, 'operations');
 			assert.equal(files.some(file => file.name === NOTES_MIGRATION), false);
@@ -333,7 +376,7 @@ export async function verifyDatabaseState(client, files, action, owner, context 
 }
 
 async function databaseAction(action, owner) {
-	assert.ok(['identity', 'operations'].includes(owner));
+	assert.ok(['identity', 'operations'].includes(owner) || (['worker-ledger', 'worker-quiet'].includes(action) && ['billing', 'support'].includes(owner)));
 	const require = createRequire('/app/package.json');
 	const { PrismaClient } = require(`@prisma/${owner}-client`);
 	// The all-services admission needs metadata the runtime must not own. Use
@@ -342,8 +385,9 @@ async function databaseAction(action, owner) {
 	const client = new PrismaClient(action === 'all-guard'
 		? { datasources: { db: { url: process.env.OPERATIONS_MIGRATION_DATABASE_URL } } }
 		: undefined);
+	const deadline = action === 'worker-quiet' ? setTimeout(() => process.exit(1), 15000) : undefined;
 	try { await verifyDatabaseState(client, migrationFiles('/app/prisma/migrations'), action, owner); }
-	finally { await client.$disconnect(); }
+	finally { await client.$disconnect(); clearTimeout(deadline); }
 }
 
 async function main() {
@@ -357,7 +401,8 @@ async function main() {
 			compose: JSON.parse(readFileSync('/run/scoped/compose.json', 'utf8')),
 			live: JSON.parse(readFileSync('/run/scoped/live.json', 'utf8')),
 			image: JSON.parse(readFileSync('/run/scoped/image.json', 'utf8'))[0],
-			operationsImage: process.env.SCOPED_SCOPE === 'identity-with-operations-manifest' ? JSON.parse(readFileSync('/run/scoped/operations-image.json', 'utf8'))[0] : undefined
+			operationsImage: ['identity-with-operations-manifest', 'workers-bootstrap-recovery'].includes(process.env.SCOPED_SCOPE) ? JSON.parse(readFileSync('/run/scoped/operations-image.json', 'utf8'))[0] : undefined,
+			supportImage: process.env.SCOPED_SCOPE === 'workers-bootstrap-recovery' ? JSON.parse(readFileSync('/run/scoped/support-image.json', 'utf8'))[0] : undefined
 		};
 		const result = prepareScopedCompose(input);
 		for (const key of ['desired', 'rollback']) writeFileSync(`/run/scoped/${key}.json`, `${JSON.stringify(result[key])}\n`, { mode: 0o600, flag: 'wx' });
@@ -408,7 +453,8 @@ async function main() {
 		};
 		assert.match(result.migrationChecksum ?? '', /^[a-f0-9]{64}$/);
 		writeFileSync('/run/scoped/finalized.json', JSON.stringify(result), { mode: 0o600, flag: 'wx' });
-	} else if (action === 'database') await databaseAction(process.argv[3], process.argv[4]);
+	} else if (action === 'broker-quiet') assertBrokerQuiet(JSON.parse(readFileSync(0, 'utf8')));
+	else if (action === 'database') await databaseAction(process.argv[3], process.argv[4]);
 	else throw new Error('Unsupported verifier action');
 }
 

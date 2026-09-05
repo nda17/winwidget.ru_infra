@@ -9,13 +9,15 @@ import {
 	NOTES_MIGRATION,
 	OTP_MIGRATION,
 	SCOPED_SERVICES,
+	assertBrokerQuiet,
 	assertIdentityManifestCompanion,
 	assertMigrationLedger,
 	assertOnlyNotesRouteRemoved,
 	migrationFiles,
 	prepareScopedCompose,
 	sha256,
-	validateRestoreEvidence
+	validateRestoreEvidence,
+	verifyDatabaseState
 } from './scoped-service-release.mjs'
 
 const scriptsRoot = dirname(fileURLToPath(import.meta.url))
@@ -25,6 +27,7 @@ const revision = 'a'.repeat(40)
 const oldRevision = 'b'.repeat(40)
 const envHash = 'c'.repeat(64)
 const identityScope = 'identity-with-operations-manifest'
+const workerScope = 'workers-bootstrap-recovery'
 
 function privateFixture(run) {
 	const directory = mkdtempSync(join(tmpdir(), 'winwidget-scoped-contract-'))
@@ -77,7 +80,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes']) {
+	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -85,6 +88,15 @@ test('real controller requires reviewed owner identity and exact env hash', () =
 			EXPECTED_SERVICE_ENV_SHA256: 'not-a-hash'
 		}, /approved live revision and owner env SHA256/)
 	}
+})
+
+test('worker release requires all three exact owner envs and no foreign authority', () => {
+	const authorized = { RELEASE_SCOPE: workerScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash, EXPECTED_SUPPORT_ENV_SHA256: envHash }
+	for (const value of ['', 'mutable']) rejectBeforeTransport([revision], { ...authorized, EXPECTED_SUPPORT_ENV_SHA256: value }, /exact Support env hash/)
+	rejectBeforeTransport([revision], { ...authorized, EXPECTED_OPERATIONS_REVISION: revision }, /common approved live revision/)
+	rejectBeforeTransport([revision], { ...authorized, OPERATIONS_RUNTIME_REVISION: oldRevision }, /Destructive authorization/)
+	rejectBeforeTransport([revision], { RELEASE_SCOPE: 'all', EXPECTED_SUPPORT_ENV_SHA256: envHash }, /Scoped authorization/)
+	rejectBeforeTransport([revision], { RELEASE_SCOPE: 'operations-runtime', EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, EXPECTED_SUPPORT_ENV_SHA256: envHash }, /Support authorization/)
 })
 
 test('all-services mode cannot inherit scoped or destructive authorization', () => {
@@ -151,6 +163,7 @@ function composeFixture(scope = identityScope) {
 		const environment = { APP_REVISION: revision, SERVICE_NAME: name }
 		if (name === 'identity-api') environment.IDENTITY_LOGIN_OTP_ENABLED = 'true'
 		if (scope === identityScope && ['operations-api', 'operations-restore-worker'].includes(name)) environment.DATABASE_RESTORE_ENABLED = 'false'
+		if (scope === workerScope && name === 'operations-restore-worker') environment.DATABASE_RESTORE_ENABLED = 'false'
 		const before = { ...environment, APP_REVISION: oldRevision }
 		if (name === 'identity-api') before.IDENTITY_LOGIN_OTP_ENABLED = 'false'
 		services[name] = {
@@ -189,8 +202,72 @@ function composeFixture(scope = identityScope) {
 	})
 	services['unrelated-widget-service'] = { image: 'never-touch-this-neighbor' }
 	const operationsImage = { ...structuredClone(image), Id: `sha256:${'f'.repeat(64)}` }
-	return { scope, revision, previousRevision: oldRevision, operationsPreviousRevision: oldRevision, compose: { services }, live, image, operationsImage }
+	const supportImage = { ...structuredClone(image), Id: `sha256:${'1'.repeat(64)}` }
+	return { scope, revision, previousRevision: oldRevision, operationsPreviousRevision: oldRevision, compose: { services }, live, image, operationsImage, supportImage }
 }
+
+test('worker Compose admits exactly seven running workers, three images and no API or scheduler', () => {
+	const input = composeFixture(workerScope)
+	input.live.forEach((container, index) => { container.State.Health.Status = index % 2 ? 'healthy' : 'unhealthy' })
+	const { desired, rollback } = prepareScopedCompose(input)
+	assert.deepEqual(Object.keys(desired.services), SCOPED_SERVICES[workerScope])
+	assert.deepEqual(Object.keys(rollback.services), SCOPED_SERVICES[workerScope])
+	for (const [name, service] of Object.entries(desired.services)) {
+		assert.equal(service.image, name.startsWith('operations-') ? input.operationsImage.Id : name.startsWith('support-') ? input.supportImage.Id : input.image.Id)
+		assert.equal(service.build, undefined)
+		assert.equal(service.depends_on, undefined)
+		assert.ok(!name.endsWith('-api') && !name.endsWith('-scheduler'))
+		assert.equal(rollback.services[name].image, input.live.find(container => container.Config.Labels['com.docker.compose.service'] === name).Image)
+	}
+	for (const mutate of [
+		candidate => { candidate.live[0].State.Status = 'exited' },
+		candidate => { candidate.live[0].State.Health.Status = 'starting' },
+		candidate => { candidate.live[0].Config.Labels['org.opencontainers.image.revision'] = revision },
+		candidate => { candidate.supportImage.Config.Labels['org.opencontainers.image.revision'] = oldRevision },
+		candidate => { candidate.operationsImage = undefined },
+		candidate => { candidate.compose.services['operations-restore-worker'].environment.DATABASE_RESTORE_ENABLED = 'true' },
+		candidate => { candidate.compose.services['operations-worker'].environment.NOTIFICATION_DELIVERY_INTERNAL_URL = 'http://127.0.0.1:4401' },
+		candidate => { candidate.live.push(structuredClone(candidate.live[0])) },
+		candidate => { candidate.compose.services['billing-worker'].environment.SERVICE_NAME = 'billing-api' }
+	]) {
+		const candidate = structuredClone(input)
+		mutate(candidate)
+		assert.throws(() => prepareScopedCompose(candidate))
+	}
+	const previous = composeFixture(identityScope)
+	previous.live[1].State.Health.Status = 'unhealthy'
+	assert.throws(() => prepareScopedCompose(previous), 'the exception cannot weaken prior scopes')
+})
+
+test('federation config reuses the exact Operations API image and normalizes only its reviewed ND origin', () => {
+	const input = composeFixture('operations-federation-config')
+	input.revision = oldRevision
+	input.image.Id = input.live[0].Image
+	input.image.Config.Labels['org.opencontainers.image.revision'] = oldRevision
+	Object.assign(input.compose.services['operations-api'].environment, { APP_REVISION: oldRevision, DATABASE_RESTORE_ENABLED: 'false', NOTIFICATION_DELIVERY_INTERNAL_URL: 'http://127.0.0.1:4401' })
+	input.live[0].Config.Env.push('DATABASE_RESTORE_ENABLED=false', 'NOTIFICATION_DELIVERY_INTERNAL_URL=http://127.0.0.1:4401/internal/notification-delivery')
+	const { desired, rollback } = prepareScopedCompose(input)
+	assert.deepEqual(Object.keys(desired.services), ['operations-api'])
+	assert.equal(desired.services['operations-api'].image, input.live[0].Image)
+	assert.equal(rollback.services['operations-api'].image, input.live[0].Image)
+	assert.equal(rollback.services['operations-api'].environment.NOTIFICATION_DELIVERY_INTERNAL_URL, 'http://127.0.0.1:4401/internal/notification-delivery')
+	for (const mutate of [
+		candidate => { candidate.image.Id = `sha256:${'a'.repeat(64)}` },
+		candidate => { candidate.compose.services['operations-api'].environment.APP_REVISION = revision },
+		candidate => { candidate.compose.services['operations-api'].environment.DATABASE_RESTORE_ENABLED = 'true' },
+		candidate => { candidate.compose.services['operations-api'].environment.TRUST_PROXY = 'true' },
+		candidate => { candidate.live[0].Config.Env = candidate.live[0].Config.Env.filter(value => !value.startsWith('NOTIFICATION_DELIVERY_INTERNAL_URL=')) }
+	]) {
+		const candidate = structuredClone(input)
+		mutate(candidate)
+		assert.throws(() => prepareScopedCompose(candidate))
+	}
+	for (const url of ['http://127.0.0.1:4401/', 'http://127.0.0.1:4402', 'http://10.0.0.1:4401', 'https://127.0.0.1:4401', 'http://user:secret@127.0.0.1:4401', 'http://127.0.0.1:4401?anything=true']) {
+		const candidate = structuredClone(input)
+		candidate.compose.services['operations-api'].environment.NOTIFICATION_DELIVERY_INTERNAL_URL = url
+		assert.throws(() => prepareScopedCompose(candidate))
+	}
+})
 
 test('coordinated Compose adapter binds three Identity and four Operations owners to separate images', () => {
 	const input = composeFixture()
@@ -527,6 +604,7 @@ expected_env_sha256="$TEST_ENV_HASH"
 expected_service_env_sha256="$TEST_ENV_HASH"
 expected_operations_revision="$TEST_PREVIOUS_REVISION"
 expected_operations_env_sha256="$TEST_ENV_HASH"
+expected_support_env_sha256="$TEST_ENV_HASH"
 operations_runtime_revision=''
 operations_evidence_sha256=''
 if [[ "$release_scope" == operations-backlog-finalize ]]; then
@@ -543,9 +621,13 @@ stat() {
 flock() { [[ "$TEST_SCENARIO" != lost-lock ]]; }
 sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); for(const p of process.argv.slice(1))console.log(c.createHash("sha256").update(f.readFileSync(p)).digest("hex")+"  "+p)' "$@"; }
 sync() { :; }
+sleep() { if [[ "$TEST_SCENARIO" == stop-timeout ]]; then SECONDS=$((SECONDS + 60)); fi; }
 git() {
   if [[ " $* " == *' diff '* ]]; then
-    if [[ "$TEST_SCENARIO" == companion-drift ]]; then printf 'apps/operations/src/unsafe-change.ts\n';
+    if [[ "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
+      for owner in billing operations support; do printf 'apps/%s/src/main.ts\napps/%s/src/runtime/bootstrap-failure.ts\n' "$owner" "$owner"; done
+      if [[ "$TEST_SCENARIO" == source-drift ]]; then printf 'apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql\n'; fi
+    elif [[ "$TEST_SCENARIO" == companion-drift ]]; then printf 'apps/operations/src/unsafe-change.ts\n';
     else printf 'apps/operations/restore-manifests/database-restore-migrations.json\n'; fi
   else printf '%s\n' "$TEST_REVISION"; fi
 }
@@ -563,8 +645,12 @@ docker() {
   for arg in "$@"; do last="$arg"; done
   current="$(<"$SCOPED_PHASE")"
   image="$TEST_OLD_IMAGE"; rev="$TEST_PREVIOUS_REVISION"
-  if [[ "$current" == desired && "$TEST_SCOPE" != gateway-remove-notes ]]; then image="$TEST_NEW_IMAGE"; rev="$TEST_REVISION"; fi
+  if [[ "$current" == desired && "$TEST_SCOPE" != gateway-remove-notes && "$TEST_SCOPE" != operations-federation-config ]]; then image="$TEST_NEW_IMAGE"; rev="$TEST_REVISION"; fi
   if [[ "$current" == desired && "$TEST_SCOPE" == identity-with-operations-manifest && "$last" =~ ^0+[1-4]$ ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
+  if [[ "$current" == desired && "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
+    if [[ "$last" =~ ^0+[1-4]$ ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
+    if [[ "$last" =~ ^0+(10|11|12)$ ]]; then image="$TEST_SUPPORT_IMAGE"; fi
+  fi
   case "$1" in
     ps)
       for arg in "$@"; do
@@ -578,10 +664,17 @@ docker() {
         identity-api) number=5 ;;
         identity-worker) number=6 ;;
         identity-outbox-publisher) number=7 ;;
+        billing-api) number=8 ;;
+        billing-worker) number=9 ;;
+        billing-outbox-publisher) number=13 ;;
+        support-api) number=10 ;;
+        support-worker) number=11 ;;
+        support-outbox-publisher) number=12 ;;
+        rabbitmq) number=14 ;;
         *) return 1 ;;
       esac
       printf -v cid '%064d' "$number"
-      [[ ! -f "$SCOPED_FIXTURE/stopped-$cid" ]] || return 0
+      [[ " $* " == *' --all '* || ! -f "$SCOPED_FIXTURE/stopped-$cid" ]] || return 0
       printf '%s\n' "$cid" ;;
     inspect)
       if [[ "${'${'}2:-}" != --format ]]; then printf '[]\n'; return 0; fi
@@ -592,15 +685,24 @@ docker() {
           if [[ -f "$SCOPED_FIXTURE/stopped-$last" && "$TEST_SCENARIO" != still-running ]]; then printf 'false 0\n'; else printf 'true 123\n'; fi ;;
         '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}')
           if [[ "$TEST_SCENARIO" == unhealthy && "$current" == desired ]]; then printf 'running unhealthy\n'; else printf 'running healthy\n'; fi ;;
+        '{{.State.Health.Status}}')
+          if [[ "$TEST_SCENARIO" == broker-unhealthy ]]; then printf 'unhealthy\n'; else printf 'healthy\n'; fi ;;
         *) return 82 ;;
       esac ;;
     image)
       if [[ "${'${'}3:-}" == --format ]]; then
         image="$TEST_NEW_IMAGE"
         if [[ "$TEST_SCOPE" == identity-with-operations-manifest && "$last" == winwidget-operations:* ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
+        if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$last" == winwidget-operations:* ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
+        if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$last" == winwidget-support:* ]]; then image="$TEST_SUPPORT_IMAGE"; fi
         printf '%s %s\n' "$image" "$TEST_REVISION"
       else printf '[]\n'; fi ;;
     build) [[ "$TEST_SCENARIO" != build-failed ]] ;;
+    exec) [[ "$TEST_SCENARIO" != broker-unavailable ]] ;;
+    kill)
+      [[ "$2" == --signal=TERM ]] || return 81
+      if [[ "$TEST_SCENARIO" == stop-interrupted ]]; then kill -TERM "$$"; fi
+      if [[ "$TEST_SCENARIO" != stop-timeout ]]; then printf stopped >"$SCOPED_FIXTURE/stopped-$last"; fi ;;
     stop)
       for arg in "$@"; do
         if [[ "$arg" =~ ^[a-f0-9]{64}$ ]]; then printf stopped >"$SCOPED_FIXTURE/stopped-$arg"; fi
@@ -618,18 +720,25 @@ docker() {
       if [[ "$action" == config ]]; then printf '{}\n'; return 0; fi
       if [[ "$action" == up ]]; then
         case "$snapshot" in */desired.json) printf desired >"$SCOPED_PHASE" ;; */rollback.json) printf rollback >"$SCOPED_PHASE" ;; *) return 83 ;; esac
-        for number in 1 2 3 4; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
+        for number in 1 2 3 4 9 11 12 13; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
         if [[ "$snapshot" == */desired.json ]]; then
           if [[ "$TEST_SCENARIO" == term || "$TEST_SCENARIO" == repeated-term ]]; then kill -TERM "$$"; fi
           if [[ "$TEST_SCENARIO" == hup ]]; then kill -HUP "$$"; fi
-          [[ "$TEST_SCENARIO" != replace-failed ]] || return 1
+          [[ "$TEST_SCENARIO" != replace-failed && "$TEST_SCENARIO" != rollback-busy ]] || return 1
         elif [[ "$TEST_SCENARIO" == repeated-term ]]; then
           kill -TERM "$$"
         fi
         return 0
       fi
       if [[ "$action" == run && " $* " == *' database '* ]]; then
+        if [[ " $* " == *' worker-quiet '* ]]; then
+          if [[ "$TEST_SCENARIO" == database-busy ]]; then return 1; fi
+          if [[ "$TEST_SCENARIO" == stop-busy && -f "$SCOPED_FIXTURE/stopped-$(printf '%064d' 9)" ]]; then return 1; fi
+          if [[ "$TEST_SCENARIO" == rollback-busy && "$current" == desired ]]; then return 1; fi
+        fi
         if [[ "$TEST_SCENARIO" == ledger-failed && " $* " == *' pre-migration '* ]]; then return 1; fi
+        if [[ "$TEST_SCENARIO" == ledger-failed && " $* " == *' worker-ledger '* ]]; then return 1; fi
+        if [[ "$TEST_SCENARIO" == ledger-post-failed && "$current" == desired && " $* " == *' worker-ledger '* ]]; then return 1; fi
         if [[ "$TEST_SCENARIO" == fence-failed && " $* " == *' fence '* ]]; then return 1; fi
         if [[ "$TEST_SCENARIO" == post-migration-failed && " $* " == *' post-migration '* ]]; then return 1; fi
         if [[ "$TEST_SCENARIO" == drain-failed && " $* " == *' operations-drain '* ]]; then return 1; fi
@@ -646,8 +755,16 @@ docker() {
     run)
       for arg in "$@"; do last="$arg"; done
       case "$last" in
-        *'readFileSync'*) printf '{}\n' ;;
+        *'readFileSync'*)
+          if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$TEST_SCENARIO" == manifest-failed && " $* " == *" $TEST_OPERATIONS_IMAGE "* ]]; then printf '{"changed":true}\n'; else printf '{}\n'; fi ;;
         identity-manifest) [[ "$TEST_SCENARIO" != manifest-failed ]] ;;
+        broker-quiet)
+          local sample=0
+          [[ ! -f "$SCOPED_FIXTURE/broker-sample" ]] || sample="$(<"$SCOPED_FIXTURE/broker-sample")"
+          sample=$((sample + 1)); printf '%s' "$sample" >"$SCOPED_FIXTURE/broker-sample"
+          [[ "$TEST_SCENARIO" != broker-busy ]] || return 1
+          [[ "$TEST_SCENARIO" != quiet-second || "$sample" != 2 ]] || return 1
+          [[ "$TEST_SCENARIO" != quiet-last || "$sample" != 3 ]] || return 1 ;;
         prepare)
           [[ "$TEST_SCENARIO" != prepare-failed ]] || return 1
           printf '{}\n' >"$scoped_work_directory/desired.json"
@@ -668,14 +785,18 @@ function runRuntime(scope, scenario = 'success') {
 		const root = join(directory, 'app')
 		for (const relative of [
 			'deploy/backend', 'payload', 'release/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog',
-			'services/apps/operations', 'services/apps/api-gateway', 'services/apps/identity',
+			'services/apps/operations', 'services/apps/api-gateway', 'services/apps/identity', 'services/apps/billing', 'services/apps/support',
 			`deploy/backend/scoped-releases/operations-backlog/${oldRevision}`
 		]) mkdirSync(join(root, relative), { recursive: true })
 		const env = 'SYNTHETIC_ONLY=true\n'
 		for (const relative of [
 			'deploy/backend/.env.production', 'services/apps/operations/.env.production',
-			'services/apps/api-gateway/.env.production', 'services/apps/identity/.env.production'
+			'services/apps/api-gateway/.env.production', 'services/apps/identity/.env.production', 'services/apps/billing/.env.production', 'services/apps/support/.env.production'
 		]) writeFileSync(join(root, relative), env, { mode: 0o600 })
+		for (const owner of ['billing', 'operations', 'support']) {
+			mkdirSync(join(root, `release/apps/${owner}/src/runtime`), { recursive: true })
+			for (const name of ['main.ts', 'runtime/bootstrap-failure.ts']) writeFileSync(join(root, `release/apps/${owner}/src/${name}`), '// synthetic\n')
+		}
 		for (const name of ['phase-a.json', 'restore-evidence.json']) {
 			writeFileSync(join(root, `deploy/backend/scoped-releases/operations-backlog/${oldRevision}`, name), '{}\n', { mode: 0o600 })
 		}
@@ -693,7 +814,7 @@ function runRuntime(scope, scenario = 'success') {
 				TEST_REVISION: revision, TEST_PREVIOUS_REVISION: oldRevision,
 				TEST_ENV_HASH: sha256(env), TEST_EVIDENCE_HASH: sha256('{}\n'),
 				TEST_OLD_IMAGE: `sha256:${'e'.repeat(64)}`, TEST_NEW_IMAGE: `sha256:${'d'.repeat(64)}`,
-				TEST_OPERATIONS_IMAGE: `sha256:${'f'.repeat(64)}`
+				TEST_OPERATIONS_IMAGE: `sha256:${'f'.repeat(64)}`, TEST_SUPPORT_IMAGE: `sha256:${'1'.repeat(64)}`
 			}
 		})
 		assert.equal(result.error, undefined, result.stderr)
@@ -712,6 +833,167 @@ function assertOnlyScopedUp(result, names, rollback = false) {
 	assert.ok(updates[0].includes('/desired.json>'), updates[0])
 	if (rollback) assert.ok(updates[1].includes('/rollback.json>'), updates[1])
 }
+
+test('worker runtime builds three images and proves all owner ledgers before seven-only replacement without DDL', () => {
+	const result = runRuntime(workerScope)
+	assert.equal(result.status, 0, result.stderr)
+	assertOnlyScopedUp(result, SCOPED_SERVICES[workerScope])
+	const lines = result.calls.split('\n')
+	const builds = lines.filter(line => line.startsWith('DOCKER <build>'))
+	assert.equal(builds.length, 3)
+	for (const owner of ['billing', 'operations', 'support']) {
+		assert.equal(builds.filter(line => line.endsWith(`/release/apps/${owner}>`)).length, 1)
+		const probes = lines.filter(line => line.includes(`<database> <worker-ledger> <${owner}>`))
+		assert.equal(probes.length, 2)
+		assert.ok(result.calls.indexOf(probes[0]) < result.calls.indexOf('<up>'))
+		assert.ok(result.calls.lastIndexOf(probes[1]) > result.calls.indexOf('<up>'))
+	}
+	for (const build of builds) assert.ok(result.calls.indexOf(build) < result.calls.indexOf('<up>'))
+	const graceful = lines.filter(line => line.startsWith('DOCKER <kill>'))
+	assert.equal(graceful.length, 7)
+	for (const line of graceful) assert.ok(line.includes('<--signal=TERM>') && result.calls.indexOf(line) < result.calls.indexOf('<up>'))
+	assert.ok(result.calls.indexOf('<worker-quiet>') < result.calls.indexOf('DOCKER <kill>'))
+	assert.ok(!result.calls.includes('MIGRATE ') && !result.calls.includes('DOCKER <stop>'), result.calls)
+})
+
+test('worker quiet-window aborts busy work before TERM and never force-kills unconfirmed exits', () => {
+	for (const scenario of ['database-busy', 'broker-busy', 'broker-unhealthy', 'broker-unavailable', 'quiet-second', 'quiet-last']) {
+		const result = runRuntime(workerScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('DOCKER <kill>') && !result.calls.includes('<up>'), result.calls)
+	}
+	for (const scenario of ['stop-timeout', 'stop-interrupted', 'stop-busy']) {
+		const result = runRuntime(workerScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.match(result.stderr, /RECOVERY_REQUIRED/)
+		assert.ok(!result.calls.includes('<up>') && !result.calls.includes('DOCKER <start>'), result.calls)
+		assert.ok(!result.calls.includes('<--signal=KILL>') && !result.calls.includes('DOCKER <stop>'), result.calls)
+	}
+	const rollback = runRuntime(workerScope, 'rollback-busy')
+	assert.notEqual(rollback.status, 0)
+	assertOnlyScopedUp(rollback, SCOPED_SERVICES[workerScope])
+	assert.match(rollback.stderr, /CRITICAL/)
+})
+
+test('broker quiet parser rejects unacked, unconfirmed, unavailable and malformed channel samples', () => {
+	const channels = Array.from({ length: 8 }, () => ({ consumer_count: 1, messages_unacknowledged: 0, messages_unconfirmed: 0, confirm: true }))
+	assertBrokerQuiet(channels)
+	for (const rows of [[], {}, channels.slice(0, 6), [...channels, { consumer_count: 1, messages_unacknowledged: 1, messages_unconfirmed: 0 }], [...channels, { consumer_count: 0, messages_unacknowledged: 0, messages_unconfirmed: 1 }], [...channels, { consumer_count: '0', messages_unacknowledged: 0, messages_unconfirmed: 0 }]]) assert.throws(() => assertBrokerQuiet(rows))
+})
+
+test('worker source, manifest, configuration or ledger drift cannot mutate running processes', () => {
+	for (const scenario of ['source-drift', 'manifest-failed', 'prepare-failed', 'ledger-failed', 'build-failed']) {
+		const result = runRuntime(workerScope, scenario)
+		assert.notEqual(result.status, 0, `${scenario}: ${result.stderr}`)
+		assert.ok(!result.calls.includes('<up>') && !result.calls.includes('MIGRATE ') && !result.calls.includes('DOCKER <stop>'), result.calls)
+	}
+})
+
+test('worker health, interruption and post-ledger failures roll back only the preserved seven images', () => {
+	for (const scenario of ['replace-failed', 'unhealthy', 'term', 'hup', 'repeated-term', 'ledger-post-failed', 'neighbor-drift']) {
+		const result = runRuntime(workerScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assertOnlyScopedUp(result, SCOPED_SERVICES[workerScope], true)
+		assert.match(result.stderr, /Scoped rollback restored/)
+		assert.ok(!result.calls.includes('MIGRATE ') && !result.calls.includes('DOCKER <stop>'), result.calls)
+	}
+})
+
+test('actual worker source allowlist rejects domain, migration, manifest, Docker, dependency and symlink changes', () => {
+	privateFixture(directory => {
+		const required = []
+		for (const owner of ['billing', 'operations', 'support']) {
+			mkdirSync(join(directory, `apps/${owner}/src/runtime`), { recursive: true })
+			for (const suffix of ['main.ts', 'runtime/bootstrap-failure.ts']) {
+				const path = `apps/${owner}/src/${suffix}`
+				required.push(path)
+				writeFileSync(join(directory, path), '// synthetic source\n')
+			}
+		}
+		const run = files => spawnSync('/bin/bash', ['-c', `
+set -euo pipefail
+source "$SCOPED_LIBRARY"
+release_root="$TEST_ROOT"
+expected_live_revision="$TEST_OLD"
+services_revision="$TEST_NEW"
+git() { if [[ " $* " == *' diff '* ]]; then printf '%s\\n' "$TEST_FILES"; else printf 'synthetic unapproved old lock'; fi; }
+sha256sum() { "$TEST_NODE" -e 'const fs=require("fs"),c=require("crypto"); const b=process.argv[1]?fs.readFileSync(process.argv[1]):fs.readFileSync(0); console.log(c.createHash("sha256").update(b).digest("hex"))' "$@"; }
+scoped_assert_worker_source
+`], { encoding: 'utf8', timeout: 5000, env: { PATH: '/usr/bin:/bin', SCOPED_LIBRARY: scopedControllerPath, TEST_ROOT: directory, TEST_OLD: oldRevision, TEST_NEW: revision, TEST_FILES: files.join('\n'), TEST_NODE: process.execPath } })
+		assert.equal(run(required).status, 0)
+		for (const path of [
+			'apps/billing/src/payments/payment.service.ts', 'apps/billing/Dockerfile', 'apps/support/package.json',
+			'apps/operations/prisma/schema.prisma', 'apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql',
+			'apps/operations/restore-manifests/database-restore-migrations.json', 'apps/crm-access/src/main.ts',
+			'apps/identity/src/main.ts', 'apps/billing/pnpm-lock.yaml', 'apps/support/pnpm-lock.yaml'
+		]) assert.notEqual(run([...required, path]).status, 0, path)
+		assert.notEqual(run(required.slice(1)).status, 0, 'all three bootstrap fixes must be present')
+		const helper = join(directory, 'apps/billing/src/runtime/bootstrap-failure.ts')
+		rmSync(helper)
+		symlinkSync(join(directory, 'apps/billing/src/main.ts'), helper)
+		assert.notEqual(run(required).status, 0, 'runtime helper cannot be a symlink')
+	})
+})
+
+test('worker ledger proof reads only the exact owner identity and already applied migrations', async () => {
+	const files = [{ name: '20260801000000_init_owner', checksum: envHash }]
+	for (const owner of ['billing', 'support', 'operations']) {
+		const fake = (mutate = () => {}) => {
+			const data = {
+				identity: [{ database: `winwidget_${owner}`, schema: owner, username: `winwidget_${owner}_migration`, recovery: false }],
+				service: [{ id: 'singleton', service_name: `${owner}-service`, database_id: '11111111-1111-1111-1111-111111111111' }],
+				ledger: files.map(file => ({ migration_name: file.name, checksum: file.checksum, finished_at: '2026-08-01', rolled_back_at: null }))
+			}
+			mutate(data)
+			return {
+				$queryRawUnsafe: async sql => {
+					assert.match(sql, /^SELECT /)
+					if (sql.includes('current_database()')) return data.identity
+					assert.ok(sql.includes(`"${owner}".`), 'no cross-owner query')
+					if (sql.includes('.service_identity')) return data.service
+					if (sql.includes('._prisma_migrations')) return data.ledger
+					assert.fail('unexpected metadata query')
+				},
+				...Object.fromEntries(['databaseRestoreJob', 'databaseRestorePermit', 'databaseRestoreRecoveryAction', 'outboxEvent', 'providerOperation', 'integrationDeliveryReceipt', 'scheduledJobRun', 'auditEventReceipt', 'telegramWebhookInbox', 'telegramOutboundDelivery', 'consumerReceipt'].map(name => [name, { count: async () => 0 }])),
+				databaseRestoreExecutionLease: { findUnique: async () => null }
+			}
+		}
+		await verifyDatabaseState(fake(), files, 'worker-ledger', owner)
+		await verifyDatabaseState(fake(), files, 'worker-quiet', owner)
+		for (const model of owner === 'billing' ? ['providerOperation', 'outboxEvent', 'integrationDeliveryReceipt'] : owner === 'operations' ? ['scheduledJobRun', 'auditEventReceipt', 'integrationDeliveryReceipt', 'outboxEvent'] : ['telegramWebhookInbox', 'telegramOutboundDelivery', 'outboxEvent', 'consumerReceipt']) {
+			const busy = fake()
+			busy[model].count = async input => { assert.deepEqual(input.where.status.in, model === 'providerOperation' ? ['PENDING', 'PROCESSING'] : ['PROCESSING']); return 1 }
+			await assert.rejects(() => verifyDatabaseState(busy, files, 'worker-quiet', owner))
+		}
+		for (const mutate of [
+			data => { data.identity[0].username = `winwidget_${owner}_runtime` },
+			data => { data.identity[0].database = 'foreign_owner' },
+			data => { data.service[0].service_name = 'foreign-service' },
+			data => { data.ledger = [] },
+			data => { data.ledger[0].finished_at = null },
+			data => { data.ledger[0].rolled_back_at = '2026-08-02' },
+			data => { data.ledger[0].checksum = 'd'.repeat(64) },
+			data => { data.ledger.push({ ...data.ledger[0], migration_name: NOTES_MIGRATION }) }
+		]) await assert.rejects(() => verifyDatabaseState(fake(mutate), files, 'worker-ledger', owner))
+		await assert.rejects(() => verifyDatabaseState(fake(), files, 'pre-migration', owner))
+	}
+})
+
+test('federation runtime is one same-image API config replacement with no worker, build or database command', () => {
+	const result = runRuntime('operations-federation-config')
+	assert.equal(result.status, 0, result.stderr)
+	assertOnlyScopedUp(result, ['operations-api'])
+	assert.ok(!result.calls.includes('MIGRATE ') && !result.calls.includes('<database>') && !result.calls.includes('DOCKER <build>') && !result.calls.includes('DOCKER <stop>'), result.calls)
+	for (const scenario of ['prepare-failed', 'replace-failed', 'unhealthy', 'hup', 'neighbor-drift']) {
+		const failed = runRuntime('operations-federation-config', scenario)
+		assert.notEqual(failed.status, 0)
+		if (scenario === 'prepare-failed') assert.ok(!failed.calls.includes('<up>'))
+		else {
+			assertOnlyScopedUp(failed, ['operations-api'], true)
+			assert.match(failed.stderr, /Scoped rollback restored/)
+		}
+	}
+})
 
 test('real coordinator starts only Operations phase-A runtimes, fences writers, never migrates Notes', () => {
 	const result = runRuntime('operations-runtime')
@@ -929,10 +1211,10 @@ test('actual transport sends both exact tracked payloads through one pinned SSH 
 	// All admitted parameters are hex/base64, scope names, or empty shell tokens.
 	// Decode only this constrained argument list; never evaluate the SSH command.
 	const parameters = encodedArguments[1].split(' ').map(value => value === "''" ? '' : value)
-	assert.equal(parameters.length, 16)
+	assert.equal(parameters.length, 17)
 	assert.deepEqual(parameters.slice(0, 3), [revision, revision, envHash])
 	assert.deepEqual(parameters.slice(5, 10), [identityScope, oldRevision, envHash, '', ''])
-	assert.deepEqual(parameters.slice(14), [oldRevision, envHash])
+	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, ''])
 	for (const [hashIndex, encodedIndex, filename] of [
 		[10, 11, 'deploy-identity-operations-scoped.sh'], [12, 13, 'scoped-service-release.mjs']
 	]) {

@@ -164,6 +164,69 @@ lock. Два дополнительных tracked payload проходят SHA-2
 их не пересоздаёт. Все соседние container IDs/images и hashes env проверяются
 до и после; `--no-deps` запрещает косвенное пересоздание соседних сервисов.
 
+- `workers-bootstrap-recovery`: только `billing-worker`,
+  `billing-outbox-publisher`, `operations-worker`,
+  `operations-outbox-publisher`, `operations-restore-worker`, `support-worker`,
+  `support-outbox-publisher`. `expected_service_env_sha256` относится к Billing;
+  дополнительно нужны `expected_operations_env_sha256`,
+  `expected_support_env_sha256` и `expected_operations_revision`, равный общему
+  `expected_live_revision` всех семи процессов. Выпуск разрешает только изменения
+  трёх `src/main.ts`, `src/runtime/bootstrap-failure.ts` и их unit tests; восемь
+  ранее согласованных qs-only lockfiles сверяются по точным old/new SHA-256.
+  Billing dependencies, Prisma/schema/migrations, Dockerfiles, package manifests,
+  API/domain source и Operations restore catalog неизменны. Три immutable image
+  собираются и проверяются до замены. Initial state семи targets допускает только
+  running healthy/unhealthy; после выпуска все семь обязаны стать healthy на
+  проверенных новых image IDs. Health-правило остальных scopes не ослабляется.
+  Metadata probes трёх owner DB до и после используют существующую migration
+  роль только для SELECT: проверяют database UUID и полностью применённый ledger
+  с точными checksums. `*-migrate` в таком probe — Compose entrypoint, явно
+  переопределённый на Node verifier, **не** запуск Prisma migration runner.
+  Operations restore jobs/permits/leases должны быть idle,
+  `DATABASE_RESTORE_ENABLED=false`; старый/новый bundled restore catalog побайтово
+  совпадает. Нет DDL, API/scheduler/Gateway/CRM rollout, очистки очередей или leases.
+  До замены нужны два quiet samples с интервалом и повтор непосредственно перед
+  SIGTERM: ноль RabbitMQ unacked/unconfirmed, активных Billing ProviderOperations,
+  Operations jobs/restore и processing receipts/Outbox трёх owners. Каждая DB quiet
+  probe ограничена 15 секундами. Проверяются точные container IDs, затем только
+  мягкий TERM и не более 45 секунд ожидания `Running=false`, `Pid=0`; SIGKILL и
+  `docker stop` с принудительным timeout не используются. После выхода — ещё
+  quiet sample и неизменность соседей. Это **не атомарный drain**: обычные
+  at-least-once риски сохраняются, известный Operations busy-lease ACK риск не
+  объявляется исправленным. Busy/неизвестное состояние или неполный выход
+  запрещает replacement и автоматический рестарт остановленных старых workers.
+  Ошибка или сигнал после замены возвращает только семь сохранённых image/config,
+  также после quiet + graceful-stop проверки; иначе выдаётся CRITICAL без kill.
+  Если старые образы снова unhealthy, rollback не объявляется успешным: нужны
+  сохранённые recovery snapshots и операторская проверка.
+  **P1 — следующий backend release:** после worker-only cutover Operations
+  имеет разные per-role revisions: API остаётся на старом image, три workers
+  получают bootstrap fix. Текущие прежние OTP/Notes candidates и admission с
+  единым Operations revision больше не считаются совместимыми. До их promotion
+  нужны отдельный review точных per-role baselines и backport сохранённого
+  bootstrap fix; нельзя возвращать старые worker images ради прохождения gate.
+  Этот scope намеренно не ослабляет проверки следующих выпусков.
+- `operations-federation-config`: только `operations-api`, на **точном текущем
+  live image** и прежнем `APP_REVISION`, без build, DB probes/migrations и workers.
+  Prepared canonical/Operations env hashes должны быть заранее двусторонне
+  синхронизированы. Единственное допустимое изменение runtime env —
+  `NOTIFICATION_DELIVERY_INTERNAL_URL` с legacy loopback URL с путём
+  `/internal/notification-delivery` на тот же точный HTTP origin порта 4401.
+  Другие hosts/ports/paths, credentials, query, HTTPS и любые сопутствующие env
+  изменения отклоняются. `DATABASE_RESTORE_ENABLED=false` сохраняется.
+  Текущий Compose передаёт этот ключ только API, не трём Operations workers;
+  worker recovery сохраняет строгую побайтовую проверку своего env.
+  Rollback возвращает только сохранённый API runtime config; синхронизированные
+  env-файлы автоматически не переписываются. После успешного выпуска отдельно
+  проверить ND overview/failures и отображение источника в админке без вывода
+  токенов или содержимого сообщений.
+  Для одного candidate push в `prod` caller может выполнить config job, затем
+  worker job с `needs` на его успех, закрепив один services SHA и green infra pin.
+  Если config job уже успешен, он не должен повторяться через rerun-all: guard
+  намеренно принимает только legacy-to-origin переход. После failed worker job
+  сначала проверить/recover exact live baselines, затем переисполнить только
+  неуспешную job. Частично обновлённые worker revisions нельзя скрывать заменой
+  expected baseline или повторным общим rollout.
 - `identity-with-operations-manifest`: три Identity и четыре Operations
   runtime; дополнительно `expected_operations_revision` и
   `expected_operations_env_sha256`. Это не Identity-only rollout: Operations
