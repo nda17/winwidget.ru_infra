@@ -766,6 +766,7 @@ docker() {
       local mode='' previous_arg='' arg
       for arg in "$@"; do if [[ "$previous_arg" == /run/crm-release.mjs ]]; then mode="$arg"; fi; previous_arg="$arg"; done
       if [[ "$mode" == inventory || "$mode" == database-neighbors ]]; then
+        [[ "$mode" == database-neighbors ]] || return 101
         command cat >/dev/null
         if [[ "$TEST_SCENARIO" == neighbor-drift && -f "$TEST_DIRECTORY/built-winwidget-crm-access:git-$TEST_REVISION" ]]; then printf 'drift\\n'; else printf '%s\\n' "$TEST_HASH"; fi
       elif [[ "$mode" == database-resources ]]; then

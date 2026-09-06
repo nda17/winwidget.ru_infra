@@ -131,8 +131,12 @@ Scope последовательно собирает четыре owner images 
 уже существующие `winwidget-crm-*:git-<SHA>` без перезаписи их tags.
 Для Node-проверок используются неизменяемые Docker images; Node.js на VPS
 не требуется. Между этапами проверяются env/source/lock и fingerprint всех
-текущих running containers, включая их конфигурацию, mounts, restart count и
-состояние health. Compose получает только подготовленный CRM env и фактические
+текущих соседних running containers, включая их конфигурацию, mounts, restart
+count и состояние health. Оба этапа одинаково исключают из этого fingerprint
+только четыре собственные CRM PostgreSQL; их точную конфигурацию отдельно
+проверяет этап БД. Поэтому новая подготовка после первого создания БД не
+меняет смысл fingerprint. Любой CRM runtime или неизвестный CRM container
+по-прежнему блокирует эти начальные этапы. Compose получает только подготовленный CRM env и фактические
 image IDs, без ambient shell overrides. Сервисный shape validator и проверка
 OCI owner/revision/architecture выполняются до сохранения артефактов.
 

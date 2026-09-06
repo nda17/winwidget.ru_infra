@@ -107,8 +107,11 @@ scoped_deploy_main() {
 	local owner prefix image_tag image_revision image_title image_id file destination
 	local -a images=() image_env=()
 	case "$release_scope" in
-		crm-prepare) crm_inventory_mode=inventory ;;
-		crm-databases) crm_inventory_mode=database-neighbors ;;
+		# Preparation and its following database stage must seal the same
+		# neighbors, including when the four owned databases already exist.
+		# database-neighbors still rejects every CRM application/unknown job;
+		# database-main verifies the four database configurations separately.
+		crm-prepare | crm-databases) crm_inventory_mode=database-neighbors ;;
 		*) die 'Unsupported CRM scope.' ;;
 	esac
 	crm_initialize
