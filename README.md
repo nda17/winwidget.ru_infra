@@ -61,6 +61,14 @@ DDL старый manifest автоматически не возобновляе
 proof. Точные inputs, rollback и ограничения описаны в
 [runbook](docs/runbook.md#узкие-выпуски-identity-и-operations).
 
+CRM имеет два отдельных scope в том же controller: `crm-prepare` запечатывает
+четыре immutable images и нормализованный Compose, а `crm-databases` создаёт
+только четыре изолированные PostgreSQL, проверяет scoped credentials и применяет
+service-owned миграции. Ни один из них не активирует CRM API, broker, Trial или
+продажи и не создаёт backup-копии. Повтор этапа БД сохраняет существующие
+контейнеры, данные и пароли. Ограничения и prerequisites — в
+[CRM runbook](docs/runbook.md#отдельный-этап-crm-databases).
+
 ## Production-окружение GitHub
 
 В репозитории `winwidget.ru_services` настройте следующие repository-level

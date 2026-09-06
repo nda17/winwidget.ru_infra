@@ -33,6 +33,21 @@ jobs:
           export CRM_BROKER_TEST_PACKAGE_JSON="$RUNNER_TEMP/crm-broker-dependencies/package.json"
           node scripts/test-crm-broker-topology.integration.mjs --ci
 
+  crm-database-container:
+    name: CRM real PostgreSQL container boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prove actual container contract and private-file authentication
+        env:
+          CRM_DATABASE_TEST_DOCKER: ci
+        run: node --test --test-name-pattern='real pinned PostgreSQL' scripts/test-crm-release.mjs
+
   verify:
     name: Verify steady-state infrastructure
     runs-on: ubuntu-24.04
@@ -111,7 +126,7 @@ jobs:
         shell: bash
         run: node --test scripts/test-crm-broker-topology.mjs
 
-      - name: Verify CRM scoped preparation without runtime activation
+      - name: Verify CRM preparation and database-only release without application activation
         shell: bash
         run: node --test scripts/test-crm-release.mjs
 

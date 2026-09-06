@@ -106,7 +106,7 @@ node --test .github/scripts/validate-crm-compose.test.mjs
 Sales 5; migration pool 1. Memory/CPU caps обязательны, но не имеют
 idle-derived значений по умолчанию. Сумма caps не доказывает реальный пик.
 
-До первого запуска нужны capacity/business/browser gates из service backlog,
+До открытия рабочего CRM нужны capacity/business/browser gates из service backlog,
 DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
 согласованный Identity/Billing cutover и отдельный CRM-only controller.
 
@@ -146,8 +146,56 @@ Scope не вызывает runtime `up/stop`, migration, broker provisioning, �
 Gateway routes или flags. Не использовать появившиеся файлы вместо свежих
 проверок после прерванной подготовки. До запуска scope на production нужен
 обычный resource preflight для последовательных image builds; подготовка не
-доказывает CRM capacity. Следующий этап controller — DB/broker provisioning,
-миграции и согласованный rollout companion/runtime — пока не подключён.
+доказывает CRM capacity.
+
+#### Отдельный этап `crm-databases`
+
+Scope использует тот же root controller, lock, transport и три одобренных
+baseline/hash inputs. Он требует уже запечатанную подготовку **того же**
+services/infra SHA, env, images и состояния соседних контейнеров. Смена
+inputs не разрешает перезаписать прежний receipt: нужен новый согласованный
+release candidate и новая подготовка. Routine `all` этот этап не запускает.
+При подключении в services workflow оба reusable jobs должны идти последовательно
+для одного `github.sha`: сначала `crm-prepare`, затем `crm-databases`. Отдельный
+commit для смены scope между этапами изменит source SHA и не совпадёт с sealed
+подготовкой. Между ними нельзя менять соседний runtime или canonical env.
+
+Перед применением отдельно подготовить и побайтово сверить локальные и
+серверные admin/backup password files всех четырёх владельцев:
+`deploy/backend/secrets/crm-<service>-postgres-{admin,backup}-password`.
+На VPS — `/opt/winwidget/` перед этим путём, root:root 0600, без symlinks.
+Каждый пароль — независимые 48–128 lowercase hex символов, допустим один
+финальный LF. Runtime/migration passwords остаются только в соответствующих
+URL приватного CRM env. Сам scope не генерирует, не переносит и не ротирует
+production secrets; существующие роли должны успешно пройти TCP-проверку
+пароля **до** повторного bootstrap. Backup role здесь только ограниченная
+роль PostgreSQL: dump, backup job, копии данных и расписания не создаются.
+
+До первого `up` проверяются все owner manifests и credentials, выключенные
+product flags, точный digest PostgreSQL 18 и доступная RAM: сумма четырёх
+DB caps + наибольший последовательный migration cap + 128 MiB verifier +
+2 GiB резерва хоста. Это консервативный gate этапа БД, а не измерение пика
+12 runtime-процессов. Обычный disk/CPU preflight всё ещё обязателен.
+
+Создаются только отсутствующие четыре owner PostgreSQL containers. Существующие
+должны быть единственными, healthy и соответствовать sealed image/config,
+лимитам, loopback ports, owner volumes/networks и приватным secret mounts;
+неизвестные CRM containers, в том числе остановленные jobs, блокируют этап.
+Для каждого владельца последовательно выполняются service-owned role bootstrap,
+реальная аутентификация трёх ролей, migration job из того же immutable image и
+проверка точных migration checksums/object ownership/runtime grants.
+SQL с паролями идёт только по приватному stdin pipeline; verifier использует
+`--log-driver none`, чтобы не сохранять этот поток в Docker logs.
+
+Повтор не пересоздаёт БД и не меняет пароли. При отказе сохраняются все созданные
+БД/volumes и применённые миграции; автоматические down/reset, удаление данных и
+откат DDL запрещены. Перед повтором устранить причину и восстановить те же
+проверяемые inputs. Удаляются только временные verification files.
+Успех этапа не меняет preparation receipt на `releaseApproved:true` и не
+включает приложения, RabbitMQ, payments, Trial или Gateway routes. Отдельные
+broker provisioning и согласованный rollout companion/runtime ещё не подключены
+к этому scope; production-применение и полный runtime load proof остаются
+обязательными gates.
 
 До первого CRM provisioning выпустить совместимый routine controller.
 Его canonical backend env принимает `CRM_RABBITMQ_CONTRACT=disabled`
