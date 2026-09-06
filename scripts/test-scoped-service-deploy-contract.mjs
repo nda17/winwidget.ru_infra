@@ -17,6 +17,7 @@ import {
 	assertOnlyNotesRouteRemoved,
 	migrationFiles,
 	parseIdentityMigrationInventory,
+	parseOperationsBackupUrl,
 	prepareScopedCompose,
 	sha256,
 	validateBackupAcquisition,
@@ -32,6 +33,44 @@ const oldRevision = 'b'.repeat(40)
 const envHash = 'c'.repeat(64)
 const identityScope = 'identity-with-operations-manifest'
 const workerScope = 'workers-bootstrap-recovery'
+
+test('backup URL accepts the existing owner loopback sslmode shape without changing credentials', () => {
+	for (const protocol of ['postgresql', 'postgres']) {
+		for (const suffix of ['', '&sslmode=disable', '&sslmode=disable&connection_limit=8&pool_timeout=30&connect_timeout=30']) {
+			const source = `${protocol}://winwidget_operations_backup:synthetic%40only%3Apassword@127.0.0.1:55441/winwidget_operations?schema=operations${suffix}`
+			const before = new URL(source)
+			const parsed = parseOperationsBackupUrl(source)
+			for (const key of ['protocol', 'hostname', 'port', 'pathname', 'username', 'password']) assert.equal(parsed[key], before[key])
+			assert.equal(parsed.searchParams.get('schema'), 'operations')
+			assert.equal(parsed.searchParams.get('sslmode'), suffix ? 'disable' : null)
+			assert.equal(parsed.searchParams.get('connection_limit'), '1')
+			assert.equal(parsed.searchParams.get('pool_timeout'), '5')
+			assert.equal(parsed.searchParams.get('connect_timeout'), '5')
+		}
+	}
+})
+
+test('backup URL rejects non-owner destinations, duplicate queries and any other TLS policy', () => {
+	const source = 'postgresql://winwidget_operations_backup:synthetic-only@127.0.0.1:55441/winwidget_operations?schema=operations&sslmode=disable'
+	for (const [before, after] of [
+		['postgresql:', 'https:'], ['127.0.0.1', 'localhost'], ['127.0.0.1', '192.0.2.1'],
+		['127.0.0.1', '[::1]'], ['55441', '5432'], ['/winwidget_operations', '/other_owner'],
+		['winwidget_operations_backup:', 'winwidget_operations_runtime:'],
+		['winwidget_operations_backup:', 'winwidget_operations_migration:'],
+		[':synthetic-only@', '@'], ['schema=operations', 'schema=public'],
+		['schema=operations&', ''], ['sslmode=disable', 'sslmode=require'],
+		['sslmode=disable', 'sslmode=prefer'], ['sslmode=disable', 'sslmode=verify-full'],
+		['sslmode=disable', 'sslmode=DISABLE'], ['sslmode=disable', 'sslmode='],
+		['sslmode=disable', 'sslmode=disable&sslmode=disable'],
+		['sslmode=disable', 'sslmode=disable&sslmode=require'],
+		['schema=operations', 'schema=operations&%73chema=operations']
+	]) assert.throws(() => parseOperationsBackupUrl(source.replace(before, after)))
+	for (const suffix of [
+		'#fragment', '&options=-c%20search_path%3Dpublic', '&host=192.0.2.1', '&sslaccept=accept_invalid_certs',
+		'&connection_limit=1&connection_limit=2', '&pool_timeout=5&pool_timeout=6', '&connect_timeout=5&connect_timeout=6'
+	]) assert.throws(() => parseOperationsBackupUrl(`${source}${suffix}`))
+	for (const value of [undefined, null, {}, '', 'not-a-url', 'a'.repeat(4097)]) assert.throws(() => parseOperationsBackupUrl(value))
+})
 
 function payloadMaterialization() {
 	const controller = readFileSync(controllerPath, 'utf8')

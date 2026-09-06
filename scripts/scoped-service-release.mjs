@@ -313,6 +313,29 @@ export async function backupArtifact(filename) {
 	return { artifactSha256: hash.digest('hex'), artifactSize: before.size };
 }
 
+export function parseOperationsBackupUrl(value) {
+	assert.equal(typeof value, 'string');
+	assert.ok(Buffer.byteLength(value, 'utf8') <= 4096);
+	const url = new URL(value.trim());
+	assert.ok(['postgres:', 'postgresql:'].includes(url.protocol));
+	assert.equal(url.hostname, '127.0.0.1');
+	assert.equal(url.port, '55441');
+	assert.equal(url.pathname, '/winwidget_operations');
+	assert.equal(decodeURIComponent(url.username), 'winwidget_operations_backup');
+	assert.ok(url.password && !url.hash);
+	const queryKeys = [...url.searchParams.keys()];
+	assert.equal(new Set(queryKeys).size, queryKeys.length);
+	for (const key of queryKeys) assert.ok(['schema', 'connection_limit', 'pool_timeout', 'connect_timeout', 'sslmode'].includes(key));
+	assert.equal(url.searchParams.get('schema'), 'operations');
+	// The existing owner URL explicitly disables TLS on this fixed loopback
+	// connection, matching pg_dump's PGSSLMODE below. No remote/TLS bypass is allowed.
+	if (url.searchParams.has('sslmode')) assert.equal(url.searchParams.get('sslmode'), 'disable');
+	url.searchParams.set('connection_limit', '1');
+	url.searchParams.set('pool_timeout', '5');
+	url.searchParams.set('connect_timeout', '5');
+	return url;
+}
+
 // This entrypoint is NOT the ordinary maintenance bootstrap: it receives only
 // one read-only backup URL file. No HTTP server, Rabbit/JWT/admin/migration,
 // provider or provenance signing credential enters this disposable executor.
@@ -322,18 +345,7 @@ async function captureOperationsBackup() {
 	const credentialPath = '/run/operations-backup-url';
 	const credential = lstatSync(credentialPath);
 	assert.ok(credential.isFile() && !credential.isSymbolicLink() && credential.nlink === 1 && credential.uid === 1001 && (credential.mode & 0o777) === 0o400 && credential.size <= 4096);
-	const url = new URL(readFileSync(credentialPath, 'utf8').trim());
-	assert.ok(['postgres:', 'postgresql:'].includes(url.protocol));
-	assert.equal(url.hostname, '127.0.0.1');
-	assert.equal(url.port, '55441');
-	assert.equal(url.pathname, '/winwidget_operations');
-	assert.equal(decodeURIComponent(url.username), 'winwidget_operations_backup');
-	assert.ok(url.password && !url.hash);
-	for (const key of url.searchParams.keys()) assert.ok(['schema', 'connection_limit', 'pool_timeout', 'connect_timeout'].includes(key));
-	assert.equal(url.searchParams.get('schema'), 'operations');
-	url.searchParams.set('connection_limit', '1');
-	url.searchParams.set('pool_timeout', '5');
-	url.searchParams.set('connect_timeout', '5');
+	const url = parseOperationsBackupUrl(readFileSync(credentialPath, 'utf8'));
 	const receipt = JSON.parse(readFileSync('/run/phase-a.json', 'utf8'));
 	validatePhaseA(receipt);
 	const startedAt = new Date().toISOString();
