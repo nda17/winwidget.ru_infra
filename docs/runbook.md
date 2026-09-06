@@ -40,6 +40,82 @@ Telegram bridge VPS
 Внутренние API, PostgreSQL и RabbitMQ слушают только loopback/private network.
 Публичными являются frontend, system Nginx API и согласованный Telegram relay.
 
+### WinCRM: отдельная opt-in конфигурация, ещё не production runtime
+
+В `winwidget.ru_services/deploy/docker-compose.crm.yml` описан отдельный
+Compose project `winwidget-crm`. Он не объединяется через `-f` с действующим
+`docker-compose.prod.yml` и не подключён к routine release controller.
+Само наличие конфигурации, зелёный shape test или запущенный CRM frontend
+не разрешают запуск backend, открытие Gateway routes, Trial или продаж.
+
+Состав профилей:
+
+| Профиль | Состав | Назначение |
+| --- | --- | --- |
+| `crm-runtime` | Access 3, Intake 7, Customers 1, Sales 1 | 12 раздельных API/worker/publisher процессов |
+| `crm-databases` | 4 PostgreSQL 18 | Собственные БД, сети, volumes и admin password files |
+| `crm-migrations` | 4 однократных процесса | Тот же immutable image, отдельная migration credential |
+
+Без явно выбранного профиля ни один сервис не активен. Не задавать
+`COMPOSE_PROFILES` глобально и не запускать все миграции параллельно:
+ресурсный отчёт предусматривает только одно последовательное migration job.
+Нет дополнительных RabbitMQ, Identity, Billing, Gateway или общего CRM API.
+
+Этот вариант предназначен только для одного проверенного backend VPS:
+процессы работают через host network и слушают `127.0.0.1:5300–5330`;
+PostgreSQL публикуют только собственные `127.0.0.1:55442–55445`.
+Отдельные обычные bridge networks сохраняют текущий проверенный контракт
+loopback port publishing; они не объединяют базы и не заменяют DB grants.
+При переносе CRM на другой VPS требуется отдельная проверенная private
+topology/HTTPS ingress. Подстановка удалённого адреса в этот same-VPS
+контракт не поддерживается валидатором.
+
+`deploy/crm/.env.example` в services — только список структурных входов.
+Пустые images/revisions/credentials/resource caps намеренно блокируют даже
+`compose config`; не копировать пример в production и не принимать
+синтетические значения из тестов за бюджет размещения. Будущий controller
+должен побайтово синхронизировать canonical production env и материализовать
+отдельные service-owned файлы тем же атомарным способом, что основной контур.
+Runtime получает только явно перечисленные переменные своего сервиса;
+migration не получает HTTP/RabbitMQ credentials, API не получает broker URL.
+Секрет администратора каждой БД хранится отдельно в
+`/opt/winwidget/deploy/backend/secrets/crm-<service>-postgres-admin-password`
+с проверенными `root:root 0600`, без symlinks; runtime его не монтирует.
+Shape validator проверяет только точный путь, не наличие/owner/mode файла.
+
+Восемь background roles используют восемь разных broker principals вида
+`winwidget-crm-<service>-<role>` в существующем vhost `winwidget`.
+Наличие URL не доказывает ACL, durable bindings, delivery или восстановление.
+Пары HTTP-токенов проверяются на совпадение внутри CRM; согласованность
+с существующими Identity/Billing/Widgets ещё должна быть доказана controller.
+Commerce и оба native Widgets flags по умолчанию выключены.
+
+Shape-проверка выполняется без Docker daemon, контейнеров и чтения production:
+
+```bash
+# Из корня winwidget.ru_services
+node --test .github/scripts/validate-crm-compose.test.mjs
+```
+
+Исполняемый validator `.github/scripts/validate-crm-compose.mjs` получает
+нормализованный Compose JSON только по stdin и возвращает безопасный отчёт
+без environment/credentials. Даже при корректной форме отчёт содержит
+`capacityVerified:false`, `credentialsProvisioned:false`,
+`releaseApproved:false`. Не выводить исходный `compose config` в CI/SSH logs.
+Пулы ограничены 40 runtime connections: Access 10, Intake 20, Customers 5,
+Sales 5; migration pool 1. Memory/CPU caps обязательны, но не имеют
+idle-derived значений по умолчанию. Сумма caps не доказывает реальный пик.
+
+До первого запуска нужны capacity/business/browser gates из service backlog,
+DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
+согласованный Identity/Billing cutover и отдельный CRM-only controller.
+Сначала обновить точный inventory contract существующего controller:
+дополнительные CRM containers/users сейчас нарушат routine deploy preflight.
+Не ослаблять проверки до wildcard/любых сторонних контейнеров. Подготовить
+сосуществование обоих проектов, serial migrations, health/queue monitoring
+и rollback без удаления БД/очередей и без отката несовместимых publishers.
+Никакие новые dumps, downloads или backup jobs этой конфигурацией не создаются.
+
 ## Workflow разработки и релизов
 
 Репозитории разделены по ответственности:
