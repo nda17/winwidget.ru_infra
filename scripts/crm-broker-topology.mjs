@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 
 // Deployment tooling only. The CRM controller owns transport, credentials,
 // the shared deploy lock and the immutable image/env checks.
@@ -147,6 +148,227 @@ const contractSha256 = createHash('sha256')
 	.update(JSON.stringify(contract))
 	.digest('hex')
 export const crmBrokerContract = () => structuredClone(contract)
+
+// Run only inside the CRM controller's locked bootstrap stage. Existing
+// credentials are never reset; an interrupted bootstrap resumes missing grants.
+export async function provisionCrmBrokerPrincipals({
+	channel,
+	request,
+	readSnapshot,
+	assertReleaseFence,
+	connect,
+	credentials,
+	legacyPrincipals
+}) {
+	let stage = 'preflight'
+	const crmNames = principals.map(item => item.name)
+	const object = value =>
+		value && typeof value === 'object' && !Array.isArray(value)
+	const snapshot = async () => {
+		const [users, permissions, topics] = await Promise.all([
+			request('/api/users'),
+			request('/api/permissions'),
+			request('/api/topic-permissions')
+		])
+		assert.ok([users, permissions, topics].every(Array.isArray))
+		assert.ok(
+			users.every(item => object(item) && typeof item.name === 'string')
+		)
+		assert.equal(new Set(users.map(item => item.name)).size, users.length)
+		assert.ok(
+			[...permissions, ...topics].every(
+				item =>
+					object(item) &&
+					typeof item.user === 'string' &&
+					typeof item.vhost === 'string' &&
+					users.some(user => user.name === item.user)
+			)
+		)
+		assert.deepEqual(
+			users
+				.filter(item => !crmNames.includes(item.name))
+				.map(item => item.name)
+				.sort(),
+			[...legacyPrincipals].sort()
+		)
+		return { users, permissions, topics }
+	}
+	const withoutCrm = value => ({
+		users: value.users
+			.filter(item => !crmNames.includes(item.name))
+			.sort((a, b) => a.name.localeCompare(b.name)),
+		permissions: value.permissions
+			.filter(item => !crmNames.includes(item.user))
+			.sort((a, b) =>
+				JSON.stringify([a.user, a.vhost]).localeCompare(
+					JSON.stringify([b.user, b.vhost])
+				)
+			),
+		topics: value.topics
+			.filter(item => !crmNames.includes(item.user))
+			.sort((a, b) =>
+				JSON.stringify([a.user, a.vhost, a.exchange]).localeCompare(
+					JSON.stringify([b.user, b.vhost, b.exchange])
+				)
+			)
+	})
+	const resourceGrant = principal => ({
+		user: principal.name,
+		vhost: 'winwidget',
+		configure: principal.configure,
+		write: principal.write,
+		read: principal.read
+	})
+	const topicGrants = principal =>
+		principal.topics.map(topic => ({
+			user: principal.name,
+			vhost: 'winwidget',
+			...topic
+		}))
+	const validatePartial = (state, complete) => {
+		for (const principal of principals) {
+			const user = state.users.find(item => item.name === principal.name)
+			if (complete) assert.ok(user)
+			if (user) {
+				assert.deepEqual(user.tags, [])
+				assert.deepEqual(user.limits ?? {}, {})
+			}
+			const grants = state.permissions.filter(
+				item => item.user === principal.name
+			)
+			if (!user) assert.equal(grants.length, 0)
+			assert.ok(grants.length <= 1)
+			if (complete || grants.length)
+				assert.deepEqual(grants, [resourceGrant(principal)])
+			const allowed = topicGrants(principal)
+			const actual = state.topics.filter(
+				item => item.user === principal.name
+			)
+			if (!user) assert.equal(actual.length, 0)
+			assert.equal(
+				new Set(actual.map(item => item.exchange)).size,
+				actual.length
+			)
+			for (const grant of actual)
+				assert.ok(allowed.some(item => isDeepStrictEqual(item, grant)))
+			if (complete) assert.equal(actual.length, allowed.length)
+		}
+	}
+	const authenticate = async principal => {
+		await assertReleaseFence()
+		const connection = await connect(
+			principal.name,
+			credentials[principal.name]
+		)
+		try {
+			const probe = await connection.createChannel()
+			await probe.close()
+		} finally {
+			await connection.close()
+		}
+	}
+	try {
+		assert.equal(typeof assertReleaseFence, 'function')
+		assert.equal(typeof connect, 'function')
+		assert.ok(
+			Array.isArray(legacyPrincipals) &&
+				legacyPrincipals.length === 16 &&
+				new Set(legacyPrincipals).size === 16 &&
+				legacyPrincipals.every(
+					name =>
+						typeof name === 'string' &&
+						/^[a-z][a-z0-9-]{0,99}$/.test(name) &&
+						!crmNames.includes(name)
+				)
+		)
+		assert.deepEqual(Object.keys(credentials).sort(), [...crmNames].sort())
+		assert.ok(
+			Object.values(credentials).every(
+				value =>
+					typeof value === 'string' && /^[a-f0-9]{48,128}$/.test(value)
+			)
+		)
+		assert.equal(
+			new Set(Object.values(credentials)).size,
+			principals.length
+		)
+		// Capture caller-owned values before any asynchronous operation.
+		credentials = { ...credentials }
+		legacyPrincipals = [...legacyPrincipals]
+		await assertReleaseFence()
+		const before = await snapshot()
+		validatePartial(before, false)
+		// Opening a connection requires a vhost grant. An interrupted bootstrap
+		// without that grant is checked after the exact missing grant is installed.
+		for (const principal of principals.filter(item =>
+			before.permissions.some(grant => grant.user === item.name)
+		))
+			await authenticate(principal)
+		stage = 'topology'
+		await provisionCrmBrokerTopology({
+			channel,
+			readSnapshot,
+			assertReleaseFence
+		})
+		stage = 'principals'
+		for (const principal of principals) {
+			const name = encodeURIComponent(principal.name)
+			if (!before.users.some(item => item.name === principal.name)) {
+				await assertReleaseFence()
+				await request('/api/users/' + name, 'PUT', {
+					password: credentials[principal.name],
+					tags: ''
+				})
+			}
+			if (!before.permissions.some(item => item.user === principal.name)) {
+				await assertReleaseFence()
+				await request('/api/permissions/winwidget/' + name, 'PUT', {
+					configure: principal.configure,
+					write: principal.write,
+					read: principal.read
+				})
+			}
+			for (const topic of principal.topics) {
+				if (
+					before.topics.some(
+						item =>
+							item.user === principal.name &&
+							item.exchange === topic.exchange
+					)
+				)
+					continue
+				await assertReleaseFence()
+				await request(
+					'/api/topic-permissions/winwidget/' + name,
+					'PUT',
+					topic
+				)
+			}
+		}
+		stage = 'authenticate'
+		for (const principal of principals) await authenticate(principal)
+		stage = 'verify'
+		await assertReleaseFence()
+		const after = await snapshot()
+		validatePartial(after, true)
+		assert.deepEqual(withoutCrm(after), withoutCrm(before))
+		for (const user of before.users)
+			assert.deepEqual(
+				after.users.find(item => item.name === user.name),
+				user
+			)
+		const topology = assertCrmBrokerSnapshot(await readSnapshot(), true)
+		return {
+			...topology,
+			credentialsProvisioned: true,
+			authenticatedPrincipals: 9,
+			legacyPrincipalsUnchanged: 16,
+			releaseApproved: false
+		}
+	} catch {
+		throw new Error('CRM broker bootstrap failed at ' + stage)
+	}
+}
 const key = value =>
 	JSON.stringify([
 		value.source,

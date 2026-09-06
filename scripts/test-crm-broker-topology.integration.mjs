@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import {
 	crmBrokerContract,
 	readCrmBrokerSnapshot,
-	provisionCrmBrokerTopology
+	provisionCrmBrokerPrincipals
 } from './crm-broker-topology.mjs'
 
 const image =
@@ -14,14 +14,14 @@ const image =
 const contract = crmBrokerContract()
 const runId = randomBytes(6).toString('hex')
 const name = 'wincrm-broker-contract-' + runId
-const user = 'crm_contract_admin'
+const user = 'crm-contract-admin'
 const password = randomBytes(32).toString('hex')
 const mode = process.argv[2]
 let stage = 'local-boundary'
 let id
 let dockerContext
 let lastSnapshot
-const connections = []
+const connections = new Set()
 const exec = (args, env = {}) =>
 	execFileSync('docker', args, {
 		encoding: 'utf8',
@@ -169,7 +169,8 @@ try {
 			{ timeout: 10000 }
 		)
 		value.on('error', () => {})
-		connections.push(value)
+		connections.add(value)
+		value.once('close', () => connections.delete(value))
 		return value
 	}
 	const admin = await connect(user, password)
@@ -177,12 +178,37 @@ try {
 	channel.on('error', () => {})
 	for (const item of contract.exchanges.filter(item => !item.owned))
 		await channel.assertExchange(item.name, item.type, { durable: true })
+	const legacyPrincipals = [
+		user,
+		...Array.from({ length: 15 }, (_, index) => 'legacy-contract-' + index)
+	]
+	for (const name of legacyPrincipals.slice(1)) {
+		await request('/api/users/' + name, 'PUT', {
+			password: randomBytes(32).toString('hex'),
+			tags: ''
+		})
+		await request('/api/permissions/winwidget/' + name, 'PUT', {
+			configure: '^$',
+			write: '^$',
+			read: '^$'
+		})
+	}
+	const credentials = Object.fromEntries(
+		contract.principals.map(item => [
+			item.name,
+			randomBytes(32).toString('hex')
+		])
+	)
 	const readSnapshot = async () => {
 		lastSnapshot = await readCrmBrokerSnapshot(request)
 		return lastSnapshot
 	}
 	const options = {
 		channel,
+		request,
+		connect,
+		credentials,
+		legacyPrincipals,
 		readSnapshot,
 		assertReleaseFence: async () => {
 			assert.equal(owned().State.Running, true)
@@ -191,7 +217,8 @@ try {
 	}
 	stage = 'first-provision'
 	console.log('CRM broker test: ' + stage)
-	const first = await provisionCrmBrokerTopology(options)
+	const first = await provisionCrmBrokerPrincipals(options)
+	const identities = await request('/api/users')
 	const publish = async (target, exchange, routingKey) => {
 		let returned = false
 		const onReturn = () => {
@@ -221,7 +248,27 @@ try {
 	for (const item of contract.queues)
 		assert.equal((await channel.checkQueue(item.name)).messageCount, 1)
 	stage = 'idempotent-preservation'
-	assert.deepEqual(await provisionCrmBrokerTopology(options), first)
+	assert.deepEqual(await provisionCrmBrokerPrincipals(options), first)
+	assert.deepEqual(await request('/api/users'), identities)
+	stage = 'resume-interrupted-principal'
+	await request(
+		'/api/permissions/winwidget/' + contract.principals[0].name,
+		'DELETE'
+	)
+	assert.deepEqual(await provisionCrmBrokerPrincipals(options), first)
+	assert.deepEqual(await request('/api/users'), identities)
+	stage = 'reject-credential-drift-without-rotation'
+	await assert.rejects(
+		provisionCrmBrokerPrincipals({
+			...options,
+			credentials: {
+				...credentials,
+				[contract.principals[0].name]: randomBytes(32).toString('hex')
+			}
+		}),
+		/^Error: CRM broker bootstrap failed at preflight$/
+	)
+	assert.deepEqual(await request('/api/users'), identities)
 	for (const item of contract.queues)
 		assert.equal((await channel.checkQueue(item.name)).messageCount, 1)
 	stage = 'least-privilege-push-and-confirm'
@@ -229,24 +276,10 @@ try {
 	let received = 0
 	const runtime = new Map()
 	for (const principal of contract.principals) {
-		const secret = randomBytes(32).toString('hex')
-		const encoded = encodeURIComponent(principal.name)
-		await request('/api/users/' + encoded, 'PUT', {
-			password: secret,
-			tags: ''
-		})
-		await request('/api/permissions/winwidget/' + encoded, 'PUT', {
-			configure: principal.configure,
-			write: principal.write,
-			read: principal.read
-		})
-		for (const topic of principal.topics)
-			await request(
-				'/api/topic-permissions/winwidget/' + encoded,
-				'PUT',
-				topic
-			)
-		const connection = await connect(principal.name, secret)
+		const connection = await connect(
+			principal.name,
+			credentials[principal.name]
+		)
 		const consumerChannel = await connection.createConfirmChannel()
 		consumerChannel.on('error', () => {})
 		runtime.set(principal.name, consumerChannel)
@@ -321,6 +354,9 @@ try {
 			topologyVerified: true,
 			repeatedProvisionPreservedMessages: 14,
 			scopedPrincipalsVerified: 9,
+			legacyPrincipalsPreserved: 16,
+			interruptedGrantResumed: true,
+			wrongCredentialRejectedWithoutRotation: true,
 			pushConsumersVerified: 7,
 			confirmedPublicationsDelivered: 5,
 			unrelatedConfigureDenied: 9,
@@ -336,7 +372,7 @@ try {
 			'; private details suppressed'
 	)
 	if (
-		/^CRM topology provisioning failed at (preflight|declare-exchanges|declare-queues|bind-queues|verify)$/.test(
+		/^CRM (topology provisioning|broker bootstrap) failed at (preflight|declare-exchanges|declare-queues|bind-queues|verify|topology|principals|authenticate)$/.test(
 			error?.message ?? ''
 		)
 	)
@@ -375,7 +411,7 @@ try {
 			})
 		)
 } finally {
-	for (const connection of connections.reverse()) {
+	for (const connection of [...connections].reverse()) {
 		try {
 			await connection.close()
 		} catch {

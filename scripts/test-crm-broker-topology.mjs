@@ -6,7 +6,8 @@ import {
 	crmBrokerContract,
 	readCrmBrokerSnapshot,
 	assertCrmBrokerSnapshot,
-	provisionCrmBrokerTopology
+	provisionCrmBrokerTopology,
+	provisionCrmBrokerPrincipals
 } from './crm-broker-topology.mjs'
 
 const contract = crmBrokerContract()
@@ -433,4 +434,334 @@ test('an incomplete final observation or raw broker failure never becomes a succ
 		/^Error: CRM topology provisioning failed at preflight$/
 	)
 	assert.equal(missingFence.calls.length, 0)
+})
+
+function principalHarness() {
+	const topology = harness()
+	const legacyPrincipals = Array.from(
+		{ length: 16 },
+		(_, index) => 'legacy-' + index
+	)
+	const credentials = Object.fromEntries(
+		contract.principals.map((item, index) => [
+			item.name,
+			(index + 1).toString(16).repeat(64)
+		])
+	)
+	const state = {
+		users: legacyPrincipals.map(name => ({
+			name,
+			tags: [],
+			password_hash: 'legacy-hash',
+			limits: {}
+		})),
+		permissions: legacyPrincipals.map(user => ({
+			user,
+			vhost: 'winwidget',
+			configure: '^$',
+			read: '^$',
+			write: '^$'
+		})),
+		topics: [
+			{
+				user: legacyPrincipals[0],
+				vhost: 'winwidget',
+				exchange: 'winwidget.events',
+				read: '^$',
+				write: '^legacy$'
+			}
+		]
+	}
+	const passwords = new Map()
+	const mutations = []
+	const authenticated = []
+	let closed = 0
+	let claimedFence = 0
+	const request = async (path, method = 'GET', body) => {
+		const field = {
+			'/api/users': 'users',
+			'/api/permissions': 'permissions',
+			'/api/topic-permissions': 'topics'
+		}[path]
+		if (method === 'GET') {
+			assert.ok(field)
+			return structuredClone(state[field])
+		}
+		assert.equal(method, 'PUT')
+		assert.ok(topology.fences() > claimedFence)
+		claimedFence = topology.fences()
+		mutations.push({ path, body: structuredClone(body) })
+		const name = path.split('/').at(-1)
+		assert.ok(contract.principals.some(item => item.name === name))
+		if (path.startsWith('/api/users/')) {
+			assert.ok(
+				!state.users.some(item => item.name === name),
+				'must not reset an existing password'
+			)
+			passwords.set(name, body.password)
+			state.users.push({
+				name,
+				tags: [],
+				limits: {},
+				password_hash: 'hash-' + name
+			})
+		} else if (path.startsWith('/api/permissions/winwidget/')) {
+			assert.ok(!state.permissions.some(item => item.user === name))
+			state.permissions.push({ user: name, vhost: 'winwidget', ...body })
+		} else {
+			assert.ok(path.startsWith('/api/topic-permissions/winwidget/'))
+			assert.ok(
+				!state.topics.some(
+					item => item.user === name && item.exchange === body.exchange
+				)
+			)
+			state.topics.push({ user: name, vhost: 'winwidget', ...body })
+		}
+	}
+	const connect = async (name, password) => {
+		assert.equal(passwords.get(name), password)
+		authenticated.push(name)
+		return {
+			createChannel: async () => ({ close: async () => {} }),
+			close: async () => {
+				closed++
+			}
+		}
+	}
+	return {
+		...topology,
+		credentials,
+		legacyPrincipals,
+		request,
+		connect,
+		state,
+		passwords,
+		mutations,
+		authenticated,
+		closed: () => closed
+	}
+}
+
+test('bootstrap provisions exactly nine users, authenticates scoped credentials and preserves all existing identities on replay', async () => {
+	const state = principalHarness()
+	const legacy = structuredClone(state.state)
+	const result = await provisionCrmBrokerPrincipals(state)
+	assert.equal(result.authenticatedPrincipals, 9)
+	assert.equal(result.legacyPrincipalsUnchanged, 16)
+	assert.equal(result.credentialsProvisioned, true)
+	assert.equal(result.releaseApproved, false)
+	assert.equal(state.mutations.length, 20)
+	assert.equal(state.authenticated.length, 9)
+	assert.equal(state.closed(), 9)
+	const before = structuredClone(state.state)
+	// JSON key order and Management inventory order are not semantic changes.
+	state.state.topics = state.state.topics.map(item =>
+		Object.fromEntries(Object.entries(item).reverse())
+	)
+	assert.deepEqual(await provisionCrmBrokerPrincipals(state), result)
+	assert.deepEqual(state.state, before)
+	assert.deepEqual(state.state.users.slice(0, 16), legacy.users)
+	assert.deepEqual(
+		state.state.permissions.slice(0, 16),
+		legacy.permissions
+	)
+	assert.equal(state.mutations.length, 20)
+	assert.equal(state.authenticated.length, 27)
+	assert.equal(state.closed(), 27)
+	assert.ok(state.snapshot.queues.every(item => item.messages === 17))
+})
+
+test('an interrupted bootstrap resumes only missing grants, never resets any credential', async () => {
+	const state = principalHarness()
+	await provisionCrmBrokerPrincipals(state)
+	const users = structuredClone(state.state.users)
+	state.state.permissions = state.state.permissions.filter(
+		item => item.user !== contract.principals[0].name
+	)
+	state.state.topics = state.state.topics.filter(
+		item => !item.user.startsWith('winwidget-crm-')
+	)
+	state.mutations.length = 0
+	await provisionCrmBrokerPrincipals(state)
+	assert.deepEqual(state.state.users, users)
+	assert.equal(state.mutations.length, 3)
+	assert.ok(
+		state.mutations.every(item => !item.path.startsWith('/api/users/'))
+	)
+})
+
+test('pre-existing CRM credential mismatch fails before topology mutation without password rotation', async () => {
+	const state = principalHarness()
+	await provisionCrmBrokerPrincipals(state)
+	const before = structuredClone(state.state)
+	state.calls.length = 0
+	state.mutations.length = 0
+	state.credentials[contract.principals[0].name] = 'f'.repeat(64)
+	await assert.rejects(
+		provisionCrmBrokerPrincipals(state),
+		/^Error: CRM broker bootstrap failed at preflight$/
+	)
+	assert.deepEqual(state.state, before)
+	assert.equal(state.calls.length, 0)
+	assert.equal(state.mutations.length, 0)
+})
+
+test('bootstrap rejects malformed inventory and overprivileged users before any broker mutation', async () => {
+	const mutations = [
+		state => {
+			state.state.users.pop()
+		},
+		state => {
+			state.state.users.push({ name: 'unknown-user', tags: [] })
+		},
+		state => {
+			state.state.users.push(structuredClone(state.state.users[0]))
+		},
+		state => {
+			state.state.users.push(null)
+		},
+		state => {
+			state.state.permissions.push({
+				user: 'unknown-user',
+				vhost: 'winwidget'
+			})
+		},
+		state => {
+			state.state.permissions.at(-1).write = '.*'
+		},
+		state => {
+			state.state.permissions.at(-1).vhost = '/'
+		},
+		state => {
+			state.state.permissions.push(
+				structuredClone(state.state.permissions.at(-1))
+			)
+		},
+		state => {
+			state.state.users.at(-1).tags = ['administrator']
+		},
+		state => {
+			state.state.users.at(-1).limits = { 'max-connections': 1 }
+		},
+		state => {
+			state.state.topics.at(-1).write = '.*'
+		},
+		state => {
+			state.state.topics.at(-1).vhost = '/'
+		},
+		state => {
+			state.state.topics.at(-1).extra = true
+		},
+		state => {
+			state.state.topics.push(structuredClone(state.state.topics.at(-1)))
+		},
+		state => {
+			state.credentials[contract.principals[0].name] = 'weak'
+		},
+		state => {
+			state.credentials[contract.principals[0].name] =
+				state.credentials[contract.principals[1].name]
+		},
+		state => {
+			delete state.credentials[contract.principals[0].name]
+		},
+		state => {
+			state.credentials.extra = 'f'.repeat(64)
+		},
+		state => {
+			state.legacyPrincipals[0] = state.legacyPrincipals[1]
+		},
+		state => {
+			delete state.assertReleaseFence
+		}
+	]
+	for (const mutate of mutations) {
+		const state = principalHarness()
+		await provisionCrmBrokerPrincipals(state)
+		state.calls.length = 0
+		state.mutations.length = 0
+		mutate(state)
+		await assert.rejects(
+			provisionCrmBrokerPrincipals(state),
+			/^Error: CRM broker bootstrap failed at preflight$/
+		)
+		assert.equal(state.calls.length, 0)
+		assert.equal(state.mutations.length, 0)
+	}
+})
+
+test('every bootstrap fence is required and interrupted provisioning remains resumable', async () => {
+	const reference = principalHarness()
+	await provisionCrmBrokerPrincipals(reference)
+	for (let stopAt = 1; stopAt <= reference.fences(); stopAt++) {
+		const state = principalHarness()
+		const fence = state.assertReleaseFence
+		let mutationsAtLoss
+		state.assertReleaseFence = async () => {
+			await fence()
+			if (state.fences() === stopAt) {
+				mutationsAtLoss = state.calls.length + state.mutations.length
+				throw new Error('synthetic-private-env-drift')
+			}
+		}
+		await assert.rejects(
+			provisionCrmBrokerPrincipals(state),
+			/^Error: CRM broker bootstrap failed at [a-z]+$/
+		)
+		assert.equal(
+			state.calls.length + state.mutations.length,
+			mutationsAtLoss
+		)
+		state.assertReleaseFence = fence
+		await provisionCrmBrokerPrincipals(state)
+		assert.equal(
+			state.mutations.filter(item => item.path.startsWith('/api/users/'))
+				.length,
+			9
+		)
+	}
+})
+
+test('bootstrap rejects final identity drift and sanitizes transport errors while closing probes', async () => {
+	for (const field of ['legacy', 'crm']) {
+		const state = principalHarness()
+		const connect = state.connect
+		state.connect = async (...args) => {
+			const value = await connect(...args)
+			if (state.authenticated.length === 9)
+				state.state.users[field === 'legacy' ? 0 : 16].password_hash =
+					'changed'
+			return value
+		}
+		if (field === 'crm') {
+			await provisionCrmBrokerPrincipals({ ...state, connect })
+			state.authenticated.length = 0
+		}
+		await assert.rejects(
+			provisionCrmBrokerPrincipals(state),
+			/^Error: CRM broker bootstrap failed at verify$/
+		)
+	}
+	const state = principalHarness()
+	let closed = false
+	state.connect = async () => ({
+		createChannel: async () => {
+			throw new Error('amqp://private:secret@host')
+		},
+		close: async () => {
+			closed = true
+		}
+	})
+	await assert.rejects(
+		provisionCrmBrokerPrincipals(state),
+		/^Error: CRM broker bootstrap failed at authenticate$/
+	)
+	assert.equal(closed, true)
+	state.request = async () => {
+		throw new Error('private-password-hash')
+	}
+	await assert.rejects(
+		provisionCrmBrokerPrincipals(state),
+		/^Error: CRM broker bootstrap failed at preflight$/
+	)
 })
