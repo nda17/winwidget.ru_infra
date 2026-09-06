@@ -56,6 +56,9 @@ jobs:
           bash -n scripts/deploy-identity-operations-scoped.sh
           shellcheck -x scripts/deploy-identity-operations-scoped.sh
           node --check scripts/scoped-service-release.mjs
+          bash -n scripts/deploy-crm-scoped.sh
+          shellcheck -x scripts/deploy-crm-scoped.sh
+          node --check scripts/crm-release.mjs
           node --check scripts/verify-operations-backlog-backup.mjs
           bash -n scripts/run-isolated-restore-rehearsal.sh
           shellcheck -x scripts/run-isolated-restore-rehearsal.sh
@@ -107,6 +110,10 @@ jobs:
       - name: Verify additive CRM broker topology and scoped ACL contract
         shell: bash
         run: node --test scripts/test-crm-broker-topology.mjs
+
+      - name: Verify CRM scoped preparation without runtime activation
+        shell: bash
+        run: node --test scripts/test-crm-release.mjs
 
       - name: Verify isolated restore rehearsal contract
         shell: bash

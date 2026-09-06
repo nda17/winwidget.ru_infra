@@ -361,7 +361,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope, platformScope]) {
+	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope, platformScope, 'crm-prepare']) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -377,6 +377,14 @@ test('Platform controller rejects destructive and foreign companion authority be
 		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_OPERATIONS_ENV_SHA256: envHash },
 		{ EXPECTED_OPERATIONS_API_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash }
 	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: platformScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization|baseline/i)
+})
+
+test('CRM preparation cannot receive destructive or foreign companion authorization', () => {
+	for (const authority of [
+		{ OPERATIONS_RUNTIME_REVISION: oldRevision }, { OPERATIONS_EVIDENCE_SHA256: envHash },
+		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_OPERATIONS_ENV_SHA256: envHash },
+		{ EXPECTED_OPERATIONS_API_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash }
+	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: 'crm-prepare', EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization|baseline/i)
 })
 
 test('worker release requires all three exact owner envs and no foreign authority', () => {
@@ -2074,8 +2082,10 @@ test('successful or unknown Identity DDL never restores any old Operations manif
 	}
 })
 
-function runTransport(scenario = 'success') {
+function runTransport(scenario = 'success', scope = identityScope) {
 	return privateFixture(directory => {
+		const shellPayload = scope === 'crm-prepare' ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
+		const nodePayload = scope === 'crm-prepare' ? 'crm-release.mjs' : 'scoped-service-release.mjs'
 		const checkout = join(directory, 'infra')
 		const bin = join(directory, 'bin')
 		const trace = join(directory, 'transport.jsonl')
@@ -2083,14 +2093,15 @@ function runTransport(scenario = 'success') {
 		mkdirSync(bin)
 		for (const relative of [
 			'scripts/deploy-services-production.sh', 'scripts/deploy-identity-operations-scoped.sh',
-			'scripts/scoped-service-release.mjs', 'nginx/backend-api.conf', 'nginx/frontend.conf'
+			'scripts/scoped-service-release.mjs', 'scripts/deploy-crm-scoped.sh', 'scripts/crm-release.mjs',
+			'nginx/backend-api.conf', 'nginx/frontend.conf'
 		]) {
-			if (scenario === 'missing-payload' && relative === 'scripts/scoped-service-release.mjs') continue
+			if (scenario === 'missing-payload' && relative === 'scripts/' + nodePayload) continue
 			writeFileSync(join(checkout, relative), readFileSync(join(scriptsRoot, '..', relative)))
 		}
-		if (scenario === 'oversized-payload') writeFileSync(join(checkout, 'scripts/scoped-service-release.mjs'), Buffer.alloc(131073, 35))
-		if (scenario === 'empty-payload') writeFileSync(join(checkout, 'scripts/scoped-service-release.mjs'), '')
-		if (scenario === 'encoded-envelope') for (const filename of ['deploy-identity-operations-scoped.sh', 'scoped-service-release.mjs']) writeFileSync(join(checkout, 'scripts', filename), randomBytes(64000))
+		if (scenario === 'oversized-payload') writeFileSync(join(checkout, 'scripts', nodePayload), Buffer.alloc(131073, 35))
+		if (scenario === 'empty-payload') writeFileSync(join(checkout, 'scripts', nodePayload), '')
+		if (scenario === 'encoded-envelope') for (const filename of [shellPayload, nodePayload]) writeFileSync(join(checkout, 'scripts', filename), randomBytes(64000))
 		const shim = `#!${process.execPath}
 const fs = require('node:fs'), crypto = require('node:crypto'), path = require('node:path');
 const name = path.basename(process.argv[1]), args = process.argv.slice(2), scenario = process.env.TEST_SCENARIO;
@@ -2099,11 +2110,11 @@ if (name === 'git') {
   else if (args.includes('status')) {}
   else if (args.includes('remote') && args.includes('get-url')) process.stdout.write('https://github.com/nda17/winwidget.ru_infra.git\\n');
   else if (args.includes('ls-files')) {
-    if (scenario === 'untracked-payload' && args.at(-1) === 'scripts/scoped-service-release.mjs') process.exit(1);
+    if (scenario === 'untracked-payload' && args.at(-1) === 'scripts/' + process.env.TEST_NODE_PAYLOAD) process.exit(1);
   } else process.exit(81);
 } else if (name === 'sha256sum') {
   for (const filename of args) {
-    const hash = scenario === 'invalid-payload-hash' && filename.endsWith('deploy-identity-operations-scoped.sh')
+    const hash = scenario === 'invalid-payload-hash' && filename.endsWith(process.env.TEST_SHELL_PAYLOAD)
       ? 'not-a-hash' : crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
     process.stdout.write(hash + '  ' + filename + '\\n');
   }
@@ -2129,9 +2140,10 @@ if (name === 'git') {
 			env: {
 				PATH: `${bin}:/usr/bin:/bin`, LANG: 'C',
 				TEST_SCENARIO: scenario, TEST_REVISION: revision, TEST_TRANSPORT_TRACE: trace,
-				INFRA_REVISION: revision, RELEASE_SCOPE: identityScope,
+				INFRA_REVISION: revision, RELEASE_SCOPE: scope,
+				TEST_NODE_PAYLOAD: nodePayload, TEST_SHELL_PAYLOAD: shellPayload,
 				EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash,
-				EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash,
+				...(scope === identityScope ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}),
 				PRODUCTION_SSH_HOST: 'synthetic.invalid', PRODUCTION_SSH_PORT: '2222', PRODUCTION_SSH_USER: 'root',
 				PRODUCTION_SSH_IDENTITY_FILE: identity, PRODUCTION_SSH_KNOWN_HOSTS_FILE: knownHosts,
 				EXPECTED_PRODUCTION_ENV_SHA256: envHash,
@@ -2190,6 +2202,39 @@ test('actual transport rejects missing/untracked/malformed payload and optional 
 		const result = runTransport(scenario)
 		assert.notEqual(result.status, 0, scenario)
 		assert.deepEqual(result.calls, [], `${scenario} must fail before any SSH invocation`)
+	}
+})
+
+test('CRM preparation uses only its two bounded hash-pinned payloads through the existing root transport', () => {
+	const result = runTransport('success', 'crm-prepare')
+	assert.equal(result.status, 0, result.stderr)
+	assert.equal(result.calls.length, 1)
+	const { args, stdin } = result.calls[0]
+	const encoded = args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
+	assert.ok(encoded)
+	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
+	assert.equal(parameters.length, 18)
+	assert.equal(parameters[5], 'crm-prepare')
+	assert.deepEqual(parameters.slice(14), ['', '', '', ''])
+	for (const [hashIndex, encodedIndex, filename] of [
+		[10, 11, 'deploy-crm-scoped.sh'], [12, 13, 'crm-release.mjs']
+	]) {
+		const original = readFileSync(join(scriptsRoot, filename))
+		assert.equal(parameters[hashIndex], sha256(original))
+		assert.deepEqual(gunzipSync(Buffer.from(parameters[encodedIndex], 'base64')), original)
+	}
+	assert.ok(parameters[11].length + parameters[13].length <= 90000)
+	assert.ok(stdin.indexOf('flock -n "$deploy_lock_fd"') < stdin.indexOf('scoped_deploy_main'))
+	assert.ok(stdin.includes('Requested revision must be the exact fetched origin/prod commit.'))
+	assert.ok(!stdin.includes('FRONTEND_CONTROLLER'))
+	assert.ok(args.includes('StrictHostKeyChecking=yes'))
+})
+
+test('CRM preparation rejects malformed payloads and any frontend companion before SSH', () => {
+	for (const scenario of ['missing-payload', 'untracked-payload', 'invalid-payload-hash', 'forbidden-frontend', 'oversized-payload', 'empty-payload', 'encoded-envelope']) {
+		const result = runTransport(scenario, 'crm-prepare')
+		assert.notEqual(result.status, 0, scenario)
+		assert.deepEqual(result.calls, [])
 	}
 })
 

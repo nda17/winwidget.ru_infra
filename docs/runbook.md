@@ -109,6 +109,46 @@ idle-derived значений по умолчанию. Сумма caps не до
 До первого запуска нужны capacity/business/browser gates из service backlog,
 DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
 согласованный Identity/Billing cutover и отдельный CRM-only controller.
+
+Подготовительный scope `crm-prepare` проходит через тот же pinned reusable
+workflow и `deploy-services-production.sh`, общий root-owned deploy lock и
+точный fetched `origin/prod`. Он использует отдельные hash-pinned payloads
+`deploy-crm-scoped.sh` и `crm-release.mjs`; остальные scopes и запрет обходить
+Notes finalization через `all` сохраняются. Для него:
+
+- `EXPECTED_LIVE_REVISION` — фактическая ревизия текущего Gateway;
+- `EXPECTED_PRODUCTION_ENV_SHA256` — согласованный hash canonical backend env;
+- `EXPECTED_SERVICE_ENV_SHA256` — hash отдельного подготовленного
+  `/opt/winwidget/deploy/backend/crm/.env.production`, root:root 0600;
+- локальную копию CRM env хранить в `deploy/backend/crm/.env.production`,
+  синхронизировать с VPS по тем же двусторонним правилам, без значений из
+  `.env.example`. Сам scope ни один production env не изменяет;
+- не передавать Operations/destructive/Support authorization или frontend
+  companion secrets. Все четыре CRM services revisions совпадают с выбранным
+  точным source commit.
+
+Scope последовательно собирает четыре owner images или повторно проверяет
+уже существующие `winwidget-crm-*:git-<SHA>` без перезаписи их tags.
+Для Node-проверок используются неизменяемые Docker images; Node.js на VPS
+не требуется. Между этапами проверяются env/source/lock и fingerprint всех
+текущих running containers, включая их конфигурацию, mounts, restart count и
+состояние health. Compose получает только подготовленный CRM env и фактические
+image IDs, без ambient shell overrides. Сервисный shape validator и проверка
+OCI owner/revision/architecture выполняются до сохранения артефактов.
+
+Результат — root-owned 0600 `desired.json` и `receipt.json` в
+`deploy/backend/crm/releases/<SHA>/`; повтор допускает только те же bytes.
+Временные данные удаляются. Это входы следующего release stage, не резервная
+копия БД и не доказательство успешной активации. Receipt всегда содержит
+`capacityVerified:false`, `credentialsProvisioned:false`,
+`migrationsApplied:false`, `runtimeDeployed:false`, `releaseApproved:false`.
+Scope не вызывает runtime `up/stop`, migration, broker provisioning, смену
+Gateway routes или flags. Не использовать появившиеся файлы вместо свежих
+проверок после прерванной подготовки. До запуска scope на production нужен
+обычный resource preflight для последовательных image builds; подготовка не
+доказывает CRM capacity. Следующий этап controller — DB/broker provisioning,
+миграции и согласованный rollout companion/runtime — пока не подключён.
+
 До первого CRM provisioning выпустить совместимый routine controller.
 Его canonical backend env принимает `CRM_RABBITMQ_CONTRACT=disabled`
 (также значение по умолчанию при отсутствии переменной) или `mvp-v1`.

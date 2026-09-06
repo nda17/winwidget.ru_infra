@@ -8,15 +8,15 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, or platform-marketing-runtime
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, or crm-prepare
         default: all
         type: string
       expected_live_revision:
-        description: Approved currently running owner revision for a scoped release
+        description: Approved currently running owner revision (Gateway baseline for crm-prepare)
         default: ''
         type: string
       expected_service_env_sha256:
-        description: Approved byte-identical prepared owner env (Billing for worker recovery)
+        description: Approved byte-identical prepared owner env (Billing for worker recovery, CRM env for crm-prepare)
         default: ''
         type: string
       expected_operations_revision:

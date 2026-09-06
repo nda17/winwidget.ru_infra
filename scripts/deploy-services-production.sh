@@ -63,7 +63,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime)
+	identity-with-operations-manifest | operations-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -117,6 +117,10 @@ esac
 
 scoped_shell_file="$controller_root/scripts/deploy-identity-operations-scoped.sh"
 scoped_node_file="$controller_root/scripts/scoped-service-release.mjs"
+if [[ "$release_scope" == crm-prepare ]]; then
+	scoped_shell_file="$controller_root/scripts/deploy-crm-scoped.sh"
+	scoped_node_file="$controller_root/scripts/crm-release.mjs"
+fi
 command -v gzip >/dev/null || die 'Scoped payload compression is unavailable.'
 for scoped_file in "$scoped_shell_file" "$scoped_node_file"; do
 	[[ -f "$scoped_file" && ! -L "$scoped_file" ]] ||
