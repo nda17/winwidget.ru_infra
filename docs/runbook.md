@@ -286,6 +286,46 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   остановлен. Возобновление требует доказанного ledger/manifest match. До DDL
   можно возобновить только исходные остановленные container IDs после повторной
   quiet проверки; неполная graceful остановка требует recovery без auto-restart.
+- `operations-api-runtime` — узкий image-only ремонт read-фильтров ошибок
+  доставки **до** финализации Notes, независимо от дополнительного backup и
+  restore rehearsal. Меняется только `operations-api`; три Operations worker
+  и остальные 27 контейнеров не останавливаются и не пересоздаются. Обязательны
+  обычные immutable CI/source, root deploy-lock и exact canonical/owner env
+  gates; `operations_runtime_revision`, restore evidence и companion inputs
+  запрещены. `expected_live_revision` указывает исходный Notes-free N, не
+  checkout HEAD. Root600 phase-A receipt проверяется по закреплённому SHA256
+  `445bb6da333f2c1fd8cbc7b63ed131989a60d88c4505d49a3985dd7468822914`:
+  application tree, database UUID, source maintenance-worker ID/image остаются
+  исходными. Global/per-N finalized marker, в том числе dangling symlink,
+  блокирует этот PRE-B scope.
+  Допустимый runtime diff — только согласованные `FAILED`/`RESOLVED`/`CLOSED`
+  predicates в `messaging-admin.service.ts` и три exact test paths; соседние
+  правки, CRM, зависимости, schema/migrations и restore catalog запрещены.
+  Инвентаризация старого и нового образов исполняется UID1001 без сети и
+  credentials: все compiled JS кроме filter module, обе Prisma schemas,
+  generated models, 14 migration files и семь restore targets побайтово
+  неизменны; старый образ действительно имеет legacy filter, новый — fixed.
+  Read-only RepeatableRead probe с существующим migration principal требует
+  ровно 13 applied migrations и exact pending Notes SQL, таблицу Notes и
+  уже установленный table/column/effective DML fence. Он не применяет REVOKE,
+  LOCK, migration или DELETE. Counts и SHA256 Notes и retired BACKLOG audits
+  вычисляются внутри PostgreSQL и сравниваются до/после; строки не выгружаются.
+  Restore должен быть выключен в API и restore-worker; активные jobs, permits,
+  recovery/outbox и execution lease блокируют переключение. Все 43 Gateway
+  routes, соседние container/env/image/mount/restart fingerprints неизменны.
+  API получает только TERM с bounded ожиданием физического выхода, без KILL.
+  После пересоздания проверяются OCI/APP revision и реальные
+  `/health/live`, `/health/ready`, `/api/v1/health/deployment`.
+  **Rollback не безусловен:** ошибка/сигнал после начала остановки, но до
+  успешного post-stop admission оставляет старый API для ручного recovery.
+  После начала replacement автоматический rollback допустим только к
+  сохранённому Notes-free N и лишь при повторном успешном admission, неизменных
+  данных/соседях и доказанном graceful exit; иначе fail-closed, без force-kill.
+  Этот scope не читает, не создаёт и не удаляет dump/acquisition/restore
+  evidence и не меняет штатный backup. После успеха API revision отличается
+  от трёх workers: прежние Notes backup/finalize gates должны отклонять mixed
+  runtime. Для возвращения к Notes B нужен отдельно согласованный протокол;
+  исходная phase-A квитанция не доказывает четыре процесса старой ревизии.
 - `operations-runtime` — фаза A удаления административного Backlog. Только
   четыре Operations runtime, без вызова migration runner. Pending migration
   должна быть ровно `20260910110000_remove_admin_backlog`, предыдущий ledger —

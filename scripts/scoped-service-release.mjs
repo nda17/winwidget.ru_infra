@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 export const NOTES_MIGRATION = '20260910110000_remove_admin_backlog';
 export const OTP_MIGRATION = '20260910010000_add_login_otp';
 export const SCOPED_SERVICES = Object.freeze({
+	'operations-api-runtime': ['operations-api'],
 	'operations-federation-config': ['operations-api'],
 	'workers-bootstrap-recovery': ['billing-api', 'billing-worker', 'billing-outbox-publisher', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker', 'support-worker', 'support-outbox-publisher'],
 	'identity-with-operations-manifest': ['identity-api', 'identity-worker', 'identity-outbox-publisher', 'operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
@@ -17,6 +18,14 @@ export const SCOPED_SERVICES = Object.freeze({
 	'operations-backlog-finalize': [],
 	'gateway-remove-notes': ['api-gateway']
 });
+export const OPERATIONS_API_SOURCE_PATHS = Object.freeze([
+	'apps/operations/src/messaging-admin/messaging-admin.service.ts',
+	'apps/operations/src/messaging-admin/messaging-admin.service.spec.ts',
+	'apps/operations/src/federation/operations-federation.client.spec.ts',
+	'apps/operations/src/operations-http-contract.spec.ts'
+]);
+const API_FILTER_PATH = 'messaging-admin/messaging-admin.service.js';
+export const OPERATIONS_API_PHASE_A_SHA256 = '445bb6da333f2c1fd8cbc7b63ed131989a60d88c4505d49a3985dd7468822914';
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
 export function assertBrokerQuiet(rows) {
 	assert.ok(Array.isArray(rows) && rows.length >= 7);
@@ -143,6 +152,7 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 	for (const name of targets) {
 		const workers = scope === 'workers-bootstrap-recovery';
 		const federation = scope === 'operations-federation-config';
+		const operationsApi = scope === 'operations-api-runtime';
 		const companion = scope === 'identity-with-operations-manifest' && name.startsWith('operations-');
 		const expectedPreviousRevision = companion ? (name === 'operations-api' && operationsApiPreviousRevision ? operationsApiPreviousRevision : operationsPreviousRevision) : previousRevision;
 		const expectedImage = companion || (workers && name.startsWith('operations-')) ? operationsImage
@@ -191,7 +201,7 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 			assert.equal(revision, previousRevision);
 			assert.equal(after.NOTIFICATION_DELIVERY_INTERNAL_URL, 'http://127.0.0.1:4401');
 		}
-		if (federation || (companion && ['operations-api', 'operations-restore-worker'].includes(name)) || (workers && name === 'operations-restore-worker')) {
+		if (operationsApi || federation || (companion && ['operations-api', 'operations-restore-worker'].includes(name)) || (workers && name === 'operations-restore-worker')) {
 			assert.equal(before.DATABASE_RESTORE_ENABLED, 'false');
 			assert.equal(after.DATABASE_RESTORE_ENABLED, 'false');
 		}
@@ -450,6 +460,163 @@ export function validateRestoreEvidence(evidence, receipt, acquisition) {
 	assert.ok(instant(evidence.restoredAt) >= instant(acquisition.completedAt));
 }
 
+// The incident-specific runtime hunk is narrower than its file allowlist.
+export function assertOperationsApiSource(before, after) {
+	assert.ok(typeof before === 'string' && typeof after === 'string' && before.length <= 262144 && after.length <= 262144);
+	const oldOpen = "\t\tif (status === 'OPEN' || status === 'UNRESOLVED')\n\t\t\twhere.resolvedAt = null;";
+	const newOpen = "\t\tif (status === 'FAILED') {\n\t\t\twhere.resolvedAt = null;\n\t\t\twhere.retryingAt = null;\n\t\t} else if (status === 'OPEN' || status === 'UNRESOLVED')\n\t\t\twhere.resolvedAt = null;";
+	const oldClosed = "\t\t} else if (status === 'RESOLVED' || status === 'CLOSED') {\n\t\t\twhere.resolvedAt = { not: null };";
+	const newClosed = "\t\t} else if (status === 'RESOLVED') {\n\t\t\twhere.resolution = IntegrationFailureResolution.DELIVERED;\n\t\t} else if (status === 'CLOSED') {\n\t\t\twhere.resolution = IntegrationFailureResolution.CLOSED_NO_RETRY;";
+	for (const part of [oldOpen, oldClosed]) assert.equal(before.split(part).length, 2);
+	assert.equal(after, before.replace(oldOpen, newOpen).replace(oldClosed, newClosed));
+}
+
+function rootFileBytes(filename, maximum = 1048576) {
+	const metadata = lstatSync(filename);
+	assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1 && metadata.uid === 0 && metadata.gid === 0 && (metadata.mode & 0o7777) === 0o600 && metadata.size > 0 && metadata.size <= maximum);
+	assert.equal(realpathSync(filename), filename);
+	return readFileSync(filename);
+}
+
+export function validateOperationsApiPhase(bytes, expected) {
+	assert.ok(Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= 65536);
+	const phase = JSON.parse(bytes);
+	assert.equal(bytes.toString(), JSON.stringify(phase));
+	validatePhaseA(phase);
+	assert.equal(sha256(bytes), OPERATIONS_API_PHASE_A_SHA256);
+	assert.equal(phase.operationsRuntimeRevision, expected.revision);
+	assert.equal(phase.operationsApplicationTree, expected.applicationTree);
+	assert.equal(phase.notesMigrationChecksum, expected.notesChecksum);
+	return phase;
+}
+
+export function validateOperationsApiInventory(value) {
+	same(Object.keys(value).sort(), ['compiled', 'filterMode', 'generatedModels', 'generatedSchemaSha256', 'kind', 'migrations', 'restoreManifestSha256', 'restoreTargets', 'schemaSha256', 'schemaVersion'].sort());
+	assert.equal(value.schemaVersion, 1);
+	assert.equal(value.kind, 'winwidget.operations.api-image-inventory.v1');
+	assert.ok(['legacy', 'fixed'].includes(value.filterMode));
+	assert.equal(value.migrations.length, 14);
+	assert.equal(value.migrations.at(-1).name, NOTES_MIGRATION);
+	assert.equal(new Set(value.migrations.map(item => item.name)).size, 14);
+	same(value.migrations.map(item => item.name), value.migrations.map(item => item.name).sort());
+	for (const item of value.migrations) { same(Object.keys(item).sort(), ['checksum', 'name']); assert.match(item.name, /^\d{14}_[a-z0-9_]+$/); assert.match(item.checksum, /^[a-f0-9]{64}$/); }
+	for (const key of ['schemaSha256', 'generatedSchemaSha256', 'restoreManifestSha256']) assert.match(value[key], /^[a-f0-9]{64}$/);
+	assert.equal(value.generatedSchemaSha256, value.schemaSha256);
+	// Operations deliberately is not one of its seven own restore targets.
+	same(value.restoreTargets, ['campaigns', 'identity', 'notification-delivery', 'platform', 'reporting', 'support', 'widgets']);
+	assert.ok(Array.isArray(value.generatedModels) && value.generatedModels.length > 10 && value.generatedModels.length < 100 && !value.generatedModels.includes('Note'));
+	same(value.generatedModels, [...new Set(value.generatedModels)].sort());
+	assert.ok(Array.isArray(value.compiled) && value.compiled.length > 10 && value.compiled.length <= 1024);
+	for (const item of value.compiled) { same(Object.keys(item).sort(), ['path', 'sha256']); assert.match(item.path, /^[a-z0-9][a-z0-9./-]*\.js$/); assert.ok(!item.path.includes('..')); assert.match(item.sha256, /^[a-f0-9]{64}$/); }
+	same(value.compiled.map(item => item.path), [...new Set(value.compiled.map(item => item.path))].sort());
+	assert.equal(value.compiled.filter(item => item.path === API_FILTER_PATH).length, 1);
+	return value;
+}
+
+export function assertOperationsApiImages(before, after) {
+	validateOperationsApiInventory(before); validateOperationsApiInventory(after);
+	assert.equal(before.filterMode, 'legacy'); assert.equal(after.filterMode, 'fixed');
+	for (const key of ['migrations', 'schemaSha256', 'generatedSchemaSha256', 'generatedModels', 'restoreManifestSha256', 'restoreTargets']) same(after[key], before[key]);
+	same(after.compiled.filter(item => item.path !== API_FILTER_PATH), before.compiled.filter(item => item.path !== API_FILTER_PATH));
+	assert.notEqual(after.compiled.find(item => item.path === API_FILTER_PATH).sha256, before.compiled.find(item => item.path === API_FILTER_PATH).sha256);
+}
+
+function operationsApiImageInventory(mode) {
+	assert.equal(process.getuid(), 1001);
+	assert.ok(['legacy', 'fixed'].includes(mode));
+	const root = '/app/dist/src', compiled = [];
+	const visit = directory => {
+		assert.equal(realpathSync(directory), directory);
+		for (const entry of readdirSync(directory, { withFileTypes: true })) {
+			assert.ok(!entry.isSymbolicLink());
+			const path = join(directory, entry.name);
+			if (entry.isDirectory()) visit(path);
+			else { assert.ok(entry.isFile()); if (entry.name.endsWith('.js')) compiled.push({ path: path.slice(root.length + 1), sha256: sha256(readFileSync(path)) }); }
+		}
+	};
+	visit(root);
+	const require = createRequire('/app/package.json');
+	const { Prisma } = require('@prisma/operations-client');
+	const { MessagingAdminService } = require(`/app/dist/src/${API_FILTER_PATH}`);
+	const service = Object.create(MessagingAdminService.prototype);
+	for (const status of ['OPEN', 'UNRESOLVED']) same(service.failureWhere({ status }), { resolvedAt: null });
+	same(service.failureWhere({ status: 'RETRYING' }), { resolvedAt: null, retryingAt: { not: null } });
+	for (const status of [undefined, 'ALL']) same(service.failureWhere({ status }), {});
+	if (mode === 'legacy') {
+		assert.throws(() => service.failureWhere({ status: 'FAILED' }));
+		for (const status of ['RESOLVED', 'CLOSED']) same(service.failureWhere({ status }), { resolvedAt: { not: null } });
+	} else {
+		same(service.failureWhere({ status: 'FAILED' }), { resolvedAt: null, retryingAt: null });
+		same(service.failureWhere({ status: 'RESOLVED' }), { resolution: 'DELIVERED' });
+		same(service.failureWhere({ status: 'CLOSED' }), { resolution: 'CLOSED_NO_RETRY' });
+	}
+	assert.throws(() => service.failureWhere({ status: 'UNKNOWN' }));
+	const restoreBytes = readFileSync('/app/restore-manifests/database-restore-migrations.json');
+	const value = { schemaVersion: 1, kind: 'winwidget.operations.api-image-inventory.v1', filterMode: mode,
+		migrations: migrationFiles('/app/prisma/migrations'), schemaSha256: sha256(readFileSync('/app/prisma/schema.prisma')),
+		generatedSchemaSha256: sha256(readFileSync(require.resolve('@prisma/operations-client/schema.prisma'))),
+		generatedModels: Prisma.dmmf.datamodel.models.map(item => item.name).sort(), restoreManifestSha256: sha256(restoreBytes),
+		restoreTargets: Object.keys(JSON.parse(restoreBytes).targets).sort(), compiled: compiled.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0) };
+	validateOperationsApiInventory(value);
+	process.stdout.write(JSON.stringify(value));
+}
+
+export function assertOperationsApiPeers(live, phase, expectedApi, allowStopped = false) {
+	assert.equal(live.length, 5);
+	for (const name of [...SCOPED_SERVICES['operations-runtime'], 'api-gateway']) {
+		const found = live.filter(item => item.Config.Labels['com.docker.compose.service'] === name);
+		assert.equal(found.length, 1);
+		const item = found[0];
+		assert.equal(item.Config.Labels['com.docker.compose.project'], 'winwidget');
+		assert.match(item.Id, /^[a-f0-9]{64}$/);
+		const env = envObject(item.Config.Env);
+		if (name === 'api-gateway') {
+			const routes = JSON.parse(env.GATEWAY_ROUTES_JSON);
+			assert.equal(routes.length, 43); assert.equal(new Set(routes.map(route => route.id)).size, 43);
+			same(routes.filter(route => route.id === 'operations-notes'), [{ id: 'operations-notes', pathPrefix: '/api/v1/notes', upstreamUrl: 'http://127.0.0.1:5200', authPolicy: 'required', timeoutMs: 30000 }]);
+			assert.equal(routes.filter(route => route.upstreamUrl === 'http://127.0.0.1:5200').length, 8);
+		} else {
+			const api = name === 'operations-api';
+			assert.equal(item.Image, api ? expectedApi.imageId : phase.sourceWorkerImageId);
+			assert.equal(item.Config.Labels['org.opencontainers.image.revision'], api ? expectedApi.revision : phase.operationsRuntimeRevision);
+			assert.equal(env.APP_REVISION, api ? expectedApi.revision : phase.operationsRuntimeRevision);
+			if (name === 'operations-worker') assert.equal(item.Id, phase.sourceWorkerContainerId);
+			if (api || name === 'operations-restore-worker') assert.equal(env.DATABASE_RESTORE_ENABLED, 'false');
+		}
+		if (name === 'operations-api' && allowStopped) {
+			assert.ok(['running', 'exited', 'created'].includes(item.State.Status));
+			if (item.State.Status !== 'running') assert.equal(item.State.Pid, 0);
+		} else { assert.equal(item.State.Status, 'running'); assert.equal(item.State.Health?.Status, 'healthy'); }
+	}
+}
+
+export async function verifyOperationsApiHttp(revision, fetcher = fetch) {
+	assert.match(revision, /^[a-f0-9]{40}$/);
+	for (const name of ['live', 'ready', 'deployment']) {
+		const path = name === 'deployment' ? '/api/v1/health/deployment' : `/health/${name}`;
+		const response = await fetcher(`http://127.0.0.1:5200${path}`, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5000) });
+		assert.equal(response.status, 200);
+		assert.equal(response.headers.get('cache-control'), 'no-store');
+		const value = await response.json();
+		assert.equal(value.service, 'operations'); assert.equal(value.role, 'api'); assert.equal(value.revision, revision);
+		if (name !== 'deployment') assert.equal(value.status, name === 'ready' ? 'ready' : 'ok');
+	}
+}
+
+export function operationsApiNeighborFingerprint(live) {
+	assert.equal(live.length, 31);
+	assert.equal(new Set(live.map(item => item.Id)).size, 31);
+	assert.equal(live.filter(item => item.Config.Labels['com.docker.compose.service'] === 'operations-api').length, 1);
+	for (const item of live) {
+		assert.equal(item.Config.Labels['com.docker.compose.project'], 'winwidget');
+		assert.match(item.Id, /^[a-f0-9]{64}$/);
+	}
+	const neighbors = live.filter(item => item.Config.Labels['com.docker.compose.service'] !== 'operations-api');
+	return sha256(JSON.stringify(neighbors.map(item => ({ id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: item.Mounts,
+		status: item.State.Status, running: item.State.Running, startedAt: item.State.StartedAt, health: item.State.Health?.Status ?? null, restartCount: item.RestartCount }))
+		.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
+}
+
 export function migrationFiles(root) {
 	assert.equal(realpathSync(root), resolve(root));
 	assert.ok(lstatSync(root).isDirectory() && !lstatSync(root).isSymbolicLink());
@@ -472,6 +639,10 @@ export function migrationFiles(root) {
 
 export async function verifyDatabaseState(client, files, action, owner, context = {}) {
 	assert.ok(['identity', 'operations'].includes(owner) || (['worker-ledger', 'worker-quiet'].includes(action) && ['billing', 'support'].includes(owner)));
+	if (action === 'operations-api-pre-finalize') {
+		assert.equal(owner, 'operations');
+		assert.equal((await client.$queryRawUnsafe('SHOW transaction_read_only'))[0]?.transaction_read_only, 'on');
+	}
 	{
 		const identity = await client.$queryRawUnsafe(`SELECT current_database() AS database, current_user AS username, current_schema() AS schema, pg_is_in_recovery() AS recovery`);
 		same(identity.map(row => [row.database, row.schema, row.recovery]), [[`winwidget_${owner}`, owner, false]]);
@@ -508,6 +679,34 @@ export async function verifyDatabaseState(client, files, action, owner, context 
 			assert.ok([jobs, permits, recovery, outbox].every(count => count === 0));
 			assert.ok(!lease || Object.values(lease).every(value => value === null));
 		};
+		if (action === 'operations-api-pre-finalize') {
+			assert.equal(files.length, 14);
+			assert.equal(files.at(-1)?.name, NOTES_MIGRATION);
+			assert.equal(assertMigrationLedger(files, ledger, NOTES_MIGRATION), false);
+			const expectedId = context.databaseId ?? process.env.SCOPED_DATABASE_ID;
+			const expectedManifest = context.migrationManifestSha256 ?? process.env.SCOPED_MIGRATION_MANIFEST_SHA256;
+			const expectedNotesChecksum = context.notesChecksum ?? process.env.SCOPED_NOTES_CHECKSUM;
+			assert.equal(serviceIdentity[0].database_id, expectedId);
+			assert.equal(files.at(-1).checksum, expectedNotesChecksum);
+			assert.equal(sha256(JSON.stringify({ schemaVersion: 1, target: 'operations', migrations: files.slice(0, -1) })), expectedManifest);
+			assert.equal((await client.$queryRaw`SELECT to_regclass('operations.notes') IS NOT NULL AS present`)[0].present, true);
+			const grants = await client.$queryRawUnsafe("SELECT count(*)::int AS count FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace CROSS JOIN LATERAL aclexplode(COALESCE(relation.relacl, acldefault('r', relation.relowner))) permission WHERE namespace.nspname = 'operations' AND relation.relname = 'notes' AND permission.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE') AND permission.grantee <> 'winwidget_operations_migration'::regrole");
+			assert.equal(grants[0].count, 0);
+			const columns = await client.$queryRawUnsafe("SELECT count(*)::int AS count FROM pg_attribute attribute JOIN pg_class relation ON relation.oid = attribute.attrelid JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace CROSS JOIN LATERAL aclexplode(attribute.attacl) permission WHERE namespace.nspname = 'operations' AND relation.relname = 'notes' AND permission.privilege_type IN ('INSERT','UPDATE') AND permission.grantee <> 'winwidget_operations_migration'::regrole");
+			assert.equal(columns[0].count, 0);
+			const effective = await client.$queryRawUnsafe("SELECT has_table_privilege('winwidget_operations_runtime', 'operations.notes', 'INSERT,UPDATE,DELETE,TRUNCATE') OR has_any_column_privilege('winwidget_operations_runtime', 'operations.notes', 'INSERT,UPDATE') AS writable");
+			assert.equal(effective[0].writable, false);
+			await assertOperationsIdle(client);
+			// Hash inside the owner DB; no row contents leave this read-only probe.
+			const fingerprints = [];
+			for (const [table, predicate] of [['notes', 'TRUE'], ['admin_event_logs', "section='BACKLOG' OR entity_type='backlog_task' OR action IN ('BACKLOG_TASK_CREATE','BACKLOG_TASK_UPDATE','BACKLOG_TASK_DELETE')"]]) {
+				const rows = await client.$queryRawUnsafe(`SELECT count(*)::text AS count, encode(sha256(convert_to(COALESCE(string_agg(encode(sha256(convert_to(to_jsonb(value)::text, 'UTF8')), 'hex'), '' ORDER BY value.id), ''), 'UTF8')), 'hex') AS fingerprint FROM operations.${table} value WHERE ${predicate}`);
+				assert.equal(rows.length, 1); assert.match(rows[0].count, /^(0|[1-9][0-9]*)$/); assert.match(rows[0].fingerprint, /^[a-f0-9]{64}$/);
+				fingerprints.push(rows[0]);
+			}
+			process.stdout.write(`DATABASE_ID=${expectedId}\nMIGRATION_MANIFEST_SHA256=${expectedManifest}\nNOTES_STATE_SHA256=${sha256(JSON.stringify(fingerprints))}\n`);
+			return;
+		}
 		if (action === 'operations-quiet') {
 			assert.equal(owner, 'operations');
 			await assertOperationsIdle(client);
@@ -594,14 +793,40 @@ async function databaseAction(action, owner) {
 	const client = new PrismaClient(action === 'all-guard'
 		? { datasources: { db: { url: process.env.OPERATIONS_MIGRATION_DATABASE_URL } } }
 		: undefined);
-	const deadline = ['worker-quiet', 'operations-quiet'].includes(action) ? setTimeout(() => process.exit(1), 15000) : undefined;
-	try { await verifyDatabaseState(client, migrationFiles('/app/prisma/migrations'), action, owner); }
+	const deadline = ['worker-quiet', 'operations-quiet', 'operations-api-pre-finalize'].includes(action) ? setTimeout(() => process.exit(1), 15000) : undefined;
+	try {
+		const files = migrationFiles('/app/prisma/migrations');
+		if (action === 'operations-api-pre-finalize') {
+			await client.$transaction(async tx => {
+				await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY');
+				await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '10s'");
+				await verifyDatabaseState(tx, files, action, owner);
+			}, { timeout: 12000, isolationLevel: 'RepeatableRead' });
+		} else await verifyDatabaseState(client, files, action, owner);
+	}
 	finally { await client.$disconnect(); clearTimeout(deadline); }
 }
 
 async function main() {
 	const action = process.argv[2];
 	if (action === 'backup-capture') await captureOperationsBackup();
+	else if (action === 'operations-api-inventory') operationsApiImageInventory(process.argv[3]);
+	else if (action === 'operations-api-http') await verifyOperationsApiHttp(process.argv[3]);
+	else if (action === 'api-neighbors') process.stdout.write(operationsApiNeighborFingerprint(JSON.parse(rootFileBytes('/run/scoped/api-neighbors.json'))));
+	else if (action === 'api-source') {
+		assertOperationsApiSource(rootFileBytes('/run/scoped/api-source-before.ts', 262144).toString(), rootFileBytes('/run/scoped/api-source-after.ts', 262144).toString());
+	} else if (action === 'api-image-pair') {
+		assertOperationsApiImages(JSON.parse(rootFileBytes('/run/scoped/api-image-before.json')), JSON.parse(rootFileBytes('/run/scoped/api-image-after.json')));
+	} else if (action === 'api-phase') {
+		assert.ok(['healthy', 'recovery'].includes(process.argv[3]));
+		const phase = validateOperationsApiPhase(rootFileBytes('/run/scoped/phase-a.json', 65536), { revision: process.env.SCOPED_PHASE_A_REVISION, applicationTree: process.env.SCOPED_APPLICATION_TREE, notesChecksum: process.env.SCOPED_NOTES_CHECKSUM });
+		const before = validateOperationsApiInventory(JSON.parse(rootFileBytes('/run/scoped/api-image-before.json')));
+		assert.equal(before.filterMode, 'legacy');
+		assert.equal(before.migrations.at(-1).checksum, phase.notesMigrationChecksum);
+		assert.equal(sha256(JSON.stringify({ schemaVersion: 1, target: 'operations', migrations: before.migrations.slice(0, -1) })), phase.migrationManifestSha256);
+		assertOperationsApiPeers(JSON.parse(rootFileBytes('/run/scoped/api-peers.json')), phase, { revision: process.env.SCOPED_API_REVISION, imageId: process.env.SCOPED_API_IMAGE }, process.argv[3] === 'recovery');
+		process.stdout.write(`DATABASE_ID=${phase.databaseId}\nMIGRATION_MANIFEST_SHA256=${phase.migrationManifestSha256}\n`);
+	}
 	else if (action === 'backup-admission') {
 		const receipt = JSON.parse(readFileSync('/run/scoped/phase-a.json', 'utf8'));
 		validatePhaseA(receipt);

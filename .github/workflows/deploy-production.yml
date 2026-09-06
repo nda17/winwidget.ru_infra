@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, or operations-federation-config
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, operations-federation-config, or operations-api-runtime
         default: all
         type: string
       expected_live_revision:
@@ -40,7 +40,7 @@ on:
         default: ''
         type: string
       operations_evidence_sha256:
-        description: SHA256 of the independently restored Operations safety backup evidence
+        description: SHA256 of independently restored Operations safety backup evidence (finalization only)
         default: ''
         type: string
     secrets:

@@ -102,6 +102,11 @@ scoped_compose() {
 scoped_verifier() {
 	local verification_revision="${operations_runtime_revision:-$services_revision}"
 	local -a verifier_mounts=(--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro")
+	if [[ "$release_scope" == operations-api-runtime ]]; then
+		verification_revision="$services_revision"
+		verifier_mounts+=(--env "SCOPED_PHASE_A_REVISION=$expected_live_revision"
+			--env "SCOPED_API_REVISION=${scoped_api_expected_revision:-}" --env "SCOPED_API_IMAGE=${scoped_api_expected_image:-}")
+	fi
 	if [[ -n "${scoped_backup_artifact:-}" ]]; then verifier_mounts+=(--volume "$scoped_backup_artifact:/run/scoped-artifact.dump:ro"); fi
 	if [[ "$release_scope" == operations-federation-config ]]; then verification_revision="$expected_live_revision"; fi
 	docker run --rm --interactive --network none --read-only --cap-drop ALL \
@@ -324,6 +329,188 @@ scoped_assert_worker_source() {
 	done
 }
 
+scoped_assert_operations_api_source() {
+	local changes path
+	local -a required=(apps/operations/src/messaging-admin/messaging-admin.service.ts
+		apps/operations/src/messaging-admin/messaging-admin.service.spec.ts
+		apps/operations/src/federation/operations-federation.client.spec.ts
+		apps/operations/src/operations-http-contract.spec.ts)
+	changes="$(git -C "$release_root" diff --name-only "$expected_live_revision" "$services_revision")" || return 1
+	[[ -n "$changes" ]] || return 1
+	while IFS= read -r path; do
+		case "$path" in
+			apps/operations/src/messaging-admin/messaging-admin.service.ts | apps/operations/src/messaging-admin/messaging-admin.service.spec.ts | \
+			apps/operations/src/federation/operations-federation.client.spec.ts | apps/operations/src/operations-http-contract.spec.ts | \
+			.github/workflows/ci.yml | .github/scripts/static-check-services-lifecycle.sh | README.md | docs/backlog.md) ;;
+			*) return 1 ;;
+		esac
+		[[ -f "$release_root/$path" && ! -L "$release_root/$path" && "$(realpath -e "$release_root/$path")" == "$release_root/$path" ]] || return 1
+	done <<<"$changes"
+	for path in "${required[@]}"; do [[ $'\n'"$changes"$'\n' == *$'\n'"$path"$'\n'* ]] || return 1; done
+	git -C "$release_root" show "$expected_live_revision:${required[0]}" >"$scoped_work_directory/api-source-before.ts" || return 1
+	chmod 600 "$scoped_work_directory/api-source-before.ts" || return 1
+	install -m 600 "$release_root/${required[0]}" "$scoped_work_directory/api-source-after.ts" || return 1
+	scoped_verifier api-source || return 1
+}
+
+scoped_api_image_inventory() {
+	local image="$1" mode="$2" output="$3"
+	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$mode" =~ ^(legacy|fixed)$ && "$output" =~ ^api-image-(before|after).json$ ]] || return 1
+	# Image-owner access to public compiled code/schema only. No credentials or
+	# root-owned release receipts cross this mount boundary.
+	(
+		umask 077
+		set -o noclobber
+		docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+			--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
+			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			--entrypoint timeout "$image" --signal=TERM --kill-after=5s 30s \
+			node /run/scoped-verifier.mjs operations-api-inventory "$mode" >"$scoped_work_directory/$output"
+	) || return 1
+}
+
+scoped_api_neighbors() {
+	local ids id result
+	local -a container_ids=()
+	ids="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --format '{{.ID}}')" || return 1
+	while IFS= read -r id; do [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1; container_ids+=("$id"); done <<<"$ids"
+	[[ "${#container_ids[@]}" == 31 ]] || return 1
+	docker inspect "${container_ids[@]}" >"$scoped_work_directory/api-neighbors.json" || return 1
+	chmod 600 "$scoped_work_directory/api-neighbors.json" || return 1
+	result="$(scoped_verifier api-neighbors)" || return 1
+	[[ "$result" =~ ^[a-f0-9]{64}$ ]] || return 1
+	printf '%s' "$result"
+}
+
+scoped_api_chain() {
+	local mode="$1" directory filename id output key value database='' manifest=''
+	local -a ids=()
+	[[ "$mode" == healthy || "$mode" == recovery ]] || return 1
+	for directory in "$app_root/deploy/backend/scoped-releases" "$app_root/deploy/backend/scoped-releases/operations-backlog" "$scoped_state_directory"; do
+		assert_root_owned_directory "$directory"
+	done
+	[[ "$(stat -c '%a' "$scoped_state_directory")" == 700 ]] || return 1
+	# The filter repair neither requires nor reads backup artifacts. Finalization
+	# changes the admitted schema state and therefore requires separate review.
+	for filename in "$app_root/deploy/backend/scoped-releases/operations-backlog/finalized.json" "$scoped_state_directory/finalized.json"; do
+		[[ ! -e "$filename" && ! -L "$filename" ]] || return 1
+	done
+	filename="$scoped_state_directory/phase-a.json"
+	assert_root_owned_file "$filename"
+	[[ "$(stat -c '%a' "$filename")" == 600 ]] || return 1
+	install -m 600 "$filename" "$scoped_work_directory/phase-a.json" || return 1
+	for filename in operations-api operations-worker operations-outbox-publisher operations-restore-worker api-gateway; do
+		id="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --filter "label=com.docker.compose.service=$filename" --format '{{.ID}}')" || return 1
+		[[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+		ids+=("$id")
+	done
+	docker inspect "${ids[@]}" >"$scoped_work_directory/api-peers.json" || return 1
+	chmod 600 "$scoped_work_directory/api-peers.json" || return 1
+	output="$(scoped_verifier api-phase "$mode")" || return 1
+	while IFS='=' read -r key value; do
+		case "$key" in
+			DATABASE_ID) [[ "$value" =~ ^[a-f0-9-]{36}$ && -z "$database" ]] || return 1; database="$value" ;;
+			MIGRATION_MANIFEST_SHA256) [[ "$value" =~ ^[a-f0-9]{64}$ && -z "$manifest" ]] || return 1; manifest="$value" ;;
+			*) return 1 ;;
+		esac
+	done <<<"$output"
+	[[ -n "$database" && -n "$manifest" ]] || return 1
+	[[ -z "${scoped_api_database_id:-}" || "$scoped_api_database_id $scoped_api_manifest_sha256" == "$database $manifest" ]] || return 1
+	scoped_api_database_id="$database"; scoped_api_manifest_sha256="$manifest"
+}
+
+scoped_api_database() {
+	local output expected fingerprint
+	output="$(scoped_source_compose run --rm --no-deps --interactive --user 1001:1001 \
+		--env "SCOPED_DATABASE_ID=$scoped_api_database_id" --env "SCOPED_MIGRATION_MANIFEST_SHA256=$scoped_api_manifest_sha256" \
+		--env "SCOPED_NOTES_CHECKSUM=$scoped_notes_checksum" \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint node operations-migrate /run/scoped-verifier.mjs database operations-api-pre-finalize operations)" || return 1
+	fingerprint="${output##*$'\n'NOTES_STATE_SHA256=}"
+	[[ "$fingerprint" =~ ^[a-f0-9]{64}$ ]] || return 1
+	expected="$(printf 'DATABASE_ID=%s\nMIGRATION_MANIFEST_SHA256=%s' "$scoped_api_database_id" "$scoped_api_manifest_sha256")"
+	[[ "$output" == "$expected"$'\n'"NOTES_STATE_SHA256=$fingerprint" ]] || return 1
+	[[ -z "${scoped_api_notes_state_sha256:-}" || "$scoped_api_notes_state_sha256" == "$fingerprint" ]] || return 1
+	scoped_api_notes_state_sha256="$fingerprint"
+}
+
+scoped_api_http() {
+	docker run --rm --network host --read-only --cap-drop ALL --security-opt no-new-privileges \
+		--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint timeout "$scoped_api_expected_image" --signal=TERM --kill-after=5s 30s \
+		node /run/scoped-verifier.mjs operations-api-http "$scoped_api_expected_revision" || return 1
+}
+
+scoped_api_assert_neighbors() {
+	local fingerprint
+	scoped_assert_unchanged_neighbors
+	fingerprint="$(scoped_api_neighbors)" || return 1
+	[[ "$fingerprint" == "$scoped_api_neighbors_before" ]] || return 1
+}
+
+scoped_api_rollback() {
+	local id image revision
+	id="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=operations-api --format '{{.ID}}')" || return 1
+	[[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+	read -r image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
+	[[ "$image $revision" == "$scoped_image_id $services_revision" || "$image $revision" == "$scoped_api_previous_image_id $expected_live_revision" ]] || return 1
+	scoped_api_expected_image="$image"; scoped_api_expected_revision="$revision"
+	(scoped_api_chain recovery && scoped_api_database && scoped_api_assert_neighbors) || return 1
+	scoped_workers_graceful_stop "$id" || return 1
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || return 1
+	(scoped_api_chain recovery && scoped_api_database && scoped_api_assert_neighbors) || return 1
+	scoped_compose rollback up -d --no-build --no-deps --force-recreate operations-api >/dev/null 2>&1 || return 1
+	scoped_wait_healthy || return 1
+	id="$(scoped_container_id operations-api)" || return 1
+	[[ "$(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")" == "$scoped_api_previous_image_id $expected_live_revision" ]] || return 1
+	scoped_api_expected_image="$scoped_api_previous_image_id"; scoped_api_expected_revision="$expected_live_revision"
+	(scoped_api_http && scoped_api_chain healthy && scoped_api_database && scoped_api_assert_neighbors) || return 1
+}
+
+scoped_deploy_operations_api() {
+	local id image_tag image_revision
+	scoped_api_previous_image_id="$1"; scoped_api_previous_id="$2"
+	[[ -z "$operations_runtime_revision$operations_evidence_sha256" ]] || die 'API-only release does not accept backup/finalization authority.'
+	scoped_state_directory="$app_root/deploy/backend/scoped-releases/operations-backlog/$expected_live_revision"
+	# This is the source tree that issued phase A, not the new API candidate tree.
+	scoped_application_tree="$(git -C "$release_root" rev-parse "$expected_live_revision:apps/operations")"
+	[[ "$scoped_application_tree" =~ ^[a-f0-9]{40}$ ]] || die 'Invalid phase-A application tree.'
+	scoped_notes_checksum="$(sha256sum "$release_root/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql" | awk '{print $1}')"
+	scoped_api_expected_image="$scoped_api_previous_image_id"; scoped_api_expected_revision="$expected_live_revision"
+	scoped_assert_operations_api_source || die 'API-only candidate exceeds the exact read-filter hunk, three tests and release metadata allowlist.'
+	scoped_api_image_inventory "$scoped_api_previous_image_id" legacy api-image-before.json || die 'Preserved API image inventory is unavailable or is not the Notes-free baseline.'
+	scoped_api_neighbors_before="$(scoped_api_neighbors)" || die 'API-only release requires its exact 30 unchanged neighbors.'
+	if ! scoped_api_chain healthy || ! scoped_api_database; then die 'API-only release requires the exact phase-A receipt, pending Notes migration and existing writer fence.'; fi
+	image_tag="winwidget-operations:git-$services_revision"
+	docker build --build-arg "APP_REVISION=$services_revision" --tag "$image_tag" "$release_root/apps/operations" >/dev/null 2>&1 || die 'API-only immutable image build failed.'
+	read -r scoped_image_id image_revision < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_tag")
+	[[ "$scoped_image_id" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" ]] || die 'API image has an unexpected immutable revision.'
+	scoped_api_image_inventory "$scoped_image_id" fixed api-image-after.json || die 'Candidate API compiled read-filter or owner inventory is invalid.'
+	scoped_verifier api-image-pair || die 'API-only image changed another compiled module, Prisma schema or restore catalog.'
+	export OPERATIONS_IMAGE="$scoped_image_id" OPERATIONS_REVISION="$services_revision"
+	scoped_source_compose config --format json >"$scoped_work_directory/compose.json"
+	scoped_target_ids=("$scoped_api_previous_id")
+	docker inspect "${scoped_target_ids[@]}" >"$scoped_work_directory/live.json"
+	docker image inspect "$scoped_image_id" >"$scoped_work_directory/image.json"
+	chmod 600 "$scoped_work_directory/compose.json" "$scoped_work_directory/live.json" "$scoped_work_directory/image.json"
+	scoped_verifier prepare || die 'API-only candidate changes unapproved runtime configuration.'
+	if ! scoped_api_chain healthy || ! scoped_api_database || ! scoped_api_assert_neighbors; then die 'Post-build API-only admission changed.'; fi
+	[[ "$(scoped_container_id operations-api)" == "$scoped_api_previous_id" ]] || die 'API changed identity before graceful stop.'
+	scoped_workers_stop_started=true
+	scoped_workers_graceful_stop "$scoped_api_previous_id" || die 'API graceful exit was not proven; no force-kill or replacement was performed.'
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$scoped_api_previous_id")" == 'false 0' ]] || die 'Old API is not physically stopped.'
+	if ! scoped_api_chain recovery || ! scoped_api_database || ! scoped_api_assert_neighbors; then die 'Post-stop API admission is unknown; keep the preserved Notes-free API stopped for review.'; fi
+	scoped_cutover_started=true
+	scoped_compose desired up -d --no-build --no-deps --force-recreate operations-api >/dev/null 2>&1 || die 'API-only replacement failed.'
+	if ! scoped_wait_healthy || ! scoped_verify_target_images; then die 'API-only immutable runtime is not healthy.'; fi
+	scoped_api_expected_image="$scoped_image_id"; scoped_api_expected_revision="$services_revision"
+	if ! scoped_api_http || ! scoped_api_chain healthy || ! scoped_api_database || ! scoped_api_assert_neighbors; then die 'API-only postflight failed.'; fi
+	id="$(scoped_container_id operations-api)" || die 'New API identity is unavailable.'
+	[[ "$id" != "$scoped_api_previous_id" ]] || die 'API-only replacement was not observed.'
+	printf 'Operations API-only release completed without DDL or worker replacement: infra=%s services=%s\n' "$infra_revision" "$services_revision"
+}
+
 scoped_workers_quiet() {
 	local owner broker action=worker-quiet
 	local -a owners=(billing operations support)
@@ -416,6 +603,12 @@ scoped_cleanup() {
 		else
 			printf '%s\n' 'RECOVERY_REQUIRED: pre-DDL Operations restart needs operator verification.' >&2
 		fi
+	elif [[ "$exit_code" != 0 && "$release_scope" == operations-api-runtime && "${scoped_cutover_started:-false}" == true ]]; then
+		if scoped_api_rollback; then
+			printf '%s\n' 'API-only rollback restored the preserved Notes-free image/config; no database changes were made.' >&2
+		else
+			printf '%s\n' 'CRITICAL: API-only recovery requires operator review; no forced stop, worker replacement or database rollback was attempted.' >&2
+		fi
 	elif [[ "$exit_code" != 0 && "${scoped_cutover_started:-false}" == true && "${scoped_fence_started:-false}" == false ]]; then
 		if { [[ "$release_scope" != workers-bootstrap-recovery && "$release_scope" != operations-runtime ]] || scoped_workers_rollback_ready; } &&
 			scoped_compose rollback up -d --no-build --no-deps --force-recreate "${scoped_targets[@]}" >/dev/null 2>&1 && scoped_wait_healthy; then
@@ -461,14 +654,14 @@ scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
-	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config)$ &&
+	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'
 	[[ "$(stat -Lc '%d:%i' "/proc/self/fd/$deploy_lock_fd")" == "$(stat -c '%d:%i' "$deploy_lock")" ]] ||
 		die 'Scoped deployment did not inherit the canonical production lock.'
 	flock -n "$deploy_lock_fd" || die 'Scoped deployment lost the canonical production lock.'
 	case "$release_scope" in
-		operations-federation-config) scoped_owner=operations; scoped_targets=(operations-api) ;;
+		operations-federation-config | operations-api-runtime) scoped_owner=operations; scoped_targets=(operations-api) ;;
 		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-api billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
 		identity-with-operations-manifest) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-runtime) scoped_owner=operations; scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
@@ -527,6 +720,10 @@ scoped_deploy_main() {
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
+	if [[ "$release_scope" == operations-api-runtime ]]; then
+		scoped_deploy_operations_api "$old_image" "$id"
+		return
+	fi
 	if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == operations-runtime || "$release_scope" == workers-bootstrap-recovery ]]; then
 		image_tag="winwidget-$scoped_owner:git-$services_revision"
 		docker build --build-arg "APP_REVISION=$services_revision" --tag "$image_tag" "$release_root/apps/$scoped_owner" >/dev/null 2>&1 || die 'Scoped immutable image build failed.'

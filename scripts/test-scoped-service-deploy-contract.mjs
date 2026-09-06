@@ -11,17 +11,26 @@ import {
 	NOTES_MIGRATION,
 	OTP_MIGRATION,
 	SCOPED_SERVICES,
+	OPERATIONS_API_PHASE_A_SHA256,
+	OPERATIONS_API_SOURCE_PATHS,
 	assertBrokerQuiet,
+	assertOperationsApiImages,
+	assertOperationsApiPeers,
+	assertOperationsApiSource,
 	assertIdentityManifestCompanion,
 	assertMigrationLedger,
 	assertOnlyNotesRouteRemoved,
 	migrationFiles,
+	operationsApiNeighborFingerprint,
 	parseIdentityMigrationInventory,
 	parseOperationsBackupUrl,
 	prepareScopedCompose,
 	sha256,
 	validateBackupAcquisition,
+	validateOperationsApiInventory,
+	validateOperationsApiPhase,
 	validateRestoreEvidence,
+	verifyOperationsApiHttp,
 	verifyDatabaseState
 } from './scoped-service-release.mjs'
 
@@ -33,6 +42,7 @@ const oldRevision = 'b'.repeat(40)
 const envHash = 'c'.repeat(64)
 const identityScope = 'identity-with-operations-manifest'
 const workerScope = 'workers-bootstrap-recovery'
+const apiScope = 'operations-api-runtime'
 
 test('backup URL accepts the existing owner loopback sslmode shape without changing credentials', () => {
 	for (const protocol of ['postgresql', 'postgres']) {
@@ -149,7 +159,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope]) {
+	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -240,6 +250,7 @@ function composeFixture(scope = identityScope) {
 		if (name === 'identity-api') environment.IDENTITY_LOGIN_OTP_ENABLED = 'true'
 		if (scope === identityScope && ['operations-api', 'operations-restore-worker'].includes(name)) environment.DATABASE_RESTORE_ENABLED = 'false'
 		if (scope === workerScope && name === 'operations-restore-worker') environment.DATABASE_RESTORE_ENABLED = 'false'
+		if (scope === apiScope) environment.DATABASE_RESTORE_ENABLED = 'false'
 		const before = { ...environment, APP_REVISION: oldRevision }
 		if (name === 'identity-api') before.IDENTITY_LOGIN_OTP_ENABLED = 'false'
 		services[name] = {
@@ -761,6 +772,160 @@ test('acquisition rejects old receipts, wrong executor/owner and pre-fence or in
 	assert.throws(() => validateBackupAcquisition(acquisition, { ...receipt, sourceWorkerContainerId: undefined }))
 })
 
+function apiInventoryFixture() {
+	const migrations = Array.from({ length: 13 }, (_, index) => ({ name: `20260801${String(index).padStart(6, '0')}_owner`, checksum: envHash }))
+	migrations.push({ name: NOTES_MIGRATION, checksum: 'e'.repeat(64) })
+	return {
+		schemaVersion: 1, kind: 'winwidget.operations.api-image-inventory.v1', filterMode: 'legacy', migrations,
+		schemaSha256: envHash, generatedSchemaSha256: envHash,
+		generatedModels: Array.from({ length: 19 }, (_, index) => `Model${String(index).padStart(2, '0')}`),
+		restoreManifestSha256: envHash, restoreTargets: ['campaigns', 'identity', 'notification-delivery', 'platform', 'reporting', 'support', 'widgets'],
+		compiled: [...Array.from({ length: 12 }, (_, index) => ({ path: `module-${String(index).padStart(2, '0')}.js`, sha256: envHash })), { path: 'messaging-admin/messaging-admin.service.js', sha256: envHash }].sort((a, b) => a.path.localeCompare(b.path))
+	}
+}
+
+test('API image pairing permits only the approved compiled filter with unchanged owner schema and seven restore targets', () => {
+	const before = apiInventoryFixture(), after = structuredClone(before)
+	after.filterMode = 'fixed'
+	after.compiled.find(item => item.path === 'messaging-admin/messaging-admin.service.js').sha256 = 'f'.repeat(64)
+	assertOperationsApiImages(before, after)
+	for (const mutate of [
+		value => { value.filterMode = 'legacy' }, value => { value.generatedModels.push('Note'); value.generatedModels.sort() },
+		value => { value.generatedSchemaSha256 = 'e'.repeat(64) }, value => { value.schemaSha256 = value.generatedSchemaSha256 = 'e'.repeat(64) },
+		value => { value.restoreTargets.push('operations'); value.restoreTargets.sort() }, value => { value.restoreManifestSha256 = 'e'.repeat(64) },
+		value => { value.migrations[0].checksum = 'e'.repeat(64) }, value => { value.migrations.pop() },
+		value => { value.compiled.find(item => item.path === 'module-00.js').sha256 = 'e'.repeat(64) },
+		value => { value.compiled[0].path = '../unsafe.js' }, value => { value.compiled.push(value.compiled[0]) },
+		value => { value.extra = true }
+	]) { const changed = structuredClone(after); mutate(changed); assert.throws(() => assertOperationsApiImages(before, changed), undefined, mutate.toString()) }
+	assert.throws(() => assertOperationsApiImages(after, before))
+	assert.throws(() => assertOperationsApiImages(before, { ...before, filterMode: 'fixed' }))
+	assert.equal(validateOperationsApiInventory(before), before)
+})
+
+test('API-only Compose has exactly one target and accepts neither env changes nor restore enablement', () => {
+	const input = composeFixture(apiScope), result = prepareScopedCompose(input)
+	assert.deepEqual(Object.keys(result.desired.services), ['operations-api'])
+	assert.deepEqual(Object.keys(result.rollback.services), ['operations-api'])
+	assert.equal(result.rollback.services['operations-api'].image, input.live[0].Image)
+	for (const mutate of [value => { value.compose.services['operations-api'].environment.DATABASE_RESTORE_ENABLED = 'true' }, value => { value.live[0].Config.Env = value.live[0].Config.Env.filter(row => !row.startsWith('DATABASE_RESTORE_ENABLED=')) }, value => { value.compose.services['operations-api'].environment.SYNTHETIC_CHANGED = 'yes' }]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareScopedCompose(changed)) }
+	for (const authority of [{ OPERATIONS_RUNTIME_REVISION: oldRevision }, { OPERATIONS_EVIDENCE_SHA256: envHash }, { EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash }]) rejectBeforeTransport([revision], { RELEASE_SCOPE: apiScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization/i)
+})
+
+test('API incident hunk preserves legacy aliases and rejects adjacent or semantically different edits', () => {
+	const before = "prefix\n\t\tif (status === 'OPEN' || status === 'UNRESOLVED')\n\t\t\twhere.resolvedAt = null;\n\t\telse if (status === 'RETRYING') {\n\t\t\twhere.resolvedAt = null;\n\t\t\twhere.retryingAt = { not: null };\n\t\t} else if (status === 'RESOLVED' || status === 'CLOSED') {\n\t\t\twhere.resolvedAt = { not: null };\n\t\t}\nsuffix"
+	const after = before.replace("\t\tif (status === 'OPEN'", "\t\tif (status === 'FAILED') {\n\t\t\twhere.resolvedAt = null;\n\t\t\twhere.retryingAt = null;\n\t\t} else if (status === 'OPEN'")
+		.replace("\t\t} else if (status === 'RESOLVED' || status === 'CLOSED') {\n\t\t\twhere.resolvedAt = { not: null };", "\t\t} else if (status === 'RESOLVED') {\n\t\t\twhere.resolution = IntegrationFailureResolution.DELIVERED;\n\t\t} else if (status === 'CLOSED') {\n\t\t\twhere.resolution = IntegrationFailureResolution.CLOSED_NO_RETRY;")
+	assertOperationsApiSource(before, after)
+	for (const value of [before, after + '\n', after.replace('prefix', 'other'), after.replace('CLOSED_NO_RETRY', 'DELIVERED'), after.replace('UNRESOLVED', 'UNKNOWN')]) assert.throws(() => assertOperationsApiSource(before, value))
+	assert.throws(() => assertOperationsApiSource(before + before, after + after))
+	assert.equal(OPERATIONS_API_SOURCE_PATHS.length, 4)
+})
+
+test('API phase admission cannot use a synthetic, rewritten or newline-normalized phase receipt', () => {
+	const { receipt } = restoreFixture()
+	assert.equal(OPERATIONS_API_PHASE_A_SHA256, '445bb6da333f2c1fd8cbc7b63ed131989a60d88c4505d49a3985dd7468822914')
+	for (const bytes of [Buffer.from(JSON.stringify(receipt)), Buffer.from(JSON.stringify(receipt) + '\n'), Buffer.from('{}'), Buffer.alloc(65537)]) {
+		assert.throws(() => validateOperationsApiPhase(bytes, { revision: receipt.operationsRuntimeRevision, applicationTree: receipt.operationsApplicationTree, notesChecksum: receipt.notesMigrationChecksum }))
+	}
+})
+
+function apiPeersFixture() {
+	const { receipt: phase } = restoreFixture()
+	const routes = routesFixture().before
+	routes[7].timeoutMs = 30000
+	for (let index = 8; index < 15; index++) routes[index].upstreamUrl = 'http://127.0.0.1:5200'
+	const live = [...SCOPED_SERVICES['operations-runtime'], 'api-gateway'].map((name, index) => ({
+		Id: name === 'operations-worker' ? phase.sourceWorkerContainerId : String(index + 5).repeat(64), Image: phase.sourceWorkerImageId,
+		Config: { Labels: { 'com.docker.compose.service': name, 'com.docker.compose.project': 'winwidget', 'org.opencontainers.image.revision': oldRevision }, Env: [`APP_REVISION=${oldRevision}`, 'DATABASE_RESTORE_ENABLED=false', ...(name === 'api-gateway' ? [`GATEWAY_ROUTES_JSON=${JSON.stringify(routes)}`] : [])] },
+		State: { Status: 'running', Running: true, Pid: 123, StartedAt: '2026-09-05T20:00:00Z', Health: { Status: 'healthy' } }, RestartCount: 0, HostConfig: {}, Mounts: []
+	}))
+	return { live, phase, expected: { revision: oldRevision, imageId: phase.sourceWorkerImageId } }
+}
+
+test('API peer admission preserves the original source worker, restore disabled and all 43 pre-finalization routes', () => {
+	const { live, phase, expected } = apiPeersFixture()
+	assertOperationsApiPeers(live, phase, expected)
+	for (const mutate of [
+		value => { value[1].Id = 'a'.repeat(64) }, value => { value[2].Image = `sha256:${'b'.repeat(64)}` },
+		value => { value[3].Config.Env[1] = 'DATABASE_RESTORE_ENABLED=true' }, value => { value[0].Config.Env[1] = 'DATABASE_RESTORE_ENABLED=true' },
+		value => { value[2].Config.Labels['org.opencontainers.image.revision'] = revision },
+		value => { value[0].State.Health.Status = 'unhealthy' }, value => { value[1].State.Status = 'exited' },
+		value => { const env = value[4].Config.Env; env[2] = `GATEWAY_ROUTES_JSON=${JSON.stringify(JSON.parse(env[2].split('=')[1]).filter(route => route.id !== 'operations-notes'))}` },
+		value => { value.push(value[0]) }
+	]) { const changed = structuredClone(live); mutate(changed); assert.throws(() => assertOperationsApiPeers(changed, phase, expected), undefined, mutate.toString()) }
+	const stopped = structuredClone(live); stopped[0].State = { Status: 'exited', Running: false, Pid: 0 }
+	assertOperationsApiPeers(stopped, phase, expected, true)
+	assert.throws(() => assertOperationsApiPeers(stopped, phase, expected))
+	stopped[0].State.Pid = 123
+	assert.throws(() => assertOperationsApiPeers(stopped, phase, expected, true))
+})
+
+test('API public health proof uses the actual prefixed deployment route and rejects false readiness', async () => {
+	const expected = ['/health/live', '/health/ready', '/api/v1/health/deployment'], calls = []
+	const fake = (patch = () => {}) => async (url, options) => {
+		const path = new URL(url).pathname; calls.push(path)
+		assert.equal(new URL(url).origin, 'http://127.0.0.1:5200'); assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'error')
+		if (!expected.includes(path)) return new Response('{}', { status: 404 })
+		const value = { service: 'operations', role: 'api', revision, status: path === '/health/ready' ? 'ready' : 'ok' }
+		const headers = { 'cache-control': 'no-store' }; patch(value, headers)
+		return new Response(JSON.stringify(value), { status: 200, headers })
+	}
+	await verifyOperationsApiHttp(revision, fake()); assert.deepEqual(calls, expected)
+	for (const patch of [value => { value.revision = oldRevision }, value => { value.role = 'worker' }, value => { value.status = 'down' }, (_, headers) => { delete headers['cache-control'] }]) await assert.rejects(() => verifyOperationsApiHttp(revision, fake(patch)))
+})
+
+test('API neighbor fingerprint excludes only API and notices every worker identity, env, mount or restart', () => {
+	const { live } = apiPeersFixture()
+	for (let index = 0; index < 26; index++) { const item = structuredClone(live[4]); item.Id = (index + 20).toString(16).padStart(64, '0'); item.Config.Labels['com.docker.compose.service'] = `neighbor-${index}`; live.push(item) }
+	const before = operationsApiNeighborFingerprint(live)
+	const apiOnly = structuredClone(live); apiOnly[0].Image = `sha256:${'a'.repeat(64)}`; apiOnly[0].State.Status = 'exited'
+	assert.equal(operationsApiNeighborFingerprint(apiOnly), before)
+	for (const mutate of [value => { value[1].RestartCount++ }, value => { value[2].Config.Env.push('SYNTHETIC_CHANGED=true') }, value => { value[3].Mounts.push({ Source: '/synthetic', Destination: '/changed' }) }, value => { value[4].State.StartedAt = '2026-09-06' }]) { const changed = structuredClone(live); mutate(changed); assert.notEqual(operationsApiNeighborFingerprint(changed), before) }
+	assert.throws(() => operationsApiNeighborFingerprint(live.slice(1)))
+})
+
+test('API database admission is read-only and requires 13 applied migrations, pending Notes SQL, existing fence and idle restore', async () => {
+	const files = apiInventoryFixture().migrations
+	const context = { databaseId: '11111111-1111-1111-1111-111111111111', migrationManifestSha256: sha256(JSON.stringify({ schemaVersion: 1, target: 'operations', migrations: files.slice(0, -1) })), notesChecksum: files.at(-1).checksum }
+	const fixture = (mutate = () => {}) => {
+		const state = { readonly: 'on', username: 'winwidget_operations_migration', databaseId: context.databaseId, notes: 'notes', grants: 0, columns: 0, writable: false, busy: 0, lease: null, ledger: files.slice(0, -1).map(file => ({ migration_name: file.name, checksum: file.checksum, finished_at: '2026-09-05', rolled_back_at: null })) }
+		mutate(state)
+		return {
+			$queryRaw: async sql => {
+				assert.equal(sql.join(''), "SELECT to_regclass('operations.notes') IS NOT NULL AS present", 'existence must not depend on the search_path-sensitive regclass text display')
+				return [{ present: state.notes !== null }]
+			},
+			$queryRawUnsafe: async sql => {
+				assert.match(sql, /^(SELECT |SHOW transaction_read_only$)/)
+				if (sql.startsWith('SHOW ')) return [{ transaction_read_only: state.readonly }]
+				if (sql.includes('current_database()')) return [{ database: 'winwidget_operations', username: state.username, schema: 'operations', recovery: false }]
+				if (sql.includes('.service_identity')) return [{ id: 'singleton', service_name: 'operations-service', database_id: state.databaseId }]
+				if (sql.includes('._prisma_migrations')) return state.ledger
+				if (sql.includes('pg_attribute')) return [{ count: state.columns }]
+				if (sql.includes('aclexplode')) return [{ count: state.grants }]
+				if (sql.includes('has_table_privilege')) return [{ writable: state.writable }]
+				assert.ok(sql.includes('to_jsonb(value)') && sql.includes('sha256(') && (sql.includes('operations.notes') || sql.includes('operations.admin_event_logs')))
+				return [{ count: '2', fingerprint: envHash }]
+			},
+			...Object.fromEntries(['databaseRestoreJob', 'databaseRestorePermit', 'databaseRestoreRecoveryAction', 'outboxEvent'].map(name => [name, { count: async () => state.busy }])),
+			databaseRestoreExecutionLease: { findUnique: async () => state.lease }
+		}
+	}
+	await verifyDatabaseState(fixture(), files, 'operations-api-pre-finalize', 'operations', context)
+	for (const present of [false, undefined, null, 'true', 1]) {
+		const malformed = fixture(); malformed.$queryRaw = async () => [{ present }]
+		await assert.rejects(() => verifyDatabaseState(malformed, files, 'operations-api-pre-finalize', 'operations', context))
+	}
+	for (const mutate of [
+		value => { value.readonly = 'off' }, value => { value.username = 'winwidget_operations_runtime' }, value => { value.databaseId = '22222222-2222-2222-2222-222222222222' },
+		value => { value.ledger.push({ migration_name: NOTES_MIGRATION, checksum: files.at(-1).checksum, finished_at: '2026-09-05', rolled_back_at: null }) },
+		value => { value.ledger[0].checksum = 'f'.repeat(64) }, value => { value.ledger[0].finished_at = null }, value => { value.ledger.pop() },
+		value => { value.notes = null }, value => { value.grants = 1 }, value => { value.columns = 1 }, value => { value.writable = true }, value => { value.busy = 1 }, value => { value.lease = { leaseOwner: 'busy' } }
+	]) await assert.rejects(() => verifyDatabaseState(fixture(mutate), files, 'operations-api-pre-finalize', 'operations', context), undefined, mutate.toString())
+	await assert.rejects(() => verifyDatabaseState(fixture(), files, 'operations-api-pre-finalize', 'operations', { ...context, notesChecksum: 'f'.repeat(64) }))
+})
+
 // Execute the real sourced Bash coordinator. Only process/host boundaries are
 // replaced: no Docker daemon, SSH, production paths, database or network exists.
 // The verifier's real pure contracts are exercised separately above.
@@ -769,6 +934,7 @@ set -euo pipefail
 umask 077
 source "$SCOPED_LIBRARY"
 app_root="$SCOPED_FIXTURE/app"
+if [[ "$TEST_SCOPE" == operations-api-runtime ]]; then app_root="$("$TEST_NODE" -e 'process.stdout.write(require("fs").realpathSync(process.argv[1]))' "$app_root")"; fi
 services_repository="$app_root/services"
 release_root="$app_root/release"
 compose_file="$release_root/compose.yml"
@@ -800,9 +966,11 @@ assert_root_owned_file() { [[ -f "$1" && ! -L "$1" ]] || die 'Synthetic file bou
 assert_root_owned_directory() { [[ -d "$1" && ! -L "$1" ]] || die 'Synthetic directory boundary'; }
 cleanup_scoped_payload() { printf 'CLEANUP_PAYLOAD\n' >>"$SCOPED_CALLS"; }
 stat() {
+  if [[ "$TEST_SCOPE" == operations-api-runtime && "$2" == '%a' && -d "$3" ]]; then printf '700\n'; return; fi
   case "$2" in '%d:%i') printf '11:22\n' ;; '%a') printf '600\n' ;; '%h') printf '1\n' ;; *) return 81 ;; esac
 }
 chown() { :; }
+realpath() { "$TEST_NODE" -e 'process.stdout.write(require("fs").realpathSync(process.argv.at(-1)))' -- "$@"; }
 df() { printf 'Filesystem blocks used available capacity mount\nfixture 9000000 1 8000000 1%% /\n'; }
 mv() { if [[ "$1" == -T ]]; then shift; fi; command mv "$@"; }
 flock() { [[ "$TEST_SCENARIO" != lost-lock ]]; }
@@ -816,7 +984,10 @@ git() {
       if [[ "$TEST_SCENARIO" == mixed-source-drift ]]; then printf 'apps/billing/src/main.ts\n'; fi
       return 0
     fi
-    if [[ "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
+    if [[ "$TEST_SCOPE" == operations-api-runtime ]]; then
+      printf '%s\n' 'apps/operations/src/messaging-admin/messaging-admin.service.ts' 'apps/operations/src/messaging-admin/messaging-admin.service.spec.ts' 'apps/operations/src/federation/operations-federation.client.spec.ts' 'apps/operations/src/operations-http-contract.spec.ts'
+      if [[ "$TEST_SCENARIO" == source-drift ]]; then printf 'apps/operations/src/main.ts\n'; fi
+    elif [[ "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
       for owner in billing operations support; do printf 'apps/%s/src/main.ts\napps/%s/src/runtime/bootstrap-failure.ts\n' "$owner" "$owner"; done
       if [[ "$TEST_SCENARIO" == source-drift ]]; then printf 'apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql\n'; fi
     elif [[ "$TEST_SCENARIO" == companion-drift ]]; then printf 'apps/operations/src/unsafe-change.ts\n';
@@ -852,6 +1023,10 @@ docker() {
   fi
   case "$1" in
     ps)
+      if [[ "$TEST_SCOPE" == operations-api-runtime && " $* " != *'label=com.docker.compose.service='* ]]; then
+        for number in {1..31}; do printf '%064d\n' "$number"; done
+        return 0
+      fi
       for arg in "$@"; do
         case "$arg" in label=com.docker.compose.service=*) service="${'${'}arg#label=com.docker.compose.service=}" ;; esac
       done
@@ -872,6 +1047,7 @@ docker() {
         rabbitmq) number=14 ;;
         *) return 1 ;;
       esac
+      if [[ "$TEST_SCOPE" == operations-api-runtime && "$service" == operations-api && "$current" == desired ]]; then number=15; fi
       printf -v cid '%064d' "$number"
       [[ " $* " == *' --all '* || ! -f "$SCOPED_FIXTURE/stopped-$cid" ]] || return 0
       printf '%s\n' "$cid" ;;
@@ -942,6 +1118,19 @@ docker() {
         return 0
       fi
       if [[ "$action" == run && " $* " == *' database '* ]]; then
+        if [[ "$TEST_SCOPE" == operations-api-runtime ]]; then
+          [[ " $* " == *' database operations-api-pre-finalize operations '* && " $* " != *' prisma '* ]] || return 1
+          local db_calls=0 notes_state="$TEST_ENV_HASH"
+          [[ ! -f "$SCOPED_FIXTURE/api-db-count" ]] || db_calls="$(<"$SCOPED_FIXTURE/api-db-count")"
+          db_calls=$((db_calls + 1)); printf '%s' "$db_calls" >"$SCOPED_FIXTURE/api-db-count"
+          if [[ "$TEST_SCENARIO" == database-busy || "$TEST_SCENARIO" == ledger-failed ]]; then return 1; fi
+          if [[ "$TEST_SCENARIO" == post-stop-database && "$db_calls" == 3 ]]; then return 1; fi
+          if [[ "$TEST_SCENARIO" == post-stop-data && "$db_calls" == 3 ]]; then notes_state="$(printf '%064d' 1)"; fi
+          if [[ "$TEST_SCENARIO" == post-data && "$current" == desired ]]; then notes_state="$(printf '%064d' 1)"; fi
+          if [[ "$TEST_SCENARIO" == rollback-busy && "$current" == desired ]]; then return 1; fi
+          printf 'DATABASE_ID=11111111-1111-1111-1111-111111111111\nMIGRATION_MANIFEST_SHA256=%s\nNOTES_STATE_SHA256=%s\n' "$TEST_ENV_HASH" "$notes_state"
+          return 0
+        fi
         if [[ " $* " == *' worker-quiet '* || " $* " == *' operations-quiet '* ]]; then
           if [[ "$TEST_SCENARIO" == database-busy ]]; then return 1; fi
           if [[ "$TEST_SCENARIO" == stop-busy && -f "$SCOPED_FIXTURE/stopped-$(printf '%064d' 9)" ]]; then return 1; fi
@@ -964,6 +1153,32 @@ docker() {
       fi
       return 84 ;;
     run)
+      if [[ "$TEST_SCOPE" == operations-api-runtime ]]; then
+        case " $* " in
+          *' operations-api-inventory '*)
+            [[ " $* " == *' --network none '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* ]] || return 1
+            [[ "$TEST_SCENARIO" != inventory-failed ]] || return 1
+            printf '{}' ; return ;;
+          *' api-neighbors '*)
+            if [[ "$TEST_SCENARIO" == neighbor-drift && "$current" == desired ]]; then printf '%064d' 1; else printf '%s' "$TEST_ENV_HASH"; fi
+            return ;;
+          *' api-source '*) [[ "$TEST_SCENARIO" != filter-drift ]]; return ;;
+          *' api-image-pair '*) [[ "$TEST_SCENARIO" != compiled-drift ]]; return ;;
+          *' api-phase '*)
+            local phase_calls=0
+            [[ ! -f "$SCOPED_FIXTURE/api-phase-count" ]] || phase_calls="$(<"$SCOPED_FIXTURE/api-phase-count")"
+            phase_calls=$((phase_calls + 1)); printf '%s' "$phase_calls" >"$SCOPED_FIXTURE/api-phase-count"
+            if [[ "$TEST_SCENARIO" == phase-invalid ]]; then return 1; fi
+            if [[ "$TEST_SCENARIO" == post-stop-phase && "$phase_calls" == 3 ]]; then return 1; fi
+            if [[ "$TEST_SCENARIO" == pre-stop-term && "$phase_calls" == 2 ]]; then kill -TERM "$$"; fi
+            if [[ "$TEST_SCENARIO" == post-stop-term && "$phase_calls" == 3 ]]; then kill -TERM "$$"; fi
+            printf 'DATABASE_ID=11111111-1111-1111-1111-111111111111\nMIGRATION_MANIFEST_SHA256=%s\n' "$TEST_ENV_HASH"
+            return ;;
+          *' operations-api-http '*)
+            [[ " $* " == *' --network host '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* ]] || return 1
+            [[ "$TEST_SCENARIO" != http-failed || "$current" != desired ]]; return ;;
+        esac
+      fi
       for arg in "$@"; do last="$arg"; done
       case "$last" in
         *'readFileSync'*)
@@ -1023,8 +1238,14 @@ function runRuntime(scope, scenario = 'success') {
 			mkdirSync(join(root, `release/apps/${owner}/src/runtime`), { recursive: true })
 			for (const name of ['main.ts', 'runtime/bootstrap-failure.ts']) writeFileSync(join(root, `release/apps/${owner}/src/${name}`), '// synthetic\n')
 		}
+		if (scope === apiScope) for (const path of OPERATIONS_API_SOURCE_PATHS) { mkdirSync(dirname(join(root, 'release', path)), { recursive: true }); writeFileSync(join(root, 'release', path), '// synthetic\n') }
 		for (const name of ['phase-a.json', 'restore-evidence.json']) {
 			writeFileSync(join(root, `deploy/backend/scoped-releases/operations-backlog/${oldRevision}`, name), '{}\n', { mode: 0o600 })
+		}
+		if (scope === apiScope && scenario.startsWith('finalized-')) {
+			const parent = join(root, 'deploy/backend/scoped-releases/operations-backlog', scenario.includes('per-n') ? oldRevision : '')
+			if (scenario.endsWith('-symlink')) symlinkSync(join(directory, 'missing-target'), join(parent, 'finalized.json'))
+			else writeFileSync(join(parent, 'finalized.json'), '{}', { mode: 0o600 })
 		}
 		const backupDirectory = join(root, `deploy/backend/scoped-releases/operations-backlog/${oldRevision}/backup`)
 		if (!scenario.startsWith('fresh-')) {
@@ -1069,6 +1290,82 @@ function assertOnlyScopedUp(result, names, rollback = false) {
 	assert.ok(updates[0].includes('/desired.json>'), updates[0])
 	if (rollback) assert.ok(updates[1].includes('/rollback.json>'), updates[1])
 }
+
+test('API-only Bash builds one immutable image and gracefully replaces only API without migration or backup', () => {
+	const result = runRuntime(apiScope)
+	assert.equal(result.status, 0, result.stderr)
+	assertOnlyScopedUp(result, ['operations-api'])
+	assert.equal(result.calls.split('\n').filter(line => line.startsWith('DOCKER <build>')).length, 1)
+	assert.equal(result.calls.split('\n').filter(line => line.startsWith('DOCKER <kill>')).length, 1)
+	assert.ok(result.calls.indexOf('<api-phase>') < result.calls.indexOf('DOCKER <build>'))
+	assert.ok(result.calls.indexOf('<api-image-pair>') < result.calls.indexOf('DOCKER <kill>'))
+	assert.ok(result.calls.indexOf('<operations-api-pre-finalize>') < result.calls.indexOf('DOCKER <kill>'))
+	assert.match(result.stdout, /without DDL or worker replacement/)
+	assert.ok(!/MIGRATE |<backup-|<fence>|<phase-a>|<stop>|<--signal=KILL>|<all-guard>/.test(result.calls), result.calls)
+})
+
+test('API-only Bash rejects source, image, config, phase or database uncertainty before stopping the API', () => {
+	for (const scenario of ['source-drift', 'filter-drift', 'inventory-failed', 'compiled-drift', 'prepare-failed', 'phase-invalid', 'database-busy', 'ledger-failed', 'build-failed', 'pre-stop-term', 'finalized-global', 'finalized-global-symlink', 'finalized-per-n', 'finalized-per-n-symlink']) {
+		const result = runRuntime(apiScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('DOCKER <kill>') && !result.calls.includes('<up>'), `${scenario}: ${result.calls}`)
+	}
+})
+
+test('API-only Bash leaves uncertain pre-cutover stops for operator recovery and never force-kills', () => {
+	for (const scenario of ['stop-timeout', 'stop-interrupted', 'still-running', 'post-stop-phase', 'post-stop-database', 'post-stop-data', 'post-stop-term']) {
+		const result = runRuntime(apiScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.match(result.stderr, /RECOVERY_REQUIRED/)
+		assert.ok(!result.calls.includes('<up>') && !result.calls.includes('DOCKER <start>') && !result.calls.includes('DOCKER <stop>') && !result.calls.includes('<--signal=KILL>'), `${scenario}: ${result.calls}`)
+	}
+})
+
+test('API-only Bash rolls back only the preserved Notes-free API after a recoverable replacement failure', () => {
+	for (const scenario of ['replace-failed', 'unhealthy', 'http-failed', 'term', 'hup', 'repeated-term']) {
+		const result = runRuntime(apiScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assertOnlyScopedUp(result, ['operations-api'], true)
+		assert.match(result.stderr, /API-only rollback restored/)
+		assert.ok(!result.calls.includes('MIGRATE ') && !result.calls.includes('DOCKER <stop>') && !result.calls.includes('<--signal=KILL>'), result.calls)
+	}
+})
+
+test('API-only Bash refuses rollback if data, restore activity or any neighbor changed', () => {
+	for (const scenario of ['post-data', 'rollback-busy', 'neighbor-drift']) {
+		const result = runRuntime(apiScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assertOnlyScopedUp(result, ['operations-api'])
+		assert.match(result.stderr, /CRITICAL: API-only recovery/)
+	}
+})
+
+test('actual API source allowlist rejects other runtime, CRM, schema, migrations, dependencies and symlink paths', () => {
+	privateFixture(directory => {
+		const root = realpathSync(directory)
+		for (const path of OPERATIONS_API_SOURCE_PATHS) { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), '// synthetic\n') }
+		const run = paths => spawnSync('/bin/bash', ['-c', String.raw`
+set -euo pipefail
+source "$SCOPED_LIBRARY"
+release_root="$TEST_ROOT"
+scoped_work_directory="$TEST_ROOT"
+expected_live_revision="$TEST_OLD"
+services_revision="$TEST_NEW"
+realpath() { "$TEST_NODE" -e 'process.stdout.write(require("fs").realpathSync(process.argv.at(-1)))' -- "$@"; }
+git() { if [[ " $* " == *' diff '* ]]; then printf '%s\n' "$TEST_FILES"; else printf 'synthetic baseline source'; fi; }
+scoped_verifier() { [[ "$1" == api-source ]]; }
+scoped_assert_operations_api_source
+`], { encoding: 'utf8', timeout: 5000, env: { PATH: '/usr/bin:/bin', SCOPED_LIBRARY: scopedControllerPath, TEST_ROOT: root, TEST_OLD: oldRevision, TEST_NEW: revision, TEST_FILES: paths.join('\n'), TEST_NODE: process.execPath } })
+		assert.equal(run(OPERATIONS_API_SOURCE_PATHS).status, 0)
+		const lifecycle = '.github/scripts/static-check-services-lifecycle.sh'
+		mkdirSync(dirname(join(root, lifecycle)), { recursive: true }); writeFileSync(join(root, lifecycle), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 })
+		assert.equal(run([...OPERATIONS_API_SOURCE_PATHS, lifecycle]).status, 0, 'the real CI lifecycle gate path must remain admissible')
+		for (const path of ['scripts/static-check-services-lifecycle.sh', 'apps/operations/src/main.ts', 'apps/operations/src/notes/notes.service.ts', 'apps/operations/Dockerfile', 'apps/operations/package.json', 'apps/operations/pnpm-lock.yaml', 'apps/operations/prisma/schema.prisma', `apps/operations/prisma/migrations/${NOTES_MIGRATION}/migration.sql`, 'apps/operations/restore-manifests/database-restore-migrations.json', 'apps/billing/src/main.ts', 'apps/identity/src/main.ts', 'apps/crm-access/src/main.ts']) assert.notEqual(run([...OPERATIONS_API_SOURCE_PATHS, path]).status, 0, path)
+		assert.notEqual(run(OPERATIONS_API_SOURCE_PATHS.slice(1)).status, 0)
+		const target = join(root, OPERATIONS_API_SOURCE_PATHS[1]); rmSync(target); symlinkSync(join(root, OPERATIONS_API_SOURCE_PATHS[0]), target)
+		assert.notEqual(run(OPERATIONS_API_SOURCE_PATHS).status, 0)
+	})
+})
 
 test('worker runtime builds three images and proves all owner ledgers before its exact eight-role replacement without DDL', () => {
 	const result = runRuntime(workerScope)
