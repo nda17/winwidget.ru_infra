@@ -112,9 +112,16 @@ DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
 Сначала обновить точный RabbitMQ user inventory существующего controller:
 новые scoped CRM principals сейчас нарушат routine deploy preflight.
 Container inventory ограничен project `winwidget` и не отклоняет отдельный
-CRM project сам по себе; cleanup защищает глобальные running IDs/image bindings.
-Доказать сохранность CRM при routine cleanup и сериализовать оба релиза общим
-deploy lock. Не ослаблять точные проверки до wildcard. Подготовить
+CRM project сам по себе; cleanup защищает глобальные running IDs/image bindings
+и исключает все `winwidget-crm-*` references, в том числе не привязанные к
+контейнерам candidate/rollback tags. Их удалением владеет только отдельный
+CRM controller; общий `winwidget-*` prefix не даёт routine release такого права.
+Поведенческий shell-тест с Docker double проверяет running/stopped CRM,
+теги четырёх сервисов, включая неиспользуемые, общий image ID с routine tag
+и отказ до image deletion при изменении CRM image binding. Это не production
+rehearsal. При первом rollout проверить сохранность CRM в целевой среде и
+сериализовать оба релиза общим deploy lock. Не ослаблять точные проверки до
+wildcard. Подготовить
 сосуществование обоих проектов, serial migrations, health/queue monitoring
 и rollback без удаления БД/очередей и без отката несовместимых publishers.
 Никакие новые dumps, downloads или backup jobs этой конфигурацией не создаются.
@@ -1023,7 +1030,8 @@ frontend Nginx, но не устанавливает bridge-конфигурац
       Остановленные project containers уже прошли строгую проверку
       labels/name/state.
 - [ ] Удалены только stopped containers точного Compose project `winwidget` и
-      только неиспользуемые теги семейств `winwidget-*`; image ID каждого
+      только неиспользуемые теги семейств `winwidget-*`, исключая
+      `winwidget-crm-*` даже без container binding; image ID каждого
       оставшегося container не изменился. Перед и сразу после каждого
       `docker image rm --no-prune` running ID set совпал с baseline.
 - [ ] Volumes, networks, BuildKit/build cache, images других семейств и

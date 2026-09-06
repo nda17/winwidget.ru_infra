@@ -57,6 +57,7 @@ for (const evidence of [
 	'[[ "$protected_bindings_current" == "$protected_bindings_before" ]]',
 	'[[ "$protected_bindings_after" == "$protected_bindings_before" ]]',
 	'[[ "$repository" == winwidget-* ]]',
+	'[[ "$repository" != winwidget-crm-* ]] || continue',
 	'docker container rm -- "$container_id"',
 	'docker image rm --no-prune -- "$image_reference"',
 	'Running Docker container set changed before exact image removal.',
@@ -198,19 +199,29 @@ printf -v project_running_api '%064x' 11
 printf -v project_stopped_api '%064x' 12
 printf -v foreign_project_stopped '%064x' 13
 printf -v unexpected_running_container '%064x' 14
+printf -v crm_running_access '%064x' 16
+printf -v crm_stopped_intake '%064x' 17
+printf -v crm_unused_customers '%064x' 18
+printf -v crm_unused_sales '%064x' 19
 printf -v compose_hash '%064x' 255
 image_infra="sha256:$project_running_infra"
 image_api="sha256:$project_running_api"
 image_obsolete="sha256:$project_stopped_api"
 image_foreign_project="sha256:$foreign_project_stopped"
+image_crm_access="sha256:$crm_running_access"
+image_crm_intake="sha256:$crm_stopped_intake"
+image_crm_customers="sha256:$crm_unused_customers"
+image_crm_sales="sha256:$crm_unused_sales"
 
 mock_state_directory="$(mktemp -d)"
 running_capture_count_file="$mock_state_directory/running-captures"
 image_rm_attempt_count_file="$mock_state_directory/image-rm-attempts"
+crm_image_capture_count_file="$mock_state_directory/crm-image-captures"
 printf '0\\n' >"$running_capture_count_file"
 printf '0\\n' >"$image_rm_attempt_count_file"
+printf '0\\n' >"$crm_image_capture_count_file"
 cleanup_mock_state() {
-	rm -f -- "$running_capture_count_file" "$image_rm_attempt_count_file"
+	rm -f -- "$running_capture_count_file" "$image_rm_attempt_count_file" "$crm_image_capture_count_file"
 	rmdir -- "$mock_state_directory"
 }
 trap cleanup_mock_state EXIT
@@ -237,6 +248,7 @@ docker() {
 						printf '%s\\n' "$project_stopped_api"
 					fi
 					printf '%s\\n' "$foreign_project_stopped"
+					printf '%s\\n' "$crm_running_access" "$crm_stopped_intake"
 				fi
 			else
 				local running_capture_count
@@ -244,6 +256,7 @@ docker() {
 				running_capture_count=$((running_capture_count + 1))
 				printf '%s\\n' "$running_capture_count" >"$running_capture_count_file"
 				printf '%s\\n' "$project_running_api" "$project_running_infra"
+				printf '%s\\n' "$crm_running_access"
 				if [[ "$scenario" == 'running-mutation' && \
 					"$running_capture_count" -ge 4 ]]; then
 					printf '%s\\n' "$unexpected_running_container"
@@ -265,7 +278,8 @@ docker() {
 			fi
 			case "$container_id" in
 				"$project_running_infra" | "$project_running_api" | \
-				"$project_stopped_api" | "$foreign_project_stopped") ;;
+					"$project_stopped_api" | "$foreign_project_stopped" | \
+					"$crm_running_access" | "$crm_stopped_intake") ;;
 				*) return 1 ;;
 			esac
 			[[ -n "$format" ]] || return 0
@@ -282,6 +296,20 @@ docker() {
 						;;
 					"$foreign_project_stopped")
 						printf '%s|%s\\n' "$container_id" "$image_foreign_project"
+						;;
+					"$crm_running_access")
+						local captures
+						IFS= read -r captures <"$crm_image_capture_count_file"
+						captures=$((captures + 1))
+						printf '%s\\n' "$captures" >"$crm_image_capture_count_file"
+						if [[ "$scenario" == 'crm-image-mutation' && "$captures" -ge 2 ]]; then
+							printf '%s|%s\\n' "$container_id" "$image_crm_sales"
+						else
+							printf '%s|%s\\n' "$container_id" "$image_crm_access"
+						fi
+						;;
+					"$crm_stopped_intake")
+						printf '%s|%s\\n' "$container_id" "$image_crm_intake"
 						;;
 				esac
 				return 0
@@ -321,6 +349,12 @@ docker() {
 					printf 'winwidget-postgres|git-current|%s|<none>\\n' "$image_infra"
 					printf 'winwidget-api|git-current|%s|<none>\\n' "$image_api"
 					printf 'winwidget-shared|git-keep|%s|<none>\\n' "$image_foreign_project"
+					printf 'winwidget-crm-access|git-running|%s|<none>\\n' "$image_crm_access"
+					printf 'winwidget-crm-intake|git-stopped|%s|<none>\\n' "$image_crm_intake"
+					printf 'winwidget-crm-customers|git-candidate|%s|<none>\\n' "$image_crm_customers"
+					printf 'winwidget-crm-sales|git-rollback|%s|<none>\\n' "$image_crm_sales"
+					# An unused CRM tag may also share an ID with a deletable routine tag.
+					printf 'winwidget-crm-sales|git-shared|%s|<none>\\n' "$image_obsolete"
 					if ((old_ref_one_present)); then
 						printf 'winwidget-old|git-old|%s|<none>\\n' "$image_obsolete"
 					fi
@@ -340,6 +374,11 @@ docker() {
 						winwidget-postgres:git-current) printf '%s\\n' "$image_infra" ;;
 						winwidget-api:git-current) printf '%s\\n' "$image_api" ;;
 						winwidget-shared:git-keep) printf '%s\\n' "$image_foreign_project" ;;
+						winwidget-crm-access:git-running) printf '%s\\n' "$image_crm_access" ;;
+						winwidget-crm-intake:git-stopped) printf '%s\\n' "$image_crm_intake" ;;
+						winwidget-crm-customers:git-candidate) printf '%s\\n' "$image_crm_customers" ;;
+						winwidget-crm-sales:git-rollback) printf '%s\\n' "$image_crm_sales" ;;
+						winwidget-crm-sales:git-shared) printf '%s\\n' "$image_obsolete" ;;
 						winwidget-old:git-old)
 							((old_ref_one_present)) || return 1
 							printf '%s\\n' "$image_obsolete"
@@ -414,6 +453,13 @@ cleanup_obsolete_winwidget_docker_resources
 docker image inspect winwidget-postgres:git-current >/dev/null
 docker image inspect winwidget-api:git-current >/dev/null
 docker image inspect winwidget-shared:git-keep >/dev/null
+docker container inspect "$crm_running_access" >/dev/null
+docker container inspect "$crm_stopped_intake" >/dev/null
+docker image inspect winwidget-crm-access:git-running >/dev/null
+docker image inspect winwidget-crm-intake:git-stopped >/dev/null
+docker image inspect winwidget-crm-customers:git-candidate >/dev/null
+docker image inspect winwidget-crm-sales:git-rollback >/dev/null
+docker image inspect winwidget-crm-sales:git-shared >/dev/null
 
 # The exact cleanup is idempotent once no valid target remains.
 cleanup_obsolete_winwidget_docker_resources
@@ -436,6 +482,25 @@ fi
 IFS= read -r image_rm_attempt_count <"$image_rm_attempt_count_file"
 [[ "$image_rm_attempt_count" -eq 0 ]] ||
 	die 'Image deletion started after a running-ID mutation.'
+
+# A concurrent CRM release changing an existing image binding is unsafe too,
+# even though CRM is not part of the routine project inventory or deletion set.
+printf '0\\n' >"$running_capture_count_file"
+printf '0\\n' >"$image_rm_attempt_count_file"
+printf '0\\n' >"$crm_image_capture_count_file"
+if (
+	trap - EXIT
+	scenario='crm-image-mutation'
+	stopped_present=1
+	old_ref_one_present=1
+	old_ref_two_present=1
+	cleanup_obsolete_winwidget_docker_resources >/dev/null 2>&1
+); then
+	die 'CRM image-binding mutation did not block cleanup.'
+fi
+IFS= read -r image_rm_attempt_count <"$image_rm_attempt_count_file"
+[[ "$image_rm_attempt_count" -eq 0 ]] ||
+	die 'Image deletion started after a CRM image-binding mutation.'
 
 if (
 	trap - EXIT
@@ -478,6 +543,24 @@ assert.match(
 	behavior.stdout,
 	/production_docker_cleanup_behavior=PASS/,
 	'cleanup behavior harness did not reach its final assertions'
+)
+
+const withoutCrmBoundary = spawnSync('bash', ['-s'], {
+	encoding: 'utf8',
+	input: behavioralHarness.replace(
+		'[[ "$repository" != winwidget-crm-* ]] || continue',
+		':'
+	)
+})
+assert.notEqual(
+	withoutCrmBoundary.status,
+	0,
+	'CRM preservation checks must fail against the previous broad cleanup'
+)
+assert.match(
+	withoutCrmBoundary.stderr,
+	/Exact unused WinWidget image reference removal failed/,
+	'previous cleanup must fail by attempting to remove a CRM reference'
 )
 
 process.stdout.write('production_docker_cleanup_contract=PASS\n')

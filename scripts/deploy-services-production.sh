@@ -2073,6 +2073,9 @@ collect_obsolete_winwidget_image_references() {
 		[[ -z "$extra_field" ]] ||
 			die 'Docker image inventory contains an ambiguous entry.'
 		[[ "$repository" == winwidget-* ]] || continue
+		# The independent winwidget-crm release controller owns these references,
+		# including unused candidate/rollback tags with no container binding.
+		[[ "$repository" != winwidget-crm-* ]] || continue
 		[[ "$repository" =~ ^winwidget-[a-z0-9][a-z0-9._-]*$ &&
 			"$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ &&
 			"$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||

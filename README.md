@@ -379,8 +379,10 @@ lifecycle gate и полной матрицы сервисов release-job ав�
 13. только после зелёного pre-cleanup gate удаляет остановленные контейнеры с точно
     совпавшими Compose labels/name проекта `winwidget`, сохраняя и сравнивая
     полный набор ID работающих контейнеров до/после. Затем удаляет только теги
-    локальных семейств `winwidget-*`, чей image ID не привязан ни к одному
-    оставшемуся контейнеру. Перед и сразу после каждого `image rm --no-prune`
+    локальных семейств `winwidget-*`, кроме принадлежащих отдельному CRM
+    controller `winwidget-crm-*`, чей image ID не привязан ни к одному
+    оставшемуся контейнеру. Неиспользуемые CRM candidate/rollback tags тоже
+    сохраняются. Перед и сразу после каждого `image rm --no-prune`
     повторно сравнивает running IDs, а также все container/image bindings;
 14. повторяет полный steady-state gate и требует отсутствия любых retired или
     остановленных project containers, legacy routes/queues/users, временных
@@ -393,7 +395,8 @@ lifecycle gate и полной матрицы сервисов release-job ав�
 удаление, очистку volumes/networks/build cache или восстановление канонического
 production env из примеров. Контейнеры других Compose projects, любой
 `running`/`restarting`/`paused` container, образы с хотя бы одним container
-binding и неатрибутируемые `<none>` images не являются cleanup-target;
+binding, любые `winwidget-crm-*` references и неатрибутируемые `<none>` images
+не являются cleanup-target;
 `--no-prune` обязателен для каждого точного удаления image reference.
 
 ## Локальная статическая проверка
