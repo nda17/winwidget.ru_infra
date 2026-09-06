@@ -79,6 +79,10 @@ jobs:
         shell: bash
         run: node scripts/test-production-docker-cleanup-contract.mjs
 
+      - name: Verify exact opt-in CRM RabbitMQ coexistence contract
+        shell: bash
+        run: node --test scripts/test-crm-rabbitmq-coexistence-contract.mjs
+
       - name: Verify isolated restore rehearsal contract
         shell: bash
         run: node scripts/test-isolated-restore-rehearsal-contract.mjs

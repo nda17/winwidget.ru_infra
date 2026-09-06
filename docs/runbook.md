@@ -109,8 +109,28 @@ idle-derived значений по умолчанию. Сумма caps не до
 До первого запуска нужны capacity/business/browser gates из service backlog,
 DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
 согласованный Identity/Billing cutover и отдельный CRM-only controller.
-Сначала обновить точный RabbitMQ user inventory существующего controller:
-новые scoped CRM principals сейчас нарушат routine deploy preflight.
+До первого CRM provisioning выпустить совместимый routine controller.
+Его canonical backend env принимает `CRM_RABBITMQ_CONTRACT=disabled`
+(также значение по умолчанию при отсутствии переменной) или `native-v1`.
+Другие значения, включая пустое, блокируют выпуск. `disabled` сохраняет
+прежние 16 пользователей; `native-v1` требует ровно прежние 16 плюс восемь
+process-scoped CRM principals из Compose. Любой лишний или отсутствующий
+пользователь блокирует preflight и steady-state; discovery/wildcard нет.
+Routine controller не создаёт и не меняет CRM credentials/ACL/queues.
+В `native-v1` он сохраняет в topic write ACL Widgets ровно дополнительное
+событие `widgets.wincrm.lead-transfer.requested.v1`, не расширяя остальные
+resource/read grants. Это не включает product flags, Trial или продажи.
+
+Первый CRM controller должен под общим deploy lock provision все восемь
+principals, их ACL и durable bindings, подтвердить их и согласованно перевести
+canonical env в `native-v1` с обязательной двусторонней синхронизацией.
+Неполный bootstrap нельзя обходить routine deploy: сначала завершить или
+восстановить точное состояние под тем же lock, без purge. Не переключать
+контракт обратно в `disabled` при остановке CRM runtime, пока остаются его
+principals или события. Подготовка кода не доказывает, что этот контракт
+уже включён на VPS; production env этой подготовкой не изменяется.
+Поведенческий тест исполняет фактический shell preflight и определения
+provisioner на synthetic данных, проверяя неизменность остальных grants.
 Container inventory ограничен project `winwidget` и не отклоняет отдельный
 CRM project сам по себе; cleanup защищает глобальные running IDs/image bindings
 и исключает все `winwidget-crm-*` references, в том числе не привязанные к

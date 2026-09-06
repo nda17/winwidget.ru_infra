@@ -2657,7 +2657,20 @@ const expectedServiceUsers = [
 ];
 const admin = process.env.RABBITMQ_ADMIN_USER ?? '';
 const monitor = process.env.RABBITMQ_MONITOR_USER ?? '';
-const names = [admin, monitor, ...expectedServiceUsers];
+// This is a provisioned topology contract, not a product feature flag.
+const crmContract = process.env.CRM_RABBITMQ_CONTRACT ?? 'disabled';
+if (!['disabled', 'native-v1'].includes(crmContract)) process.exit(1);
+const crmUsers = crmContract === 'native-v1' ? [
+	'winwidget-crm-access-worker',
+	'winwidget-crm-access-outbox-publisher',
+	'winwidget-crm-intake-worker',
+	'winwidget-crm-intake-publisher',
+	'winwidget-crm-intake-widget-control-worker',
+	'winwidget-crm-intake-widget-control-publisher',
+	'winwidget-crm-intake-widget-transfer-worker',
+	'winwidget-crm-intake-widget-transfer-publisher'
+] : [];
+const names = [admin, monitor, ...expectedServiceUsers, ...crmUsers];
 if (
 	names.some(name => !/^[A-Za-z0-9._-]+$/.test(name)) ||
 	new Set(names).size !== names.length
@@ -2801,6 +2814,8 @@ const fail = () => {
 	throw new Error('RabbitMQ provisioning contract failed');
 };
 const value = name => process.env[name] ?? '';
+const crmContract = process.env.CRM_RABBITMQ_CONTRACT ?? 'disabled';
+if (!['disabled', 'native-v1'].includes(crmContract)) fail();
 const vhost = value('RABBITMQ_VHOST');
 const managementUrl = value('RABBITMQ_MANAGEMENT_URL').replace(/\/$/, '');
 const adminUser = value('RABBITMQ_ADMIN_USER');
@@ -3092,6 +3107,9 @@ const restoreQueuePattern = exactQueuePattern([
 	constants.OPERATIONS_DATABASE_RESTORE_RETRY_QUEUE,
 	constants.OPERATIONS_DATABASE_RESTORE_DLQ
 ]);
+const widgetsWriteTopicPattern = '^(widgets\\.(widget|lead)\\.changed\\.v1|lead\\.(integration\\.(email|telegram|webhook|bitrix24|amo-crm)|limit\\.reached\\.(email|telegram))\\.v2|admin\\.audit\\.widgets\\.v1'
+	+ (crmContract === 'native-v1' ? '|widgets\\.wincrm\\.lead-transfer\\.requested\\.v1' : '')
+	+ ')$';
 
 const users = [
 	{
@@ -3130,7 +3148,7 @@ const users = [
 		write: '^(winwidget\\.(events|dead-letter)|winwidget\\.widgets(\\..*)?|winwidget\\.lead-integration\\.(webhook|bitrix24|amo-crm)(\\.(dead-letter|retry\\.[1-3]))?)$',
 		read: '^(winwidget\\.(events|dead-letter)|winwidget\\.widgets(\\..*)?|winwidget\\.lead-integration\\.(webhook|bitrix24|amo-crm)(\\.(dead-letter|retry\\.[1-3]))?)$',
 		topics: [
-			{ exchange: 'winwidget.events', write: '^(widgets\\.(widget|lead)\\.changed\\.v1|lead\\.(integration\\.(email|telegram|webhook|bitrix24|amo-crm)|limit\\.reached\\.(email|telegram))\\.v2|admin\\.audit\\.widgets\\.v1)$', read: '^(identity\\.user\\.changed\\.v1|billing\\.subscription\\.changed\\.v1|lead\\.integration\\.(webhook|bitrix24|amo-crm)\\.v2)$' },
+			{ exchange: 'winwidget.events', write: widgetsWriteTopicPattern, read: '^(identity\\.user\\.changed\\.v1|billing\\.subscription\\.changed\\.v1|lead\\.integration\\.(webhook|bitrix24|amo-crm)\\.v2)$' },
 			{ exchange: 'winwidget.dead-letter', write: '^widgets\\.(identity|entitlement|webhook|bitrix24|amo-crm)\\.dead-letter$', read: '^widgets\\.(identity|entitlement|webhook|bitrix24|amo-crm)\\.dead-letter$' }
 		]
 	},
