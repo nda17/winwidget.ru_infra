@@ -12,6 +12,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  crm-broker:
+    name: CRM broker provisioning on pinned RabbitMQ
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact infrastructure revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prepare isolated test client
+        shell: bash
+        run: npm install --prefix "$RUNNER_TEMP/crm-broker-dependencies" --ignore-scripts --no-audit --no-fund amqplib@0.10.9
+      - name: Verify topology, preservation and process-scoped credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CRM_BROKER_TEST_PACKAGE_JSON="$RUNNER_TEMP/crm-broker-dependencies/package.json"
+          node scripts/test-crm-broker-topology.integration.mjs --ci
+
   verify:
     name: Verify steady-state infrastructure
     runs-on: ubuntu-24.04
@@ -82,6 +103,10 @@ jobs:
       - name: Verify exact opt-in CRM RabbitMQ coexistence contract
         shell: bash
         run: node --test scripts/test-crm-rabbitmq-coexistence-contract.mjs
+
+      - name: Verify additive CRM broker topology and scoped ACL contract
+        shell: bash
+        run: node --test scripts/test-crm-broker-topology.mjs
 
       - name: Verify isolated restore rehearsal contract
         shell: bash

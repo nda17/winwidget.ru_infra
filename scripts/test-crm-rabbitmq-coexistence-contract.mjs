@@ -32,7 +32,8 @@ const crmUsers = [
 	'winwidget-crm-intake-widget-control-worker',
 	'winwidget-crm-intake-widget-control-publisher',
 	'winwidget-crm-intake-widget-transfer-worker',
-	'winwidget-crm-intake-widget-transfer-publisher'
+	'winwidget-crm-intake-widget-transfer-publisher',
+	'winwidget-billing-wincrm-provider-worker'
 ]
 const serviceCredentials = [
 	['NOTIFICATION_DELIVERY', 'notification-delivery'],
@@ -73,8 +74,14 @@ const environment = mode => ({
 		retryExchange: 'winwidget.retry',
 		deadLetterExchange: 'winwidget.dead-letter',
 		manualRetryExchange: 'winwidget.manual-retry',
-		queueNames: ['winwidget.notification.test'],
-		readRoutingKeys: ['notification.test.v1'],
+		queueNames: [
+			'winwidget.notification.test',
+			'winwidget.notification.wincrm.invitation.email'
+		],
+		readRoutingKeys: [
+			'notification.test.v1',
+			'notification.wincrm.invitation.email.requested.v1'
+		],
 		writeRoutingKeys: ['notification.outcome.v1'],
 		deadLetterRoutingKeys: ['notification.dead-letter'],
 		retryCount: 3
@@ -114,9 +121,9 @@ const inventory = (mode, overrides = {}) => {
 	)
 	return output.split('\n')
 }
-const permissions = mode => {
+const permissions = (mode, overrides = {}) => {
 	const context = {
-		process: { env: environment(mode) },
+		process: { env: { ...environment(mode), ...overrides } },
 		Buffer,
 		URL,
 		require: name => {
@@ -206,31 +213,34 @@ test('existing default inventory and permissions are unchanged by an absent opt-
 	assert.deepEqual(permissions(), permissions('disabled'))
 })
 
-test('native-v1 admits precisely eight process-scoped CRM users, no API or shared user', () => {
+test('mvp-v1 admits eight CRM process users plus the isolated Billing provider consumer', () => {
 	assert.deepEqual(
-		inventory('native-v1'),
+		inventory('mvp-v1'),
 		[...inventory(), ...crmUsers].sort()
 	)
-	assert.equal(inventory('native-v1').length, 24)
+	assert.equal(inventory('mvp-v1').length, 25)
 	assert.throws(() =>
-		inventory('native-v1', { RABBITMQ_ADMIN_USER: crmUsers[0] })
+		inventory('mvp-v1', { RABBITMQ_ADMIN_USER: crmUsers[0] })
 	)
 	assert.throws(() =>
-		inventory('native-v1', { RABBITMQ_MONITOR_USER: crmUsers[1] })
+		inventory('mvp-v1', { RABBITMQ_MONITOR_USER: crmUsers[1] })
 	)
 })
 
 test('actual shell preflight rejects extra, missing, legacy and premature CRM principals', () => {
 	assert.equal(preflight(undefined, inventory()), 0)
-	assert.equal(preflight('native-v1', inventory('native-v1')), 0)
+	assert.equal(preflight('mvp-v1', inventory('mvp-v1')), 0)
 	for (const actual of [
 		inventory(),
-		inventory('native-v1').slice(1),
-		[...inventory('native-v1'), 'winwidget-crm-unknown-worker'],
-		[...inventory('native-v1'), 'winwidget-core']
+		inventory('mvp-v1').slice(1),
+		inventory('mvp-v1').filter(
+			name => name !== 'winwidget-billing-wincrm-provider-worker'
+		),
+		[...inventory('mvp-v1'), 'winwidget-crm-unknown-worker'],
+		[...inventory('mvp-v1'), 'winwidget-core']
 	])
-		assert.equal(preflight('native-v1', actual), 42)
-	assert.equal(preflight(undefined, inventory('native-v1')), 42)
+		assert.equal(preflight('mvp-v1', actual), 42)
+	assert.equal(preflight(undefined, inventory('mvp-v1')), 42)
 })
 
 test('invalid or empty versions fail closed in both inventory and provisioner', () => {
@@ -239,18 +249,19 @@ test('invalid or empty versions fail closed in both inventory and provisioner', 
 		'true',
 		'false',
 		'native-v2',
+		'native-v1',
 		'*',
-		' native-v1',
-		'native-v1\n'
+		' mvp-v1',
+		'mvp-v1\n'
 	]) {
 		assert.throws(() => inventory(mode))
 		assert.throws(() => permissions(mode))
 	}
 })
 
-test('CRM changes only the exact Widgets event write permission, never existing resource/read grants', () => {
+test('MVP adds only exact producer routes and the Billing-owned provider DLQ exchange', () => {
 	const before = permissions()
-	const after = permissions('native-v1')
+	const after = permissions('mvp-v1')
 	assert.equal(after.length, before.length)
 	assert.ok(
 		after.every(user => !crmUsers.includes(user.username)),
@@ -305,11 +316,108 @@ test('CRM changes only the exact Widgets event write permission, never existing 
 	])
 		assert.equal(allowed.test(route), false)
 	newTopic.write = oldTopic.write
+	for (const [username, additional, legacy] of [
+		[
+			'winwidget-identity-publisher',
+			[
+				'identity.wincrm.invitation-accepted.v1',
+				'notification.wincrm.invitation.email.requested.v1'
+			],
+			'^(identity\\.user\\.changed\\.v1|billing\\.(identity\\.changed|referral\\.requested|lifecycle-repair\\.requested)\\.v1|admin\\.audit\\.identity\\.v1)$'
+		],
+		[
+			'winwidget-billing-publisher',
+			['billing.wincrm.provider-operation.requested.v1'],
+			'^(payment\\.succeeded\\.v1|payment\\.notification\\.telegram\\.requested\\.v1|payment\\.auto-renewal\\.charge\\.requested\\.v1|notification\\.subscription-expiry\\.(email|telegram)\\.requested\\.v1|billing\\.(payment|subscription)(\\.details)?\\.changed\\.v1|billing\\.(affiliate|settings)\\.changed\\.v1|admin\\.audit\\.billing\\.v1)$'
+		]
+	]) {
+		const oldUser = before.find(user => user.username === username)
+		const newUser = after.find(user => user.username === username)
+		const oldEvent = oldUser.topics.find(
+			topic => topic.exchange === 'winwidget.events'
+		)
+		const newEvent = newUser.topics.find(
+			topic => topic.exchange === 'winwidget.events'
+		)
+		assert.equal(oldEvent.write, legacy)
+		assert.equal(
+			newEvent.write,
+			legacy.slice(0, -2) +
+				'|' +
+				additional.map(route => route.replaceAll('.', '\\.')).join('|') +
+				')$'
+		)
+		for (const route of additional) {
+			assert.equal(new RegExp(oldEvent.write).test(route), false)
+			assert.equal(new RegExp(newEvent.write).test(route), true)
+			for (const wrong of [
+				route + '.extra',
+				'prefix.' + route,
+				route.replace('.v1', '.v2'),
+				route.replaceAll('.', 'x')
+			])
+				assert.equal(new RegExp(newEvent.write).test(wrong), false)
+		}
+		for (const forbidden of [
+			'crm.access.admission-wake.v1',
+			nativeEvent,
+			'other.provider-operation.requested.v1'
+		])
+			assert.equal(new RegExp(newEvent.write).test(forbidden), false)
+		newEvent.write = oldEvent.write
+	}
+	const oldBilling = before.find(
+		user => user.username === 'winwidget-billing-publisher'
+	)
+	const newBilling = after.find(
+		user => user.username === 'winwidget-billing-publisher'
+	)
+	assert.equal(
+		oldBilling.write,
+		'^winwidget\\.(events|billing\\.(retry|dead-letter))$'
+	)
+	assert.equal(
+		newBilling.write,
+		'^winwidget\\.(events|billing\\.(retry|dead-letter)|billing\\.wincrm-provider\\.dead-letter)$'
+	)
+	for (const exchange of [
+		'winwidget.events',
+		'winwidget.billing.retry',
+		'winwidget.billing.dead-letter',
+		'winwidget.billing.wincrm-provider.dead-letter'
+	])
+		assert.equal(new RegExp(newBilling.write).test(exchange), true)
+	for (const exchange of [
+		'winwidget.billing.wincrm-provider.v1',
+		'winwidget.billing.wincrm-provider.dead-letter.extra',
+		'winwidget.crm-intake.events',
+		'winwidget.dead-letter'
+	])
+		assert.equal(new RegExp(newBilling.write).test(exchange), false)
+	newBilling.write = oldBilling.write
 	assert.deepEqual(
 		after,
 		before,
 		'all other permissions, credentials and tags must remain identical'
 	)
+})
+
+test('MVP refuses missing invitation email reader before any provisioning', () => {
+	for (const missing of ['readRoutingKeys', 'queueNames']) {
+		const topology = JSON.parse(
+			environment('mvp-v1').NOTIFICATION_TOPOLOGY_CONTRACT
+		)
+		topology[missing] = [
+			missing === 'readRoutingKeys'
+				? 'notification.test.v1'
+				: 'winwidget.notification.test'
+		]
+		const overrides = {
+			NOTIFICATION_TOPOLOGY_CONTRACT: JSON.stringify(topology)
+		}
+		assert.doesNotThrow(() => permissions('disabled', overrides))
+		assert.throws(() => permissions('mvp-v1', overrides))
+	}
 })
 
 test('preflight and steady-state retain exact equality; CI executes this contract', () => {

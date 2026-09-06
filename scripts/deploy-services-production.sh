@@ -2659,8 +2659,8 @@ const admin = process.env.RABBITMQ_ADMIN_USER ?? '';
 const monitor = process.env.RABBITMQ_MONITOR_USER ?? '';
 // This is a provisioned topology contract, not a product feature flag.
 const crmContract = process.env.CRM_RABBITMQ_CONTRACT ?? 'disabled';
-if (!['disabled', 'native-v1'].includes(crmContract)) process.exit(1);
-const crmUsers = crmContract === 'native-v1' ? [
+if (!['disabled', 'mvp-v1'].includes(crmContract)) process.exit(1);
+const crmUsers = crmContract === 'mvp-v1' ? [
 	'winwidget-crm-access-worker',
 	'winwidget-crm-access-outbox-publisher',
 	'winwidget-crm-intake-worker',
@@ -2668,7 +2668,8 @@ const crmUsers = crmContract === 'native-v1' ? [
 	'winwidget-crm-intake-widget-control-worker',
 	'winwidget-crm-intake-widget-control-publisher',
 	'winwidget-crm-intake-widget-transfer-worker',
-	'winwidget-crm-intake-widget-transfer-publisher'
+	'winwidget-crm-intake-widget-transfer-publisher',
+	'winwidget-billing-wincrm-provider-worker'
 ] : [];
 const names = [admin, monitor, ...expectedServiceUsers, ...crmUsers];
 if (
@@ -2815,7 +2816,7 @@ const fail = () => {
 };
 const value = name => process.env[name] ?? '';
 const crmContract = process.env.CRM_RABBITMQ_CONTRACT ?? 'disabled';
-if (!['disabled', 'native-v1'].includes(crmContract)) fail();
+if (!['disabled', 'mvp-v1'].includes(crmContract)) fail();
 const vhost = value('RABBITMQ_VHOST');
 const managementUrl = value('RABBITMQ_MANAGEMENT_URL').replace(/\/$/, '');
 const adminUser = value('RABBITMQ_ADMIN_USER');
@@ -3053,6 +3054,17 @@ const notificationWriteTopicPattern = exactQueuePattern(
 const notificationDeadLetterTopicPattern = exactQueuePattern(
 	notificationTopology.deadLetterRoutingKeys
 );
+if (
+	crmContract === 'mvp-v1' &&
+	(
+		!notificationTopology.readRoutingKeys.includes(
+			'notification.wincrm.invitation.email.requested.v1'
+		) ||
+		!notificationTopology.queueNames.includes(
+			'winwidget.notification.wincrm.invitation.email'
+		)
+	)
+) fail();
 let reportingTopology;
 try {
 	reportingTopology = JSON.parse(value('REPORTING_TOPOLOGY_CONTRACT'));
@@ -3108,7 +3120,16 @@ const restoreQueuePattern = exactQueuePattern([
 	constants.OPERATIONS_DATABASE_RESTORE_DLQ
 ]);
 const widgetsWriteTopicPattern = '^(widgets\\.(widget|lead)\\.changed\\.v1|lead\\.(integration\\.(email|telegram|webhook|bitrix24|amo-crm)|limit\\.reached\\.(email|telegram))\\.v2|admin\\.audit\\.widgets\\.v1'
-	+ (crmContract === 'native-v1' ? '|widgets\\.wincrm\\.lead-transfer\\.requested\\.v1' : '')
+	+ (crmContract === 'mvp-v1' ? '|widgets\\.wincrm\\.lead-transfer\\.requested\\.v1' : '')
+	+ ')$';
+const identityWriteTopicPattern = '^(identity\\.user\\.changed\\.v1|billing\\.(identity\\.changed|referral\\.requested|lifecycle-repair\\.requested)\\.v1|admin\\.audit\\.identity\\.v1'
+	+ (crmContract === 'mvp-v1' ? '|identity\\.wincrm\\.invitation-accepted\\.v1|notification\\.wincrm\\.invitation\\.email\\.requested\\.v1' : '')
+	+ ')$';
+const billingWriteTopicPattern = '^(payment\\.succeeded\\.v1|payment\\.notification\\.telegram\\.requested\\.v1|payment\\.auto-renewal\\.charge\\.requested\\.v1|notification\\.subscription-expiry\\.(email|telegram)\\.requested\\.v1|billing\\.(payment|subscription)(\\.details)?\\.changed\\.v1|billing\\.(affiliate|settings)\\.changed\\.v1|admin\\.audit\\.billing\\.v1'
+	+ (crmContract === 'mvp-v1' ? '|billing\\.wincrm\\.provider-operation\\.requested\\.v1' : '')
+	+ ')$';
+const billingWriteResourcePattern = '^winwidget\\.(events|billing\\.(retry|dead-letter)'
+	+ (crmContract === 'mvp-v1' ? '|billing\\.wincrm-provider\\.dead-letter' : '')
 	+ ')$';
 
 const users = [
@@ -3161,8 +3182,8 @@ const users = [
 	},
 	{
 		...services.billingPublisher,
-		configure: '^$', write: '^winwidget\\.(events|billing\\.(retry|dead-letter))$', read: '^$',
-		topics: [{ exchange: 'winwidget.events', write: '^(payment\\.succeeded\\.v1|payment\\.notification\\.telegram\\.requested\\.v1|payment\\.auto-renewal\\.charge\\.requested\\.v1|notification\\.subscription-expiry\\.(email|telegram)\\.requested\\.v1|billing\\.(payment|subscription)(\\.details)?\\.changed\\.v1|billing\\.(affiliate|settings)\\.changed\\.v1|admin\\.audit\\.billing\\.v1)$', read: '^$' }]
+		configure: '^$', write: billingWriteResourcePattern, read: '^$',
+		topics: [{ exchange: 'winwidget.events', write: billingWriteTopicPattern, read: '^$' }]
 	},
 	{
 		...services.identityWorker,
@@ -3178,7 +3199,7 @@ const users = [
 		...services.identityPublisher,
 		configure: '^$', write: '^winwidget\\.(events|retry|dead-letter|manual-retry)$', read: '^$',
 		topics: [
-			{ exchange: 'winwidget.events', write: '^(identity\\.user\\.changed\\.v1|billing\\.(identity\\.changed|referral\\.requested|lifecycle-repair\\.requested)\\.v1|admin\\.audit\\.identity\\.v1)$', read: '^$' },
+			{ exchange: 'winwidget.events', write: identityWriteTopicPattern, read: '^$' },
 			{ exchange: 'winwidget.dead-letter', write: '^telegram-destination-unavailable\\.dead-letter$', read: '^$' }
 		]
 	},

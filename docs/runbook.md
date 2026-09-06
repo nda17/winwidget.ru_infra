@@ -111,19 +111,32 @@ DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
 согласованный Identity/Billing cutover и отдельный CRM-only controller.
 До первого CRM provisioning выпустить совместимый routine controller.
 Его canonical backend env принимает `CRM_RABBITMQ_CONTRACT=disabled`
-(также значение по умолчанию при отсутствии переменной) или `native-v1`.
+(также значение по умолчанию при отсутствии переменной) или `mvp-v1`.
 Другие значения, включая пустое, блокируют выпуск. `disabled` сохраняет
-прежние 16 пользователей; `native-v1` требует ровно прежние 16 плюс восемь
-process-scoped CRM principals из Compose. Любой лишний или отсутствующий
+прежние 16 пользователей; `mvp-v1` требует ровно прежние 16 плюс восемь
+process-scoped CRM principals из Compose и отдельного
+`winwidget-billing-wincrm-provider-worker` — всего 25. Это consumer внутри
+существующего Billing worker, не пятый CRM-сервис. Любой лишний или отсутствующий
 пользователь блокирует preflight и steady-state; discovery/wildcard нет.
 Routine controller не создаёт и не меняет CRM credentials/ACL/queues.
-В `native-v1` он сохраняет в topic write ACL Widgets ровно дополнительное
-событие `widgets.wincrm.lead-transfer.requested.v1`, не расширяя остальные
-resource/read grants. Это не включает product flags, Trial или продажи.
+В `mvp-v1` controller сохраняет точные дополнительные producer permissions:
 
-Первый CRM controller должен под общим deploy lock provision все восемь
+- Widgets: `widgets.wincrm.lead-transfer.requested.v1`;
+- Identity: `identity.wincrm.invitation-accepted.v1` и
+  `notification.wincrm.invitation.email.requested.v1`;
+- Billing publisher: `billing.wincrm.provider-operation.requested.v1` и write
+  на отдельный direct exchange `winwidget.billing.wincrm-provider.dead-letter`.
+
+Read/configure grants этих producers не расширяются. Для Notification Delivery
+обязателен opt-in reader `wincrm-invitation-email` в её topology contract;
+без него provisioning блокируется до изменения RabbitMQ. Старые consumer kinds
+сохраняются. Это не включает product flags, Trial или продажи.
+Предварительный `native-v1`, не включавший приглашения и платёжный consumer,
+не является release contract и отклоняется.
+
+Первый CRM controller должен под общим deploy lock provision все девять
 principals, их ACL и durable bindings, подтвердить их и согласованно перевести
-canonical env в `native-v1` с обязательной двусторонней синхронизацией.
+canonical env в `mvp-v1` с обязательной двусторонней синхронизацией.
 Неполный bootstrap нельзя обходить routine deploy: сначала завершить или
 восстановить точное состояние под тем же lock, без purge. Не переключать
 контракт обратно в `disabled` при остановке CRM runtime, пока остаются его
@@ -131,6 +144,42 @@ principals или события. Подготовка кода не доказ�
 уже включён на VPS; production env этой подготовкой не изменяется.
 Поведенческий тест исполняет фактический shell preflight и определения
 provisioner на synthetic данных, проверяя неизменность остальных grants.
+Billing provider user получает read только на
+`winwidget.billing.wincrm-provider.v1`, без configure/write; отдельная DLQ
+`winwidget.billing.wincrm-provider.v1.dead-letter` связана с его direct exchange.
+Его credential передаётся только Billing worker через
+`BILLING_WINCRM_PROVIDER_RABBITMQ_URL`, не API/scheduler/publisher. Сохранять URL
+и совместимый Billing publisher до полного drain даже после отключения оплат.
+Identity invitation email flag включается только после готовности reader и
+согласованного Notify/Identity private token; обычный Billing/Identity rollout
+должен явно передавать новые CRM variables только нужным process roles.
+
+`scripts/crm-broker-topology.mjs` — AMQP-компонент будущего CRM controller,
+не самостоятельная команда деплоя. Он содержит точные 9 ACL-профилей,
+создаёт только 7 собственных exchanges, 14 durable classic queues и 18 bindings.
+Три общих exchanges должны уже существовать с правильным типом; компонент
+не переобъявляет их. Нет TTL/DLX retry, purge, удаления или бизнес-публикаций.
+Неизвестные CRM resources/bindings, несовместимые arguments/policies и
+работающие consumers блокируют действия. `x-queue-type=classic` задаётся явно;
+отсутствующий счётчик consumers в первом Management sample не считается нулём.
+Повторная совместимая декларация сохраняет сообщения.
+
+Caller обязан передать проверку актуального lock/env/image fence перед каждой
+мутацией и финальным чтением. Эти проверки, приватный transport, создание
+пользователей/выдача ACL, проверка identities и включение контракта ещё должны
+быть связаны CRM controller; сам модуль их не подменяет и не открывает продукт.
+Его отчёт явно содержит `credentialsProvisioned:false` и `releaseApproved:false`.
+Локальный/CI integration driver использует отдельный pinned RabbitMQ,
+синтетические сообщения и свои временные credentials, без production/провайдеров.
+Проверка 06.09.2026 на RabbitMQ 4.2.9 подтвердила повторную декларацию с
+сохранением 14 сообщений, подключение 9 scoped principals, 7 push consumers,
+доставку 5 confirmed/mandatory публикаций и запрет постороннего configure
+для всех 9 principals. Контракт topology SHA-256:
+`ecaa3836f87e98dc8a74f1b93f5621214e6bffcbdfb851899c4471d71b1173f8`.
+Это тест AMQP-компонента, а не production-прогон Billing/CRM runtimes или
+доказательство платежей. Собственный локальный broker/anonymous volumes,
+images/cache удалены, Colima остановлена.
+
 Container inventory ограничен project `winwidget` и не отклоняет отдельный
 CRM project сам по себе; cleanup защищает глобальные running IDs/image bindings
 и исключает все `winwidget-crm-*` references, в том числе не привязанные к
