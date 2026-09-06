@@ -40,13 +40,24 @@ Telegram bridge VPS
 Внутренние API, PostgreSQL и RabbitMQ слушают только loopback/private network.
 Публичными являются frontend, system Nginx API и согласованный Telegram relay.
 
-### WinCRM: отдельная opt-in конфигурация, ещё не production runtime
+### WinCRM: отдельные БД в production, приложения ещё закрыты
 
 В `winwidget.ru_services/deploy/docker-compose.crm.yml` описан отдельный
 Compose project `winwidget-crm`. Он не объединяется через `-f` с действующим
 `docker-compose.prod.yml` и не подключён к routine release controller.
 Само наличие конфигурации, зелёный shape test или запущенный CRM frontend
 не разрешают запуск backend, открытие Gateway routes, Trial или продаж.
+
+Первичная подготовка БД выполнена 07.09.2026 через services CI/CD
+`34067866115` для `774db6490808cbaff4ff96033c589205cb3935f7`
+с controller `6ab9828d9e8fdc058780514a5b434855c9924b07`.
+Четыре owner PostgreSQL healthy, migration ledgers содержат соответственно
+Access 6, Intake 8, Customers 4 и Sales 6 записей; точные checksums,
+object grants и аутентификацию ролей проверил этап `crm-databases`.
+Приложения, broker principals, Trial, платежи и публичные CRM routes этим
+выпуском не включены. Read-only замер после этапа: 4.83 GiB `MemAvailable`,
+15.97 GiB свободного диска; это не доказательство полного runtime capacity.
+При следующем запуске использовать свежую проверку состояния, а не этот снимок.
 
 Состав профилей:
 
@@ -107,8 +118,8 @@ Sales 5; migration pool 1. Memory/CPU caps обязательны, но не и�
 idle-derived значений по умолчанию. Сумма caps не доказывает реальный пик.
 
 До открытия рабочего CRM нужны capacity/business/browser gates из service backlog,
-DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
-согласованный Identity/Billing cutover и отдельный CRM-only controller.
+актуальная сверка owner DB/image/migration evidence, broker ACL/bindings,
+согласованный Identity/Billing cutover и CRM-only controller запуска приложений.
 
 Подготовительный scope `crm-prepare` проходит через тот же pinned reusable
 workflow и `deploy-services-production.sh`, общий root-owned deploy lock и
