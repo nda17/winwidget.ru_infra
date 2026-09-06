@@ -169,6 +169,7 @@ jobs:
             'RESTORE_STORAGE_PROBE',
             'ENV_CONTRACT',
             'COMPOSE_CONTRACT',
+            'CRM_COMPANION_CONTRACT',
             'NOTIFICATION_TOPOLOGY',
             'REPORTING_TOPOLOGY',
             'RABBITMQ_EXPECTED_USERS',

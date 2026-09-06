@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
 
@@ -9,15 +10,236 @@ const source = readFileSync(
 	'utf8'
 )
 const heredoc = label => {
-	const marker = "<<'" + label + "'\n"
+	const marker = "<<'" + label + "'"
 	const begin = source.indexOf(marker)
 	assert.ok(begin >= 0, label)
-	const start = begin + marker.length
+	const start = source.indexOf('\n', begin) + 1
 	const end = source.indexOf('\n' + label + '\n', start)
 	assert.ok(end > start, label)
 	return source.slice(start, end)
 }
+const materialize = (overrides = {}) => {
+	const examples = {
+		billing: [
+			'BILLING_CRM_ACCESS_TOKEN',
+			'BILLING_WINCRM_PAYMENTS_ENABLED',
+			'BILLING_WINCRM_RECONCILIATION_ENABLED',
+			'BILLING_WINCRM_FRONTEND_ORIGIN',
+			'BILLING_CRM_ACCESS_COMMERCE_BASE_URL',
+			'BILLING_CRM_ACCESS_COMMERCE_TOKEN',
+			'BILLING_WINCRM_PROVIDER_RABBITMQ_URL',
+			'BILLING_WINCRM_PROVIDER_ASSERT_TOPOLOGY',
+			'BILLING_WINCRM_WIDGETS_ELIGIBILITY_ENABLED',
+			'BILLING_WINCRM_WIDGETS_TOKEN',
+			'BILLING_WINCRM_CRM_INTAKE_TOKEN'
+		],
+		identity: [
+			'IDENTITY_CRM_ACCESS_TOKEN',
+			'WINCRM_INVITATION_EMAIL_ENABLED',
+			'IDENTITY_NOTIFICATION_DELIVERY_TOKEN'
+		],
+		widgets: [
+			'WIDGETS_WINCRM_CONNECTOR_ENABLED',
+			'WIDGETS_CRM_INTAKE_TOKEN',
+			'BILLING_WINCRM_WIDGETS_TOKEN',
+			'WIDGETS_WINCRM_HTTP_TIMEOUT_MS'
+		],
+		'notification-delivery': ['IDENTITY_NOTIFICATION_DELIVERY_TOKEN']
+	}
+	const values = {
+		DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64: Buffer.alloc(32, 1).toString(
+			'base64'
+		),
+		DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID: 'test-receipt-key',
+		IDENTITY_CRM_ACCESS_TOKEN: 'a'.repeat(64),
+		BILLING_CRM_ACCESS_TOKEN: 'b'.repeat(64),
+		...overrides
+	}
+	const written = new Map()
+	runInNewContext(
+		heredoc('MATERIALIZE_SERVICE_ENVS'),
+		{
+			Buffer,
+			process: { env: { EXPECTED_SERVICES_REVISION: 'c'.repeat(40) } },
+			require: name => {
+				if (name === 'node:path') return path
+				assert.equal(name, 'node:fs')
+				return {
+					readFileSync: file => {
+						if (file === '/run/winwidget/canonical.env')
+							return Object.entries(values)
+								.map(([key, value]) => key + '=' + value)
+								.join('\n')
+						if (
+							file.endsWith('/database-backup-provenance-public-keys.json')
+						)
+							return JSON.stringify({
+								schemaVersion: 1,
+								domain:
+									'winwidget.operations.database-backup-provenance.v1',
+								keys: [
+									{
+										keyId: 'operations-backup-ed25519-2026-08-31',
+										publicKeySpkiDerBase64: 'synthetic-only'
+									}
+								]
+							})
+						const match =
+							/^\/run\/winwidget\/apps\/([a-z-]+)\/\.env\.example$/.exec(
+								file
+							)
+						assert.ok(match)
+						return [
+							'APP_REVISION',
+							'NODE_ENV',
+							...(examples[match[1]] ?? [])
+						]
+							.map(key => key + '=change_me')
+							.join('\n')
+					},
+					writeFileSync: (file, contents, options) => {
+						assert.match(
+							file,
+							/^\/run\/winwidget\/output\/[a-z-]+\.env\.production$/
+						)
+						assert.equal(options.mode, 0o600)
+						assert.equal(options.flag, 'wx')
+						assert.equal(written.has(file), false)
+						written.set(
+							file,
+							Object.fromEntries(
+								contents
+									.trimEnd()
+									.split('\n')
+									.map(line => {
+										const index = line.indexOf('=')
+										return [line.slice(0, index), line.slice(index + 1)]
+									})
+							)
+						)
+					}
+				}
+			}
+		},
+		{ timeout: 1000 }
+	)
+	return Object.fromEntries(
+		[...written].map(([file, value]) => [
+			path.basename(file, '.env.production'),
+			value
+		])
+	)
+}
+
+test('actual env materializer keeps CRM opt-in defaults and does not substitute example secrets', () => {
+	const result = materialize()
+	assert.equal(Object.keys(result).length, 10)
+	assert.equal(result.billing.BILLING_WINCRM_PAYMENTS_ENABLED, 'false')
+	assert.equal(
+		result.billing.BILLING_WINCRM_RECONCILIATION_ENABLED,
+		'false'
+	)
+	assert.equal(result.billing.BILLING_WINCRM_PROVIDER_RABBITMQ_URL, '')
+	assert.equal(result.identity.WINCRM_INVITATION_EMAIL_ENABLED, 'false')
+	assert.equal(
+		result['notification-delivery'].IDENTITY_NOTIFICATION_DELIVERY_TOKEN,
+		''
+	)
+	assert.equal(result.widgets.WIDGETS_WINCRM_CONNECTOR_ENABLED, 'false')
+	assert.equal(JSON.stringify(result).includes('change_me'), false)
+	assert.throws(() => materialize({ BILLING_CRM_ACCESS_TOKEN: '' }))
+	assert.throws(() => materialize({ IDENTITY_CRM_ACCESS_TOKEN: '' }))
+})
+
+test('actual env materializer requires missing credentials when their precise CRM feature is active', () => {
+	for (const key of [
+		'BILLING_WINCRM_PAYMENTS_ENABLED',
+		'BILLING_WINCRM_RECONCILIATION_ENABLED',
+		'BILLING_WINCRM_WIDGETS_ELIGIBILITY_ENABLED',
+		'WIDGETS_WINCRM_CONNECTOR_ENABLED',
+		'WINCRM_INVITATION_EMAIL_ENABLED'
+	]) {
+		assert.throws(() => materialize({ [key]: 'true' }))
+		assert.throws(() => materialize({ [key]: 'yes' }))
+	}
+	assert.throws(() =>
+		materialize({
+			NOTIFICATION_DELIVERY_KINDS: 'email,wincrm-invitation-email'
+		})
+	)
+	const broker = 'amqp://synthetic:synthetic@127.0.0.1:5672/winwidget'
+	const result = materialize({
+		BILLING_WINCRM_RECONCILIATION_ENABLED: 'true',
+		BILLING_WINCRM_PROVIDER_RABBITMQ_URL: broker
+	})
+	assert.equal(result.billing.BILLING_WINCRM_PROVIDER_RABBITMQ_URL, broker)
+	assert.equal(result.billing.BILLING_WINCRM_PAYMENTS_ENABLED, 'false')
+	const mail = materialize({
+		WINCRM_INVITATION_EMAIL_ENABLED: 'true',
+		NOTIFICATION_DELIVERY_KINDS: 'email,wincrm-invitation-email',
+		IDENTITY_NOTIFICATION_DELIVERY_TOKEN: 'd'.repeat(64)
+	})
+	assert.equal(
+		mail.identity.IDENTITY_NOTIFICATION_DELIVERY_TOKEN,
+		mail['notification-delivery'].IDENTITY_NOTIFICATION_DELIVERY_TOKEN
+	)
+})
 const inventoryCode = heredoc('RABBITMQ_EXPECTED_USERS')
+test('actual companion validation wrapper suppresses malformed input, loader and validator errors', () => {
+	const code = heredoc('CRM_COMPANION_CONTRACT')
+	const run = (module, input) =>
+		spawnSync(
+			process.execPath,
+			[
+				'-e',
+				module === undefined
+					? code
+					: code.replace(
+							'/run/winwidget/validate-crm-compose.mjs',
+							'data:text/javascript;base64,' +
+								Buffer.from(module).toString('base64')
+						)
+			],
+			{
+				input,
+				encoding: 'utf8',
+				timeout: 5000,
+				env: { SYNTHETIC_CRM_CANONICAL: 'fixture-only' }
+			}
+		)
+	const module =
+		'export function validateCrmCompanionCompose(config, source) { if(config.test !== true || source.SYNTHETIC_CRM_CANONICAL !== "fixture-only") throw new Error("sensitive-validator-message"); }'
+	const ok = run(module, '{"test":true}')
+	assert.equal(ok.status, 0)
+	assert.equal(ok.stdout + ok.stderr, '')
+	for (const result of [
+		run(module, 'sensitive-invalid-json'),
+		run(module, '{}'),
+		run(undefined, '{}')
+	]) {
+		assert.equal(result.status, 1)
+		assert.equal(result.stdout, '')
+		assert.equal(
+			result.stderr,
+			'Production CRM companion wiring is invalid; private details suppressed.\n'
+		)
+	}
+	const invocation = source.slice(
+		source.indexOf('crm_companion_validator_file='),
+		source.indexOf('unset crm_companion_validator')
+	)
+	for (const boundary of [
+		'--network none',
+		'--read-only',
+		'--cap-drop ALL',
+		'--security-opt no-new-privileges',
+		'--env-file "$env_file"',
+		'$crm_companion_validator_file:/run/winwidget/validate-crm-compose.mjs:ro',
+		'winwidget-api-gateway:git-$services_revision',
+		"die 'Production CRM companion environment validation failed.'"
+	])
+		assert.ok(invocation.includes(boundary))
+})
 const provisionCode = heredoc('PROVISION_RABBITMQ')
 const definitionsEnd = provisionCode.indexOf(
 	'const provisionTopology = async () => {'

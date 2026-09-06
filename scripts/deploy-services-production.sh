@@ -840,6 +840,45 @@ const fallbacks = new Map([
 ]);
 const overrides = new Map();
 const explicitlyOptionalEmptyValues = new Set(['widgets:S3_KEY_PREFIX']);
+// CRM readers/producers stay opt-in. Empty optional credentials are allowed
+// only while their exact feature is disabled; never copy example secrets.
+const crmFlag = key => {
+	const flag = canonical.get(key) ?? 'false';
+	if (!['true', 'false'].includes(flag)) fail();
+	return flag === 'true';
+};
+const crmPayments = crmFlag('BILLING_WINCRM_PAYMENTS_ENABLED');
+const crmReconciliation = crmFlag('BILLING_WINCRM_RECONCILIATION_ENABLED');
+const crmEligibility = crmFlag('BILLING_WINCRM_WIDGETS_ELIGIBILITY_ENABLED');
+const crmWidgets = crmFlag('WIDGETS_WINCRM_CONNECTOR_ENABLED');
+const crmEmail = crmFlag('WINCRM_INVITATION_EMAIL_ENABLED');
+const crmEmailReader = (canonical.get('NOTIFICATION_DELIVERY_KINDS') ?? '')
+	.split(',').includes('wincrm-invitation-email');
+for (const [ownerKey, fallback] of [
+	['billing:BILLING_WINCRM_PAYMENTS_ENABLED', 'false'],
+	['billing:BILLING_WINCRM_RECONCILIATION_ENABLED', 'false'],
+	['billing:BILLING_WINCRM_WIDGETS_ELIGIBILITY_ENABLED', 'false'],
+	['billing:BILLING_WINCRM_PROVIDER_ASSERT_TOPOLOGY', 'false'],
+	['billing:BILLING_WINCRM_FRONTEND_ORIGIN', 'https://crm.winwidget.ru'],
+	['widgets:WIDGETS_WINCRM_CONNECTOR_ENABLED', 'false'],
+	['widgets:WIDGETS_WINCRM_HTTP_TIMEOUT_MS', '3000'],
+	['identity:WINCRM_INVITATION_EMAIL_ENABLED', 'false']
+]) fallbacks.set(ownerKey, fallback);
+for (const [ownerKey, optional] of [
+	['billing:BILLING_CRM_ACCESS_COMMERCE_BASE_URL', !crmPayments],
+	['billing:BILLING_CRM_ACCESS_COMMERCE_TOKEN', !crmPayments],
+	['billing:BILLING_WINCRM_PROVIDER_RABBITMQ_URL', !crmPayments && !crmReconciliation],
+	['billing:BILLING_WINCRM_WIDGETS_TOKEN', !crmEligibility],
+	['billing:BILLING_WINCRM_CRM_INTAKE_TOKEN', !crmEligibility],
+	['widgets:WIDGETS_CRM_INTAKE_TOKEN', !crmWidgets],
+	['widgets:BILLING_WINCRM_WIDGETS_TOKEN', !crmWidgets],
+	['identity:IDENTITY_NOTIFICATION_DELIVERY_TOKEN', !crmEmail && !crmEmailReader],
+	['notification-delivery:IDENTITY_NOTIFICATION_DELIVERY_TOKEN', !crmEmailReader]
+]) {
+	if (!optional) continue;
+	explicitlyOptionalEmptyValues.add(ownerKey);
+	fallbacks.set(ownerKey, '');
+}
 overrides.set(
 	'operations:DATABASE_RESTORE_STAGING_DIR',
 	'/var/lib/winwidget-operations/restore-staging'
@@ -1803,6 +1842,37 @@ database_restore_enabled="$(
 	die 'Production Compose returned an invalid restore gate.'
 readonly database_restore_enabled
 unset compose_contract_validator
+
+crm_companion_validator_file="$release_root/.github/scripts/validate-crm-compose.mjs"
+[[ -f "$crm_companion_validator_file" && ! -L "$crm_companion_validator_file" ]] ||
+	die 'Exact CRM companion environment validator is missing or unsafe.'
+crm_companion_validator=''
+read -r -d '' crm_companion_validator <<'CRM_COMPANION_CONTRACT' || true
+const fs = require('node:fs');
+import('/run/winwidget/validate-crm-compose.mjs')
+	.then(({ validateCrmCompanionCompose }) => {
+		const config = JSON.parse(fs.readFileSync(0, 'utf8'));
+		validateCrmCompanionCompose(config, process.env);
+	})
+	.catch(() => {
+		process.stderr.write('Production CRM companion wiring is invalid; private details suppressed.\n');
+		process.exitCode = 1;
+	});
+CRM_COMPANION_CONTRACT
+compose_all config --format json 2>/dev/null |
+	docker run --rm -i \
+		--network none \
+		--read-only \
+		--cap-drop ALL \
+		--security-opt no-new-privileges \
+		--user 0:0 \
+		--env-file "$env_file" \
+		--volume "$crm_companion_validator_file:/run/winwidget/validate-crm-compose.mjs:ro" \
+		--entrypoint node \
+		"winwidget-api-gateway:git-$services_revision" \
+		-e "$crm_companion_validator" ||
+	die 'Production CRM companion environment validation failed.'
+unset crm_companion_validator
 
 compose_all run --rm --no-deps --interactive operations-worker node - \
 	<<'VERIFY_BACKUP_PROVENANCE_KEY' >/dev/null

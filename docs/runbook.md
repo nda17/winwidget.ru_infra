@@ -154,6 +154,22 @@ Identity invitation email flag включается только после го
 согласованного Notify/Identity private token; обычный Billing/Identity rollout
 должен явно передавать новые CRM variables только нужным process roles.
 
+Companion Compose передаёт provider URL и reverse commerce token только
+Billing worker. Scheduler получает `BILLING_WINCRM_RECONCILIATION_ENABLED`,
+без брокерного секрета: этот флаг сохраняется после закрытия продаж до
+завершения durable операций и активации уже оплаченных отложенных периодов.
+`validateCrmCompanionCompose` запускается и в CI, и в routine controller
+до migrations/restarts; он сверяет canonical env с нормализованным Compose,
+проверяет process-scoped ключи и запрещает producer без reader/eligibility,
+платёжный drain без scheduler и runtime topology provisioning.
+Canonical env должен содержать все документированные CRM companion keys,
+включая явно пустые optional значения при выключенных flags. Materializer
+разрешает их только при отключении соответствующего feature; обязательные
+Identity/Billing inbound CRM credentials остаются обязательными. Перед первым
+применением выполнить обычную двустороннюю env-синхронизацию. Новый controller
+требует services revision с companion validator; старую ревизию без него
+нельзя выпускать этим controller. Production wiring ещё не проверена.
+
 `scripts/crm-broker-topology.mjs` — AMQP-компонент будущего CRM controller,
 не самостоятельная команда деплоя. Он содержит точные 9 ACL-профилей,
 создаёт только 7 собственных exchanges, 14 durable classic queues и 18 bindings.
