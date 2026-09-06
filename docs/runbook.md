@@ -109,9 +109,12 @@ idle-derived значений по умолчанию. Сумма caps не до
 До первого запуска нужны capacity/business/browser gates из service backlog,
 DB provisioning/grants, actual image/migration evidence, broker ACL/bindings,
 согласованный Identity/Billing cutover и отдельный CRM-only controller.
-Сначала обновить точный inventory contract существующего controller:
-дополнительные CRM containers/users сейчас нарушат routine deploy preflight.
-Не ослаблять проверки до wildcard/любых сторонних контейнеров. Подготовить
+Сначала обновить точный RabbitMQ user inventory существующего controller:
+новые scoped CRM principals сейчас нарушат routine deploy preflight.
+Container inventory ограничен project `winwidget` и не отклоняет отдельный
+CRM project сам по себе; cleanup защищает глобальные running IDs/image bindings.
+Доказать сохранность CRM при routine cleanup и сериализовать оба релиза общим
+deploy lock. Не ослаблять точные проверки до wildcard. Подготовить
 сосуществование обоих проектов, serial migrations, health/queue monitoring
 и rollback без удаления БД/очередей и без отката несовместимых publishers.
 Никакие новые dumps, downloads или backup jobs этой конфигурацией не создаются.
