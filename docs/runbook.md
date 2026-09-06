@@ -326,6 +326,35 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   от трёх workers: прежние Notes backup/finalize gates должны отклонять mixed
   runtime. Для возвращения к Notes B нужен отдельно согласованный протокол;
   исходная phase-A квитанция не доказывает четыре процесса старой ревизии.
+- `platform-marketing-runtime` — совместимое расширение CMS перед выпуском
+  главной экосистемы и `/products/crm`. Меняется только `platform-api`;
+  `platform-outbox-publisher` и остальные 29 контейнеров сохраняют свои
+  ID/image/revision, настройки, mounts и счётчики перезапусков. Порядок
+  перечисления mounts Docker незначим, но все их свойства проверяются.
+  Обязательны immutable green services/infra SHA, canonical root lock,
+  неизменные canonical/Platform env SHA и точная live Platform revision.
+  Operations/restore/companion authority запрещена; этот scope не читает
+  dump, не запускает backup, DDL, GRANT, auth-команды или платёжные операции.
+  Source gate допускает только два закреплённых CMS модуля, их новый spec,
+  CI/audit metadata и точную пару package/lock для security patch qs.
+  Остальные app trees закреплены отдельно от старого live Platform image.
+  UID1001-инвентаризация образов без сети и credentials проверяет реальный
+  старый/новый validator, восемь migrations, обе Prisma schemas, семь models,
+  весь compiled JS и единственную dependency-разницу `qs 6.15.3 -> 6.16.0`.
+  База не изменяется: bounded RepeatableRead/READ ONLY probe существующей
+  migration-ролью проверяет UUID, semantic fingerprint, applied ledger,
+  content hash/aggregate version/source sequence и owner ACL. Контент и
+  credentials в отчёт не выводятся. До/после замены доступны три настоящих
+  GET: live, ready и публичный `home-page-content`.
+  API останавливается только TERM с доказанным `Running=false/Pid=0`;
+  после остановки повторяются DB и neighbor checks. Неполный stop или
+  неизвестное состояние оставляет snapshots для recovery, без KILL.
+  **Откат старого validator разрешён только при неизменном контенте:**
+  сначала остановить новый writer, затем повторно проверить версию/hash,
+  ledger/ACL и соседей. После успешной записи расширенного CMS-документа
+  автоматический откат запрещён — нужен совместимый fix-forward, не
+  восстановление БД или потеря новых полей. Поэтому frontend с новым
+  редактором выпускается только после успешного Platform rollout.
 - `operations-runtime` — фаза A удаления административного Backlog. Только
   четыре Operations runtime, без вызова migration runner. Pending migration
   должна быть ровно `20260910110000_remove_admin_backlog`, предыдущий ledger —

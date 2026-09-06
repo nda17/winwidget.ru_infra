@@ -13,6 +13,15 @@ import {
 	SCOPED_SERVICES,
 	OPERATIONS_API_PHASE_A_SHA256,
 	OPERATIONS_API_SOURCE_PATHS,
+	PLATFORM_MARKETING_SOURCE,
+	assertPlatformMarketingSource,
+	assertPlatformImages,
+	validatePlatformInventory,
+	platformNeighborFingerprint,
+	parsePlatformProbeUrl,
+	verifyPlatformDatabase,
+	verifyPlatformHttp,
+	platformMarketingFixture,
 	assertBrokerQuiet,
 	assertOperationsApiImages,
 	assertOperationsApiPeers,
@@ -43,6 +52,199 @@ const envHash = 'c'.repeat(64)
 const identityScope = 'identity-with-operations-manifest'
 const workerScope = 'workers-bootstrap-recovery'
 const apiScope = 'operations-api-runtime'
+const platformScope = 'platform-marketing-runtime'
+
+function platformInventoryFixture() {
+	return {
+		schemaVersion: 1, kind: 'winwidget.platform.marketing-image.v1', mode: 'legacy',
+		migrations: [...Array.from({ length: 7 }, (_, index) => ({ name: `20260801${String(index).padStart(6, '0')}_owner`, checksum: envHash })), { name: '20260830020000_harden_default_routine_acl', checksum: envHash }],
+		schemaSha256: envHash, generatedSchemaSha256: envHash,
+		generatedModels: ['BillingOfferProducerState', 'HomePageContent', 'LegalPage', 'OutboxEvent', 'PlatformSourceSequence', 'ServiceIdentity', 'SiteSettings'],
+		compiled: [...Array.from({ length: 30 }, (_, index) => ({ path: `module-${String(index).padStart(2, '0')}.js`, sha256: envHash })), ...Object.keys(PLATFORM_MARKETING_SOURCE).map(path => ({ path: path.replace(/\.ts$/, '.js'), sha256: envHash }))].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
+		packages: [...Array.from({ length: 31 }, (_, index) => `package-${index}@1.0.0`), 'qs@6.15.3'].sort()
+	}
+}
+
+test('Platform image pair changes only the two CMS modules and exact qs security patch', () => {
+	const before = platformInventoryFixture(), after = structuredClone(before)
+	after.mode = 'marketing'
+	after.packages = after.packages.map(name => name === 'qs@6.15.3' ? 'qs@6.16.0' : name)
+	for (const source of Object.keys(PLATFORM_MARKETING_SOURCE)) after.compiled.find(row => row.path === source.replace(/\.ts$/, '.js')).sha256 = 'f'.repeat(64)
+	assert.equal(validatePlatformInventory(before), before)
+	assertPlatformImages(before, after)
+	for (const mutate of [
+		value => { value.mode = 'legacy' }, value => { value.kind = 'another-owner' }, value => { value.schemaVersion = 2 }, value => { value.extra = true },
+		value => { value.migrations.pop() }, value => { value.migrations.push(value.migrations[0]) }, value => { value.migrations[0].checksum = 'e'.repeat(64) },
+		value => { value.migrations[7].name = '20260830020000_unreviewed' }, value => { value.migrations.reverse() },
+		value => { value.schemaSha256 = value.generatedSchemaSha256 = 'e'.repeat(64) }, value => { value.generatedSchemaSha256 = 'e'.repeat(64) },
+		value => { value.generatedModels.push('CrmWorkspace') }, value => { value.generatedModels.reverse() },
+		value => { value.compiled.find(row => row.path === 'module-00.js').sha256 = 'f'.repeat(64) },
+		value => { value.compiled[0].sha256 = envHash }, value => { value.compiled.pop() }, value => { value.compiled.push(value.compiled[0]) },
+		value => { value.compiled[0].path = '../unsafe.js' }, value => { value.compiled[0].extra = true },
+		value => { value.packages = value.packages.filter(name => !name.startsWith('qs@')) },
+		value => { value.packages[value.packages.length - 1] = 'qs@6.17.0' }, value => { value.packages.push('qs@6.15.3'); value.packages.sort() },
+		value => { value.packages[0] = 'different@1.0.0'; value.packages.sort() }, value => { value.packages.push('../unsafe') }
+	]) { const changed = structuredClone(after); mutate(changed); assert.throws(() => assertPlatformImages(before, changed), undefined, mutate.toString()) }
+	assert.throws(() => assertPlatformImages(after, before))
+})
+
+test('Platform source admission pins both reviewed byte pairs and rejects synthetic or broadened source', () => {
+	assert.deepEqual(Object.keys(PLATFORM_MARKETING_SOURCE), ['content/platform-content.validation.ts', 'home-page-content/home-page-content.service.ts'])
+	assert.deepEqual(PLATFORM_MARKETING_SOURCE['content/platform-content.validation.ts'], ['b19aa419513a9a8dc936846c15b1b3871aad2a0b6b04d0886538ed90a8a9b99d', 'eefe666009198306f4595712c6c686d29d2b96f9843dbc10003c9a58f8f36f8a'])
+	assert.deepEqual(PLATFORM_MARKETING_SOURCE['home-page-content/home-page-content.service.ts'], ['f09abc76f355441b015df1cd929844987ebf2380eb307807bc085dda92849dc6', 'e5b0aa7a5487b5eb1e18cf25a367f43a05430a4c09c235e19a2cbd17d1fffcae'])
+	const sources = Object.fromEntries(Object.keys(PLATFORM_MARKETING_SOURCE).map(path => [path, Buffer.from('// synthetic source, not release proof\n')]))
+	assert.throws(() => assertPlatformMarketingSource(sources, sources))
+	assert.throws(() => assertPlatformMarketingSource({}, sources))
+	assert.throws(() => assertPlatformMarketingSource(sources, { ...sources, 'main.ts': Buffer.from('unreviewed') }))
+	assert.throws(() => assertPlatformMarketingSource(undefined, sources))
+	// Positive exact-source bytes are checked against actual release images/source,
+	// not manufactured by weakening the immutable hashes for a synthetic fixture.
+	const { legacy, marketing } = platformMarketingFixture()
+	assert.deepEqual(Object.keys(marketing).filter(key => !(key in legacy)), ['ecosystem', 'crmProduct'])
+	for (const [key, value] of Object.entries(legacy)) assert.deepEqual(marketing[key], value)
+	for (const key of ['enabled', 'price', 'release', 'url']) assert.equal(Object.hasOwn(marketing.crmProduct, key), false)
+})
+
+test('Platform read-only probe URL preserves credentials and pins the owner loopback and one bounded connection', () => {
+	const source = 'postgresql://winwidget_platform_migration:synthetic%40only%3Apassword@127.0.0.1:55439/winwidget_platform?schema=platform&sslmode=disable&connection_limit=9&pool_timeout=30&connect_timeout=30'
+	for (const protocol of ['postgresql:', 'postgres:']) {
+		const before = new URL(source.replace('postgresql:', protocol)), after = new URL(parsePlatformProbeUrl(before.toString()))
+		for (const key of ['protocol', 'hostname', 'port', 'pathname', 'username', 'password']) assert.equal(after[key], before[key])
+		assert.equal(after.searchParams.get('schema'), 'platform'); assert.equal(after.searchParams.get('sslmode'), 'disable')
+		assert.equal(after.searchParams.get('connection_limit'), '1'); assert.equal(after.searchParams.get('pool_timeout'), '5'); assert.equal(after.searchParams.get('connect_timeout'), '5')
+	}
+	for (const [from, to] of [
+		['postgresql:', 'https:'], ['127.0.0.1', 'localhost'], ['127.0.0.1', '192.0.2.1'], ['127.0.0.1', '[::1]'], ['55439', '5432'],
+		['/winwidget_platform', '/winwidget_operations'], ['winwidget_platform_migration:', 'winwidget_platform_runtime:'],
+		[':synthetic%40only%3Apassword@', '@'], ['schema=platform', 'schema=public'], ['schema=platform&', ''],
+		['sslmode=disable', 'sslmode=require'], ['sslmode=disable', 'sslmode=prefer'], ['sslmode=disable', 'sslmode=verify-full']
+	]) assert.throws(() => parsePlatformProbeUrl(source.replace(from, to)))
+	for (const suffix of ['#fragment', '&host=192.0.2.1', '&options=-c%20search_path%3Dpublic', '&schema=platform', '&%73chema=platform', '&sslmode=disable', '&connection_limit=1', '&pool_timeout=5', '&connect_timeout=5']) assert.throws(() => parsePlatformProbeUrl(source + suffix))
+	for (const value of [undefined, null, {}, '', 'not-a-url', 'a'.repeat(4097)]) assert.throws(() => parsePlatformProbeUrl(value))
+})
+
+function platformPeersFixture() {
+	return ['platform-api', 'platform-outbox-publisher', ...Array.from({ length: 29 }, (_, index) => `neighbor-${index}`)].map((name, index) => ({
+		Id: (index + 1).toString(16).padStart(64, '0'), Image: `sha256:${'e'.repeat(64)}`,
+		Config: { Labels: { 'com.docker.compose.project': 'winwidget', 'com.docker.compose.service': name, 'org.opencontainers.image.revision': oldRevision }, Env: [`APP_REVISION=${oldRevision}`, 'SYNTHETIC_ONLY=true'] },
+		State: { Running: true, Status: 'running', Health: { Status: 'healthy' }, StartedAt: '2026-09-05T20:00:00.000Z' },
+		RestartCount: 0, HostConfig: { NetworkMode: 'host' }, Mounts: []
+	}))
+}
+
+test('Platform requires exactly 31 distinct containers and fingerprints all 30 healthy neighbors including its publisher', () => {
+	const live = platformPeersFixture(), before = platformNeighborFingerprint(live)
+	assert.match(before, /^[a-f0-9]{64}$/)
+	assert.equal(platformNeighborFingerprint([...live].reverse()), before)
+	const replacement = structuredClone(live)
+	replacement[0].Id = 'f'.repeat(64); replacement[0].Image = `sha256:${'f'.repeat(64)}`; replacement[0].Config.Env.push('APP_REVISION=synthetic-candidate')
+	replacement[0].State = { Running: false, Status: 'exited' }
+	assert.equal(platformNeighborFingerprint(replacement), before)
+	for (const mutate of [
+		value => { value[1].Id = 'f'.repeat(64) }, value => { value[1].Image = `sha256:${'f'.repeat(64)}` }, value => { value[1].RestartCount++ },
+		value => { value[2].Config.Env.push('SYNTHETIC_DRIFT=true') }, value => { value[3].HostConfig.NetworkMode = 'bridge' },
+		value => { value[4].Mounts.push({ Source: '/synthetic', Destination: '/changed' }) }, value => { value[5].State.StartedAt = '2026-09-06T01:00:00.000Z' }
+	]) { const changed = structuredClone(live); mutate(changed); assert.notEqual(platformNeighborFingerprint(changed), before, mutate.toString()) }
+	for (const mutate of [
+		value => { value.pop() }, value => { value.push(structuredClone(value[0])) }, value => { value[1].Id = value[0].Id },
+		value => { value[1].Config.Labels['com.docker.compose.service'] = 'other-publisher' }, value => { value[0].Config.Labels['com.docker.compose.service'] = 'other-api' },
+		value => { value[2].Config.Labels['com.docker.compose.service'] = value[1].Config.Labels['com.docker.compose.service'] },
+		value => { value[2].Config.Labels['com.docker.compose.project'] = 'other' }, value => { value[2].State.Health.Status = 'unhealthy' },
+		value => { value[2].State.Running = false }, value => { value[2].State.Status = 'exited' }, value => { value[2].Image = 'mutable:latest' }
+	]) { const changed = structuredClone(live); mutate(changed); assert.throws(() => platformNeighborFingerprint(changed), undefined, mutate.toString()) }
+})
+
+test('Platform database admission is SELECT-only and binds its eight applied migrations, UUID, content versions and owner ACL', async () => {
+	const files = platformInventoryFixture().migrations
+	const make = (mutate = () => {}) => {
+		const state = {
+			readonly: 'on', principal: [{ database: 'winwidget_platform', username: 'winwidget_platform_migration', schema: 'platform', recovery: false }],
+			identity: [{ id: 'singleton', service_name: 'platform-service', database_id: '11111111-1111-4111-8111-111111111111', current_semantic_fingerprint: envHash, actual_fingerprint: envHash }],
+			ledger: files.map(file => ({ migration_name: file.name, checksum: file.checksum, finished_at: '2026-09-05', rolled_back_at: null })),
+			content: [{ version: '3', sequence: '7', sha256: envHash }], acl: [{ acl: { relations: [['home_page_content', 'winwidget_platform_migration', 'synthetic-acl']], routines: [], defaults: [] } }]
+		}
+		mutate(state)
+		return { $queryRawUnsafe: async sql => {
+			assert.match(sql, /^(SHOW transaction_read_only$|SELECT )/); assert.doesNotMatch(sql, /\b(INSERT|UPDATE|DELETE|DROP|ALTER|GRANT|REVOKE|TRUNCATE|COPY)\b/)
+			if (sql.startsWith('SHOW ')) return [{ transaction_read_only: state.readonly }]
+			if (sql.includes('current_database()')) return state.principal
+			if (sql.includes('.service_identity')) return state.identity
+			if (sql.includes('._prisma_migrations')) return state.ledger
+			if (sql.includes('.home_page_content')) { assert.match(sql, /aggregate_version::text/); assert.match(sql, /source_sequence::text/); assert.match(sql, /encode\(sha256\(convert_to\(content::text/); return state.content }
+			assert.match(sql, /jsonb_build_object\('relations'/); assert.match(sql, /pg_default_acl/); return state.acl
+		} }
+	}
+	const before = await verifyPlatformDatabase(make(), files)
+	assert.match(before, /^[a-f0-9]{64}$/); assert.equal(await verifyPlatformDatabase(make(), files), before)
+	for (const mutate of [
+		value => { value.identity[0].database_id = '22222222-2222-4222-8222-222222222222' },
+		value => { value.identity[0].current_semantic_fingerprint = value.identity[0].actual_fingerprint = 'e'.repeat(64) },
+		value => { value.content[0].version = '4' }, value => { value.content[0].sequence = '8' }, value => { value.content[0].sha256 = 'e'.repeat(64) },
+		value => { value.acl[0].acl.relations[0][2] = 'changed-acl' }
+	]) assert.notEqual(await verifyPlatformDatabase(make(mutate), files), before, mutate.toString())
+	for (const mutate of [
+		value => { value.readonly = 'off' }, value => { value.principal[0].username = 'winwidget_platform_runtime' }, value => { value.principal[0].schema = 'public' },
+		value => { value.principal[0].database = 'winwidget_operations' }, value => { value.principal[0].recovery = true }, value => { value.identity.pop() },
+		value => { value.identity[0].service_name = 'operations-service' }, value => { value.identity[0].database_id = 'invalid' }, value => { value.identity[0].actual_fingerprint = 'e'.repeat(64) },
+		value => { value.ledger.pop() }, value => { value.ledger.push(value.ledger[0]) }, value => { value.ledger[0].checksum = 'e'.repeat(64) }, value => { value.ledger[0].finished_at = null }, value => { value.ledger[0].rolled_back_at = '2026-09-06' },
+		value => { value.content.pop() }, value => { value.content[0].version = '-1' }, value => { value.content[0].sequence = '1.1' }, value => { value.content[0].sha256 = 'invalid' }, value => { value.acl[0].acl = null }
+	]) await assert.rejects(() => verifyPlatformDatabase(make(mutate), files), undefined, mutate.toString())
+	await assert.rejects(() => verifyPlatformDatabase(make(), files.slice(1)))
+})
+
+test('scoped neighbor inventories ignore only mount enumeration order, not mount or ordered configuration changes', () => {
+	const { live: operations } = apiPeersFixture()
+	for (let index = 0; index < 26; index++) { const item = structuredClone(operations[4]); item.Id = (index + 20).toString(16).padStart(64, '0'); item.Config.Labels['com.docker.compose.service'] = `neighbor-${index}`; operations.push(item) }
+	for (const [live, fingerprint] of [[operations, operationsApiNeighborFingerprint], [platformPeersFixture(), platformNeighborFingerprint]]) {
+		live[3].Mounts = [
+			{ Type: 'bind', Source: '/synthetic/source', Destination: '/run/input', Mode: 'ro', RW: false, Propagation: 'rprivate' },
+			{ Type: 'volume', Name: 'synthetic-volume', Source: '/synthetic/volume', Destination: '/data', Driver: 'local', Mode: 'rw', RW: true, Propagation: '' }
+		]
+		const original = structuredClone(live), before = fingerprint(live)
+		for (let sample = 0; sample < 12; sample++) {
+			const next = structuredClone(live)
+			if (sample % 2) next[3].Mounts.reverse()
+			if (sample % 3) next[3].Mounts = next[3].Mounts.map(mount => Object.fromEntries(Object.entries(mount).reverse()))
+			assert.equal(fingerprint(next), before)
+		}
+		assert.deepEqual(live, original)
+		for (const [index, key, value] of [[0, 'Source', '/changed'], [0, 'Destination', '/changed'], [0, 'RW', true], [0, 'Mode', 'rw'], [0, 'Propagation', 'shared'], [0, 'Type', 'volume'], [1, 'Name', 'other-volume'], [1, 'Driver', 'other-driver'], [0, 'FutureDockerField', 'changed']]) {
+			const next = structuredClone(live); next[3].Mounts[index][key] = value
+			assert.notEqual(fingerprint(next), before, `mount property ${key} must remain checked`)
+		}
+		for (const mutate of [value => value[3].Mounts.pop(), value => value[3].Mounts.push(value[3].Mounts[0]), value => { delete value[3].Mounts[0].Propagation }]) {
+			const next = structuredClone(live); mutate(next); assert.notEqual(fingerprint(next), before)
+		}
+		const next = structuredClone(live); next[3].HostConfig.Dns = ['127.0.0.2', '127.0.0.3']
+		const dnsBefore = fingerprint(next); next[3].HostConfig.Dns.reverse()
+		assert.notEqual(fingerprint(next), dnsBefore)
+	}
+})
+
+test('Platform HTTP proof performs only the actual three bounded public GETs and rejects false readiness or content shape', async () => {
+	const expected = ['/health/live', '/health/ready', '/api/v1/home-page-content'], calls = []
+	const fake = (mutate = () => {}) => async (url, options) => {
+		const path = new URL(url).pathname; calls.push(path)
+		assert.equal(new URL(url).origin, 'http://127.0.0.1:5000'); assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'error'); assert.ok(options.signal instanceof AbortSignal)
+		assert.ok(expected.includes(path)); assert.equal(options.body, undefined); assert.equal(options.headers, undefined)
+		const value = path.endsWith('home-page-content') ? { id: 'singleton', content: {}, updatedAt: '2026-09-05T20:00:00.000Z' } : { service: 'platform', role: 'api', revision, status: path.endsWith('ready') ? 'ready' : 'ok', database: { serviceName: 'platform-service', currentSemanticFingerprint: envHash } }
+		const response = { value, status: 200, headers: { 'cache-control': 'no-store' } }; mutate(response, path)
+		return new Response(JSON.stringify(response.value), { status: response.status, headers: response.headers })
+	}
+	await verifyPlatformHttp(revision, fake()); assert.deepEqual(calls, expected)
+	for (const mutate of [
+		response => { response.status = 503 }, response => { response.value.revision = oldRevision }, response => { response.value.role = 'publisher' },
+		response => { response.value.service = 'operations' }, response => { response.value.status = 'not-ready' }, response => { delete response.headers['cache-control'] },
+		(response, path) => { if (path.endsWith('ready')) response.value.database.serviceName = 'other-service' },
+		(response, path) => { if (path.endsWith('ready')) response.value.database.currentSemanticFingerprint = 'invalid' },
+		(response, path) => { if (path.endsWith('home-page-content')) response.value.id = 'other' },
+		(response, path) => { if (path.endsWith('home-page-content')) response.value.content = [] },
+		(response, path) => { if (path.endsWith('home-page-content')) response.value.updatedAt = 'invalid' },
+		(response, path) => { if (path.endsWith('home-page-content')) response.value.content = { oversized: 'x'.repeat(2 * 1024 * 1024) } }
+	]) await assert.rejects(() => verifyPlatformHttp(revision, fake(mutate)), undefined, mutate.toString())
+	await assert.rejects(() => verifyPlatformHttp('prod', fake()))
+	await assert.rejects(() => verifyPlatformHttp(revision, async () => { throw new Error('synthetic unavailable') }))
+})
 
 test('backup URL accepts the existing owner loopback sslmode shape without changing credentials', () => {
 	for (const protocol of ['postgresql', 'postgres']) {
@@ -159,7 +361,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope]) {
+	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope, platformScope]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -167,6 +369,14 @@ test('real controller requires reviewed owner identity and exact env hash', () =
 			EXPECTED_SERVICE_ENV_SHA256: 'not-a-hash'
 		}, /approved live revision and owner env SHA256/)
 	}
+})
+
+test('Platform controller rejects destructive and foreign companion authority before transport', () => {
+	for (const authority of [
+		{ OPERATIONS_RUNTIME_REVISION: oldRevision }, { OPERATIONS_EVIDENCE_SHA256: envHash },
+		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_OPERATIONS_ENV_SHA256: envHash },
+		{ EXPECTED_OPERATIONS_API_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash }
+	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: platformScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization|baseline/i)
 })
 
 test('worker release requires all three exact owner envs and no foreign authority', () => {
@@ -251,6 +461,7 @@ function composeFixture(scope = identityScope) {
 		if (scope === identityScope && ['operations-api', 'operations-restore-worker'].includes(name)) environment.DATABASE_RESTORE_ENABLED = 'false'
 		if (scope === workerScope && name === 'operations-restore-worker') environment.DATABASE_RESTORE_ENABLED = 'false'
 		if (scope === apiScope) environment.DATABASE_RESTORE_ENABLED = 'false'
+		if (scope === platformScope) environment.PLATFORM_PROCESS_ROLE = 'api'
 		const before = { ...environment, APP_REVISION: oldRevision }
 		if (name === 'identity-api') before.IDENTITY_LOGIN_OTP_ENABLED = 'false'
 		services[name] = {
@@ -292,6 +503,22 @@ function composeFixture(scope = identityScope) {
 	const supportImage = { ...structuredClone(image), Id: `sha256:${'1'.repeat(64)}` }
 	return { scope, revision, previousRevision: oldRevision, operationsPreviousRevision: oldRevision, compose: { services }, live, image, operationsImage, supportImage }
 }
+
+test('Platform Compose replaces only its API and preserves process role, environment and runtime configuration', () => {
+	const input = composeFixture(platformScope), { desired, rollback } = prepareScopedCompose(input)
+	assert.deepEqual(Object.keys(desired.services), ['platform-api'])
+	assert.deepEqual(Object.keys(rollback.services), ['platform-api'])
+	assert.equal(desired.services['platform-api'].environment.PLATFORM_PROCESS_ROLE, 'api')
+	assert.equal(desired.services['platform-api'].image, input.image.Id)
+	assert.equal(rollback.services['platform-api'].image, input.live[0].Image)
+	for (const mutate of [
+		value => { value.compose.services['platform-api'].environment.PLATFORM_PROCESS_ROLE = 'outbox-publisher' },
+		value => { value.live[0].Config.Env = value.live[0].Config.Env.filter(entry => !entry.startsWith('PLATFORM_PROCESS_ROLE=')) },
+		value => { value.compose.services['platform-api'].environment.NEW_SETTING = 'unreviewed' },
+		value => { value.compose.services['platform-api'].mem_limit = 1024 },
+		value => { value.live[0].State.Health.Status = 'unhealthy' }
+	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareScopedCompose(changed), undefined, mutate.toString()) }
+})
 
 test('worker Compose requires its healthy same-revision Billing API companion and excludes all other APIs/schedulers', () => {
 	const input = composeFixture(workerScope)
@@ -957,6 +1184,11 @@ expected_operations_env_sha256="$TEST_ENV_HASH"
 expected_support_env_sha256="$TEST_ENV_HASH"
 operations_runtime_revision=''
 operations_evidence_sha256=''
+if [[ "$release_scope" == platform-marketing-runtime ]]; then
+  expected_operations_revision=''; expected_operations_env_sha256=''; expected_support_env_sha256=''
+  if [[ "$TEST_SCENARIO" == foreign-authority ]]; then operations_runtime_revision="$TEST_PREVIOUS_REVISION"; fi
+  scoped_platform_source() { printf 'PLATFORM_SOURCE\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != source-drift ]]; }
+fi
 if [[ "$release_scope" == operations-backlog-finalize || "$release_scope" == operations-backlog-backup ]]; then
   operations_runtime_revision="$expected_live_revision"
   if [[ "$release_scope" == operations-backlog-finalize ]]; then operations_evidence_sha256="$TEST_EVIDENCE_HASH"; fi
@@ -1023,7 +1255,7 @@ docker() {
   fi
   case "$1" in
     ps)
-      if [[ "$TEST_SCOPE" == operations-api-runtime && " $* " != *'label=com.docker.compose.service='* ]]; then
+      if [[ ( "$TEST_SCOPE" == operations-api-runtime || "$TEST_SCOPE" == platform-marketing-runtime ) && " $* " != *'label=com.docker.compose.service='* ]]; then
         for number in {1..31}; do printf '%064d\n' "$number"; done
         return 0
       fi
@@ -1031,7 +1263,8 @@ docker() {
         case "$arg" in label=com.docker.compose.service=*) service="${'${'}arg#label=com.docker.compose.service=}" ;; esac
       done
       case "$service" in
-        operations-api|api-gateway) number=1 ;;
+        operations-api|api-gateway|platform-api) number=1 ;;
+        platform-outbox-publisher) number=2 ;;
         operations-worker) number=2 ;;
         operations-outbox-publisher) number=3 ;;
         operations-restore-worker) number=4 ;;
@@ -1048,6 +1281,7 @@ docker() {
         *) return 1 ;;
       esac
       if [[ "$TEST_SCOPE" == operations-api-runtime && "$service" == operations-api && "$current" == desired ]]; then number=15; fi
+      if [[ "$TEST_SCOPE" == platform-marketing-runtime && "$service" == platform-api && "$current" == desired ]]; then number=15; fi
       printf -v cid '%064d' "$number"
       [[ " $* " == *' --all '* || ! -f "$SCOPED_FIXTURE/stopped-$cid" ]] || return 0
       printf '%s\n' "$cid" ;;
@@ -1105,6 +1339,16 @@ docker() {
         previous="$arg"; last="$arg"
       done
       if [[ "$action" == config ]]; then printf '{}\n'; return 0; fi
+      if [[ "$action" == run && " $* " == *' platform-database '* ]]; then
+        [[ "$TEST_SCOPE" == platform-marketing-runtime && " $* " == *' --user 1001:1001 '* && " $* " == *' --entrypoint timeout platform-migrate '* && " $* " != *' prisma '* ]] || return 1
+        local db_calls=0 content_state="$TEST_ENV_HASH"
+        [[ ! -f "$SCOPED_FIXTURE/platform-db-count" ]] || db_calls="$(<"$SCOPED_FIXTURE/platform-db-count")"
+        db_calls=$((db_calls + 1)); printf '%s' "$db_calls" >"$SCOPED_FIXTURE/platform-db-count"
+        [[ "$TEST_SCENARIO" != database-busy && "$TEST_SCENARIO" != ledger-failed ]] || return 1
+        if [[ "$TEST_SCENARIO" == post-stop-database && "$db_calls" == 3 ]]; then return 1; fi
+        if [[ "$TEST_SCENARIO" == pre-build-data && "$db_calls" == 2 || "$TEST_SCENARIO" == post-stop-data && "$db_calls" == 3 || "$TEST_SCENARIO" == post-data && "$current" == desired ]]; then content_state="$(printf '%064d' 1)"; fi
+        printf '%s' "$content_state"; return 0
+      fi
       if [[ "$action" == up ]]; then
         case "$snapshot" in */desired.json) printf desired >"$SCOPED_PHASE" ;; */rollback.json) printf rollback >"$SCOPED_PHASE" ;; *) return 83 ;; esac
         for number in 1 2 3 4 8 9 11 12 13; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
@@ -1153,6 +1397,20 @@ docker() {
       fi
       return 84 ;;
     run)
+      if [[ "$TEST_SCOPE" == platform-marketing-runtime ]]; then
+        case " $* " in
+          *' platform-image-inventory '*)
+            [[ " $* " == *' --network none '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* && "$TEST_SCENARIO" != inventory-failed ]] || return 1
+            printf '{}'; return ;;
+          *' platform-neighbors '*)
+            if [[ "$TEST_SCENARIO" == neighbor-drift && "$current" == desired ]]; then printf '%064d' 1; else printf '%s' "$TEST_ENV_HASH"; fi
+            return ;;
+          *' platform-image-pair '*) [[ "$TEST_SCENARIO" != compiled-drift ]]; return ;;
+          *' platform-http '*)
+            [[ " $* " == *' --network host '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* ]] || return 1
+            [[ "$TEST_SCENARIO" != http-failed || "$current" != desired ]]; return ;;
+        esac
+      fi
       if [[ "$TEST_SCOPE" == operations-api-runtime ]]; then
         case " $* " in
           *' operations-api-inventory '*)
@@ -1226,13 +1484,13 @@ function runRuntime(scope, scenario = 'success') {
 		const root = join(directory, 'app')
 		for (const relative of [
 			'deploy/backend', 'payload', 'release/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog',
-			'services/apps/operations', 'services/apps/api-gateway', 'services/apps/identity', 'services/apps/billing', 'services/apps/support',
+			'services/apps/operations', 'services/apps/api-gateway', 'services/apps/identity', 'services/apps/billing', 'services/apps/support', 'services/apps/platform',
 			`deploy/backend/scoped-releases/operations-backlog/${oldRevision}`
 		]) mkdirSync(join(root, relative), { recursive: true })
 		const env = 'SYNTHETIC_ONLY=true\n' + (scope === 'operations-backlog-backup' ? 'OPERATIONS_BACKUP_URL=synthetic-only-private-backup-url\n' : '')
 		for (const relative of [
 			'deploy/backend/.env.production', 'services/apps/operations/.env.production',
-			'services/apps/api-gateway/.env.production', 'services/apps/identity/.env.production', 'services/apps/billing/.env.production', 'services/apps/support/.env.production'
+			'services/apps/api-gateway/.env.production', 'services/apps/identity/.env.production', 'services/apps/billing/.env.production', 'services/apps/support/.env.production', 'services/apps/platform/.env.production'
 		]) writeFileSync(join(root, relative), env, { mode: 0o600 })
 		for (const owner of ['billing', 'operations', 'support']) {
 			mkdirSync(join(root, `release/apps/${owner}/src/runtime`), { recursive: true })
@@ -1524,6 +1782,55 @@ test('worker ledger proof reads only the exact owner identity and already applie
 			data => { data.ledger.push({ ...data.ledger[0], migration_name: NOTES_MIGRATION }) }
 		]) await assert.rejects(() => verifyDatabaseState(fake(mutate), files, 'worker-ledger', owner))
 		await assert.rejects(() => verifyDatabaseState(fake(), files, 'pre-migration', owner))
+	}
+})
+
+test('Platform coordinator builds a CMS-only image and replaces one API after read-only and graceful-stop proofs', () => {
+	const result = runRuntime(platformScope)
+	assert.equal(result.status, 0, result.stderr)
+	assertOnlyScopedUp(result, ['platform-api'])
+	assert.ok(result.calls.indexOf('<platform-image-pair>') < result.calls.indexOf('<kill>'))
+	assert.ok(result.calls.indexOf('<platform-database>') < result.calls.indexOf('<build>'))
+	assert.ok(result.calls.indexOf('<kill>') < result.calls.indexOf('<up>'))
+	assert.equal(result.calls.split('\n').filter(line => line.includes('<platform-database>')).length, 4)
+	for (const forbidden of ['MIGRATE ', '<database>', '<backup-capture>', '<phase-a>', '<prisma>', '<stop>']) assert.ok(!result.calls.includes(forbidden), result.calls)
+	assert.match(result.stdout, /without DDL or publisher replacement/)
+})
+
+test('Platform rejects source, image, database and configuration drift before stopping the existing API', () => {
+	for (const scenario of ['foreign-authority', 'source-drift', 'inventory-failed', 'database-busy', 'ledger-failed', 'compiled-drift', 'prepare-failed', 'build-failed', 'lost-lock', 'pre-build-data']) {
+		const result = runRuntime(platformScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('<up>') && !result.calls.includes('<kill>'), `${scenario}\n${result.calls}`)
+		assert.ok(!result.calls.includes('MIGRATE '), result.calls)
+	}
+})
+
+test('Platform unknown post-stop state never forces a process or starts an unproved old writer', () => {
+	for (const scenario of ['stop-timeout', 'stop-interrupted', 'post-stop-data', 'post-stop-database']) {
+		const result = runRuntime(platformScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('<up>') && !result.calls.includes('<start>'), result.calls)
+		assert.ok(!result.calls.includes('<--signal=KILL>') && !result.calls.includes('MIGRATE '), result.calls)
+		assert.match(result.stderr, /RECOVERY_REQUIRED/)
+	}
+})
+
+test('Platform rollback stops the new writer and proves unchanged content before restoring the legacy validator', () => {
+	for (const scenario of ['replace-failed', 'unhealthy', 'term', 'hup', 'http-failed']) {
+		const result = runRuntime(platformScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assertOnlyScopedUp(result, ['platform-api'], true)
+		assert.equal(result.phase, 'rollback')
+		assert.match(result.stderr, /Platform rollback restored/)
+		assert.ok(!result.calls.includes('MIGRATE '), result.calls)
+	}
+	for (const scenario of ['post-data', 'neighbor-drift']) {
+		const result = runRuntime(platformScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assertOnlyScopedUp(result, ['platform-api'])
+		assert.match(result.stderr, /RECOVERY_REQUIRED: Platform/)
+		assert.ok(!result.calls.includes('/rollback.json> <up>'), result.calls)
 	}
 })
 

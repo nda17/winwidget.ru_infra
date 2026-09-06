@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 export const NOTES_MIGRATION = '20260910110000_remove_admin_backlog';
 export const OTP_MIGRATION = '20260910010000_add_login_otp';
 export const SCOPED_SERVICES = Object.freeze({
+	'platform-marketing-runtime': ['platform-api'],
 	'operations-api-runtime': ['operations-api'],
 	'operations-federation-config': ['operations-api'],
 	'workers-bootstrap-recovery': ['billing-api', 'billing-worker', 'billing-outbox-publisher', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker', 'support-worker', 'support-outbox-publisher'],
@@ -27,6 +28,189 @@ export const OPERATIONS_API_SOURCE_PATHS = Object.freeze([
 const API_FILTER_PATH = 'messaging-admin/messaging-admin.service.js';
 export const OPERATIONS_API_PHASE_A_SHA256 = '445bb6da333f2c1fd8cbc7b63ed131989a60d88c4505d49a3985dd7468822914';
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
+export const PLATFORM_MARKETING_SOURCE = Object.freeze({
+	'content/platform-content.validation.ts': ['b19aa419513a9a8dc936846c15b1b3871aad2a0b6b04d0886538ed90a8a9b99d', 'eefe666009198306f4595712c6c686d29d2b96f9843dbc10003c9a58f8f36f8a'],
+	'home-page-content/home-page-content.service.ts': ['f09abc76f355441b015df1cd929844987ebf2380eb307807bc085dda92849dc6', 'e5b0aa7a5487b5eb1e18cf25a367f43a05430a4c09c235e19a2cbd17d1fffcae']
+});
+const PLATFORM_COMPILED_PATHS = Object.keys(PLATFORM_MARKETING_SOURCE).map(path => path.replace(/\.ts$/, '.js'));
+export function assertPlatformMarketingSource(before, after) {
+	assert.ok(before && after);
+	same(Object.keys(before).sort(), Object.keys(PLATFORM_MARKETING_SOURCE).sort());
+	same(Object.keys(after).sort(), Object.keys(before).sort());
+	for (const [path, hashes] of Object.entries(PLATFORM_MARKETING_SOURCE)) {
+		assert.equal(sha256(before[path]), hashes[0]); assert.equal(sha256(after[path]), hashes[1]);
+	}
+}
+
+export function validatePlatformInventory(value) {
+	same(Object.keys(value).sort(), ['compiled', 'generatedModels', 'generatedSchemaSha256', 'kind', 'migrations', 'mode', 'packages', 'schemaSha256', 'schemaVersion'].sort());
+	assert.equal(value.schemaVersion, 1); assert.equal(value.kind, 'winwidget.platform.marketing-image.v1');
+	assert.ok(['legacy', 'marketing'].includes(value.mode));
+	assert.equal(value.migrations.length, 8);
+	same(value.migrations.map(row => row.name), [...new Set(value.migrations.map(row => row.name))].sort());
+	for (const row of value.migrations) { same(Object.keys(row).sort(), ['checksum', 'name']); assert.match(row.name, /^\d{14}_[a-z0-9_]+$/); assert.match(row.checksum, /^[a-f0-9]{64}$/); }
+	assert.equal(value.migrations.at(-1).name, '20260830020000_harden_default_routine_acl');
+	assert.match(value.schemaSha256, /^[a-f0-9]{64}$/); assert.equal(value.schemaSha256, value.generatedSchemaSha256);
+	same(value.generatedModels, ['BillingOfferProducerState', 'HomePageContent', 'LegalPage', 'OutboxEvent', 'PlatformSourceSequence', 'ServiceIdentity', 'SiteSettings']);
+	assert.ok(Array.isArray(value.compiled) && value.compiled.length >= 30 && value.compiled.length <= 100);
+	same(value.compiled.map(row => row.path), [...new Set(value.compiled.map(row => row.path))].sort());
+	for (const row of value.compiled) { same(Object.keys(row).sort(), ['path', 'sha256']); assert.match(row.path, /^[a-z0-9][a-z0-9./-]*\.js$/); assert.ok(!row.path.includes('..')); assert.match(row.sha256, /^[a-f0-9]{64}$/); }
+	for (const path of PLATFORM_COMPILED_PATHS) assert.equal(value.compiled.filter(row => row.path === path).length, 1);
+	assert.ok(Array.isArray(value.packages) && value.packages.length > 30 && value.packages.length <= 2000);
+	same(value.packages, [...new Set(value.packages)].sort());
+	for (const name of value.packages) assert.match(name, /^[a-zA-Z0-9@+_.()-]+$/);
+	assert.equal(value.packages.filter(name => name.startsWith('qs@')).length, 1);
+	assert.ok(value.packages.includes(value.mode === 'legacy' ? 'qs@6.15.3' : 'qs@6.16.0'));
+	return value;
+}
+
+export function assertPlatformImages(before, after) {
+	validatePlatformInventory(before); validatePlatformInventory(after);
+	assert.equal(before.mode, 'legacy'); assert.equal(after.mode, 'marketing');
+	for (const key of ['migrations', 'schemaSha256', 'generatedSchemaSha256', 'generatedModels']) same(before[key], after[key]);
+	same(before.packages.filter(name => !name.startsWith('qs@')), after.packages.filter(name => !name.startsWith('qs@')));
+	same(before.compiled.filter(row => !PLATFORM_COMPILED_PATHS.includes(row.path)), after.compiled.filter(row => !PLATFORM_COMPILED_PATHS.includes(row.path)));
+	for (const path of PLATFORM_COMPILED_PATHS) assert.notEqual(before.compiled.find(row => row.path === path).sha256, after.compiled.find(row => row.path === path).sha256);
+}
+
+export function platformNeighborFingerprint(live) {
+	assert.ok(Array.isArray(live)); assert.equal(live.length, 31);
+	assert.equal(new Set(live.map(item => item.Id)).size, 31);
+	assert.equal(new Set(live.map(item => item.Config.Labels['com.docker.compose.service'])).size, 31);
+	assert.equal(live.filter(item => item.Config.Labels['com.docker.compose.service'] === 'platform-api').length, 1);
+	const peers = live.filter(item => item.Config.Labels['com.docker.compose.service'] !== 'platform-api');
+	assert.equal(peers.filter(item => item.Config.Labels['com.docker.compose.service'] === 'platform-outbox-publisher').length, 1);
+	for (const item of live) {
+		assert.equal(item.Config.Labels['com.docker.compose.project'], 'winwidget'); assert.match(item.Id, /^[a-f0-9]{64}$/); assert.match(item.Image, /^sha256:[a-f0-9]{64}$/);
+		if (item.Config.Labels['com.docker.compose.service'] === 'platform-api') continue;
+		assert.equal(item.State.Status, 'running'); assert.equal(item.State.Running, true); assert.equal(item.State.Health?.Status, 'healthy');
+	}
+	return sha256(JSON.stringify(peers.map(item => ({ id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: orderedMountInventory(item.Mounts),
+		startedAt: item.State.StartedAt, running: item.State.Running, status: item.State.Status, health: item.State.Health?.Status, restartCount: item.RestartCount }))
+		.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
+}
+
+export function parsePlatformProbeUrl(value) {
+	assert.ok(typeof value === 'string' && value.length < 4096);
+	const url = new URL(value);
+	assert.ok(['postgres:', 'postgresql:'].includes(url.protocol));
+	assert.equal(url.hostname, '127.0.0.1'); assert.equal(url.port, '55439'); assert.equal(url.pathname, '/winwidget_platform');
+	assert.equal(decodeURIComponent(url.username), 'winwidget_platform_migration'); assert.ok(url.password); assert.equal(url.hash, '');
+	const keys = [...url.searchParams.keys()]; assert.equal(new Set(keys).size, keys.length);
+	assert.ok(keys.every(key => ['schema', 'sslmode', 'connection_limit', 'pool_timeout', 'connect_timeout'].includes(key)));
+	assert.equal(url.searchParams.get('schema'), 'platform');
+	if (url.searchParams.has('sslmode')) assert.equal(url.searchParams.get('sslmode'), 'disable');
+	url.searchParams.set('connection_limit', '1'); url.searchParams.set('pool_timeout', '5'); url.searchParams.set('connect_timeout', '5');
+	return url.toString();
+}
+
+export async function verifyPlatformDatabase(client, files) {
+	assert.equal((await client.$queryRawUnsafe('SHOW transaction_read_only'))[0]?.transaction_read_only, 'on');
+	const principal = await client.$queryRawUnsafe('SELECT current_database() AS database, current_user AS username, current_schema() AS schema, pg_is_in_recovery() AS recovery');
+	same(principal, [{ database: 'winwidget_platform', username: 'winwidget_platform_migration', schema: 'platform', recovery: false }]);
+	const identity = await client.$queryRawUnsafe("SELECT id, service_name, database_id::text AS database_id, current_semantic_fingerprint, platform.current_semantic_fingerprint() AS actual_fingerprint FROM platform.service_identity");
+	assert.equal(identity.length, 1); assert.equal(identity[0].id, 'singleton'); assert.equal(identity[0].service_name, 'platform-service');
+	assert.match(identity[0].database_id, /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+	assert.match(identity[0].current_semantic_fingerprint, /^[a-f0-9]{64}$/); assert.equal(identity[0].current_semantic_fingerprint, identity[0].actual_fingerprint);
+	const ledger = await client.$queryRawUnsafe('SELECT migration_name, checksum, finished_at, rolled_back_at FROM platform._prisma_migrations ORDER BY migration_name');
+	assert.equal(files.length, 8); same(ledger.map(row => ({ name: row.migration_name, checksum: row.checksum })), files);
+	assert.ok(ledger.every(row => row.finished_at && !row.rolled_back_at));
+	const content = await client.$queryRawUnsafe("SELECT aggregate_version::text AS version, source_sequence::text AS sequence, encode(sha256(convert_to(content::text, 'UTF8')), 'hex') AS sha256 FROM platform.home_page_content WHERE id='singleton'");
+	assert.equal(content.length, 1); assert.match(content[0].sha256, /^[a-f0-9]{64}$/);
+	for (const key of ['version', 'sequence']) assert.match(content[0][key], /^(0|[1-9][0-9]*)$/);
+	const acl = await client.$queryRawUnsafe("SELECT jsonb_build_object('relations', (SELECT jsonb_agg(jsonb_build_array(c.relname, pg_get_userbyid(c.relowner), c.relacl::text) ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='platform'), 'routines', (SELECT jsonb_agg(jsonb_build_array(p.oid::regprocedure::text, pg_get_userbyid(p.proowner), p.proacl::text) ORDER BY p.oid::regprocedure::text) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='platform'), 'defaults', (SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(d.defaclrole), d.defaclobjtype, d.defaclacl::text) ORDER BY d.defaclrole, d.defaclobjtype) FROM pg_default_acl d JOIN pg_namespace n ON n.oid=d.defaclnamespace WHERE n.nspname='platform')) AS acl");
+	assert.equal(acl.length, 1); assert.ok(acl[0].acl && typeof acl[0].acl === 'object');
+	return sha256(JSON.stringify({ identity, files, content, acl })); // Hashes/owner metadata only; no content or credentials leave the database.
+}
+
+async function platformDatabaseAction() {
+	assert.equal(process.getuid(), 1001);
+	const require = createRequire('/app/package.json'); const { PrismaClient } = require('@prisma/platform-client');
+	const client = new PrismaClient({ datasources: { db: { url: parsePlatformProbeUrl(process.env.PLATFORM_DATABASE_URL) } } });
+	const deadline = setTimeout(() => process.exit(1), 15000);
+	try {
+		const files = migrationFiles('/app/prisma/migrations');
+		const hash = await client.$transaction(async tx => {
+			await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY'); await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'");
+			return verifyPlatformDatabase(tx, files);
+		}, { timeout: 10000, isolationLevel: 'RepeatableRead' });
+		process.stdout.write(hash);
+	} finally { await client.$disconnect(); clearTimeout(deadline); }
+}
+
+export async function verifyPlatformHttp(revision, fetcher = fetch) {
+	assert.match(revision, /^[a-f0-9]{40}$/);
+	for (const name of ['live', 'ready']) {
+		const response = await fetcher(`http://127.0.0.1:5000/health/${name}`, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5000) });
+		assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store');
+		const value = await response.json(); assert.equal(value.service, 'platform'); assert.equal(value.role, 'api'); assert.equal(value.revision, revision);
+		assert.equal(value.status, name === 'ready' ? 'ready' : 'ok');
+		if (name === 'ready') { assert.equal(value.database?.serviceName, 'platform-service'); assert.match(value.database.currentSemanticFingerprint, /^[a-f0-9]{64}$/); }
+	}
+	const response = await fetcher('http://127.0.0.1:5000/api/v1/home-page-content', { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5000) });
+	assert.equal(response.status, 200); const text = await response.text(); assert.ok(Buffer.byteLength(text) <= 2 * 1024 * 1024);
+	const value = JSON.parse(text); assert.equal(value.id, 'singleton'); assert.ok(value.content && typeof value.content === 'object' && !Array.isArray(value.content));
+	assert.ok(Number.isFinite(Date.parse(value.updatedAt)));
+}
+
+export function platformMarketingFixture() {
+	const seo = { title: '', description: '', keywords: [], ogTitle: '', ogDescription: '' };
+	const section = { enabled: true, title: '', subtitle: '', items: [] };
+	const legacy = {
+		seo, technicalSeo: { baseUrl: '', robotsDisallow: [], sitemapItems: [] },
+		demoWidgets: { enabled: true, bubbleTexts: { wheel: '', quiz: '', callback: '', countdown: '', aiConsultant: '', stopOffer: '', calculator: '' } },
+		hero: { titleBeforeAccent: '', accentText: '', titleAfterAccent: '', subtitle: '', primaryButtonText: '', faqButtonLabel: '', benefits: [] },
+		analysis: { enabled: true, title: '', subtitle: '', cards: [] }, integrations: { enabled: true, title: '', items: [] },
+		tools: { enabled: true, title: '', ctaText: '', items: [] }, audiences: section, caseStudies: section, leadFlow: section,
+		whyWidgets: { enabled: true, title: '', subtitle: '', formTitle: '', widgetTitle: '', formItems: [], widgetItems: [] },
+		steps: { enabled: true, title: '', resultText: '', items: [] }, customization: { enabled: true, title: '', subtitle: '', cards: [], features: [], bottomText: '' },
+		dashboardPreview: { enabled: true, title: '', subtitle: '', cards: [], metrics: [] }, directLink: section, security: section,
+		subscriptionBundle: { ...section, cardTitle: '' }, tariffComparison: { enabled: true, title: '', subtitle: '', rows: [] },
+		pricing: { enabled: true, title: '', monthlyToggleText: '', yearlyToggleText: '', discountText: '', buttonText: '', plans: [] },
+		microCta: { enabled: true, afterIntegrationsText: '', afterIntegrationsButtonText: '', afterStepsText: '', afterStepsButtonText: '' },
+		seoText: { enabled: true, title: '', text: '' }, payment: { seoTitle: '', seoDescription: '' }, faq: { enabled: true, title: '', items: [] },
+		cta: { enabled: true, text: '', buttonText: '', benefits: [] },
+		footer: { aboutTitle: '', infoLines: [], email: '', ybsUrl: '', vkUrl: '', telegramUrl: '', vkAriaLabel: '', telegramAriaLabel: '', legalDisclaimer: '' }
+	};
+	const hero = { eyebrow: '', title: '', subtitle: '' }, integration = { ...section, note: '' }, faq = { enabled: true, title: '', items: [] };
+	const product = { description: '', features: [], buttonText: '' }, buttons = { widgetsButtonText: '', crmButtonText: '' }, cta = { enabled: true, title: '', text: '' };
+	return structuredClone({ legacy, marketing: { ...legacy,
+		ecosystem: { seo, hero, products: { title: '', subtitle: '', widgets: product, crm: product }, integration, plans: { enabled: true, title: '', subtitle: '', ...buttons, note: '' }, faq, cta: { ...cta, ...buttons } },
+		crmProduct: { seo, hero: { ...hero, buttonText: '' }, features: section, workflow: section, integration, faq, cta: { ...cta, buttonText: '' } }
+	} });
+}
+
+function platformImageInventory(mode) {
+	assert.equal(process.getuid(), 1001); assert.equal(process.getgid(), 1001); assert.ok(['legacy', 'marketing'].includes(mode));
+	const root = '/app/dist/src', compiled = [];
+	const visit = directory => {
+		assert.equal(realpathSync(directory), directory);
+		for (const entry of readdirSync(directory, { withFileTypes: true })) {
+			assert.ok(!entry.isSymbolicLink()); const path = join(directory, entry.name);
+			if (entry.isDirectory()) visit(path);
+			else { assert.ok(entry.isFile()); if (entry.name.endsWith('.js')) compiled.push({ path: path.slice(root.length + 1), sha256: sha256(readFileSync(path)) }); }
+		}
+	};
+	visit(root);
+	const require = createRequire('/app/package.json'), { Prisma } = require('@prisma/platform-client');
+	const { validateAndSanitizeStructuredHomeContent: validate } = require('/app/dist/src/content/platform-content.validation.js');
+	const { legacy, marketing } = platformMarketingFixture(); same(validate(legacy), legacy);
+	if (mode === 'legacy') assert.throws(() => validate(marketing)); else same(validate(marketing), marketing);
+	for (const key of ['head', 'body', 'unexpected']) assert.throws(() => validate({ ...legacy, [key]: {} }));
+	if (mode === 'marketing') {
+		for (const key of ['enabled', 'price', 'release', 'url']) assert.throws(() => validate({ ...marketing, crmProduct: { ...marketing.crmProduct, [key]: true } }));
+		assert.throws(() => validate({ ...marketing, ecosystem: {} }));
+	}
+	const { PlatformRuntimeService } = require('/app/dist/src/runtime/platform-runtime.service.js');
+	const runtime = new PlatformRuntimeService({ get: key => key === 'PLATFORM_PROCESS_ROLE' ? 'api' : undefined });
+	assert.equal(runtime.apiEnabled, true); assert.equal(runtime.outboxPublisherEnabled, false);
+	const packages = readdirSync('/app/node_modules/.pnpm', { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== 'node_modules').map(entry => entry.name).sort();
+	const value = { schemaVersion: 1, kind: 'winwidget.platform.marketing-image.v1', mode, packages,
+		migrations: migrationFiles('/app/prisma/migrations'), schemaSha256: sha256(readFileSync('/app/prisma/schema.prisma')),
+		generatedSchemaSha256: sha256(readFileSync(require.resolve('@prisma/platform-client/schema.prisma'))),
+		generatedModels: Prisma.dmmf.datamodel.models.map(row => row.name).sort(), compiled: compiled.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0) };
+	validatePlatformInventory(value); process.stdout.write(JSON.stringify(value));
+}
 export function assertBrokerQuiet(rows) {
 	assert.ok(Array.isArray(rows) && rows.length >= 7);
 	for (const row of rows) {
@@ -174,6 +358,10 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		assertServiceConfiguration(service, container, expectedImage, compose.secrets ?? {});
 		const before = envObject(container.Config.Env);
 		const after = Object.fromEntries(Object.entries(service.environment).map(([key, value]) => [key, String(value ?? '')]));
+		if (scope === 'platform-marketing-runtime') {
+			assert.equal(name, 'platform-api'); assert.equal(before.APP_REVISION, previousRevision);
+			assert.equal(before.PLATFORM_PROCESS_ROLE, 'api'); assert.equal(after.PLATFORM_PROCESS_ROLE, 'api');
+		}
 		const inherited = envObject(expectedImage.Config.Env);
 		for (const [key, value] of Object.entries(before)) {
 			if (!Object.hasOwn(after, key)) assert.equal(inherited[key], value);
@@ -603,6 +791,19 @@ export async function verifyOperationsApiHttp(revision, fetcher = fetch) {
 	}
 }
 
+function orderedMountInventory(mounts) {
+	assert.ok(Array.isArray(mounts));
+	// Docker may enumerate Mounts in a different order on successive inspections.
+	// Preserve every field and every entry; only this unordered inventory is sorted.
+	return mounts.map(mount => {
+		assert.ok(mount && typeof mount === 'object' && !Array.isArray(mount));
+		return Object.fromEntries(Object.entries(mount).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0));
+	}).sort((left, right) => {
+		const a = JSON.stringify(left), b = JSON.stringify(right);
+		return a < b ? -1 : a > b ? 1 : 0;
+	});
+}
+
 export function operationsApiNeighborFingerprint(live) {
 	assert.equal(live.length, 31);
 	assert.equal(new Set(live.map(item => item.Id)).size, 31);
@@ -612,7 +813,7 @@ export function operationsApiNeighborFingerprint(live) {
 		assert.match(item.Id, /^[a-f0-9]{64}$/);
 	}
 	const neighbors = live.filter(item => item.Config.Labels['com.docker.compose.service'] !== 'operations-api');
-	return sha256(JSON.stringify(neighbors.map(item => ({ id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: item.Mounts,
+	return sha256(JSON.stringify(neighbors.map(item => ({ id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: orderedMountInventory(item.Mounts),
 		status: item.State.Status, running: item.State.Running, startedAt: item.State.StartedAt, health: item.State.Health?.Status ?? null, restartCount: item.RestartCount }))
 		.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
 }
@@ -809,7 +1010,20 @@ async function databaseAction(action, owner) {
 
 async function main() {
 	const action = process.argv[2];
-	if (action === 'backup-capture') await captureOperationsBackup();
+	if (action === 'platform-image-inventory') platformImageInventory(process.argv[3]);
+	else if (action === 'platform-http') await verifyPlatformHttp(process.argv[3]);
+	else if (action === 'platform-database') await platformDatabaseAction();
+	else if (action === 'platform-neighbors') process.stdout.write(platformNeighborFingerprint(JSON.parse(rootFileBytes('/run/scoped/platform-neighbors.json'))));
+	else if (action === 'platform-source') {
+		const before = {}, after = {};
+		for (const [index, path] of Object.keys(PLATFORM_MARKETING_SOURCE).entries()) {
+			before[path] = rootFileBytes(`/run/scoped/platform-source-before-${index}.ts`, 262144);
+			after[path] = rootFileBytes(`/run/scoped/platform-source-after-${index}.ts`, 262144);
+		}
+		assertPlatformMarketingSource(before, after);
+	} else if (action === 'platform-image-pair') {
+		assertPlatformImages(JSON.parse(rootFileBytes('/run/scoped/platform-image-before.json')), JSON.parse(rootFileBytes('/run/scoped/platform-image-after.json')));
+	} else if (action === 'backup-capture') await captureOperationsBackup();
 	else if (action === 'operations-api-inventory') operationsApiImageInventory(process.argv[3]);
 	else if (action === 'operations-api-http') await verifyOperationsApiHttp(process.argv[3]);
 	else if (action === 'api-neighbors') process.stdout.write(operationsApiNeighborFingerprint(JSON.parse(rootFileBytes('/run/scoped/api-neighbors.json'))));

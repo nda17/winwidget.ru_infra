@@ -528,6 +528,158 @@ scoped_workers_quiet() {
 	done
 }
 
+scoped_platform_source() {
+	local changes path checksum index=0 peers base=19a0ecd47fd448ca82d1efeb67df59bb00a0c293
+	local -a paths=(content/platform-content.validation.ts home-page-content/home-page-content.service.ts)
+	# The API live baseline predates other owners' already-reviewed releases.
+	# Pin their entire app trees independently; never import CRM foundation.
+	peers="$(git -C "$release_root" ls-tree "$services_revision:apps" | awk '$4 != "platform"')" || return 1
+	[[ "$(printf '%s' "$peers" | sha256sum | awk '{print $1}')" == 51d78c0fa9bd6eb66d04152968023a512d784cc15e3cdaf352fcf254e0c75f85 ]] || return 1
+	changes="$(git -C "$release_root" diff --name-only "$base" "$services_revision")" || return 1
+	while IFS= read -r path; do
+		case "$path" in
+			apps/platform/src/content/platform-content.validation.ts | apps/platform/src/home-page-content/home-page-content.service.ts | apps/platform/src/content/product-marketing-content.spec.ts | apps/platform/package.json | apps/platform/pnpm-lock.yaml | \
+			.github/workflows/ci.yml | .github/scripts/static-check-services-lifecycle.sh | .github/scripts/verify-production-audit.cjs | README.md | docs/backlog.md) ;;
+			*) return 1 ;;
+		esac
+		[[ -f "$release_root/$path" && ! -L "$release_root/$path" && "$(realpath -e "$release_root/$path")" == "$release_root/$path" ]] || return 1
+	done <<<"$changes"
+	changes="$(git -C "$release_root" diff --name-only "$expected_live_revision" "$services_revision" -- apps/platform)" || return 1
+	for path in "${paths[@]}"; do
+		[[ $'\n'"$changes"$'\n' == *$'\n'"apps/platform/src/$path"$'\n'* ]] || return 1
+		git -C "$release_root" show "$expected_live_revision:apps/platform/src/$path" >"$scoped_work_directory/platform-source-before-$index.ts" || return 1
+		chmod 600 "$scoped_work_directory/platform-source-before-$index.ts" || return 1
+		install -m 600 "$release_root/apps/platform/src/$path" "$scoped_work_directory/platform-source-after-$index.ts" || return 1
+		index=$((index + 1))
+	done
+	while IFS= read -r path; do
+		case "$path" in apps/platform/src/content/platform-content.validation.ts | apps/platform/src/home-page-content/home-page-content.service.ts | apps/platform/src/content/product-marketing-content.spec.ts | apps/platform/package.json | apps/platform/pnpm-lock.yaml) ;; *) return 1 ;; esac
+	done <<<"$changes"
+	[[ "$(sha256sum "$release_root/apps/platform/src/content/product-marketing-content.spec.ts" | awk '{print $1}')" == 21215144c5c82c2ae5ab83bec44be05251823640b8ee9e014ce261033cb0c975 ]] || return 1
+	checksum="$(git -C "$release_root" show "$expected_live_revision:apps/platform/pnpm-lock.yaml" | sha256sum | awk '{print $1}')" || return 1
+	[[ "$checksum" == 43e3f9b66437458a180f5db4da7bf4690c873305612a9672f81536c3ff3ac208 ]] || return 1
+	checksum="$(git -C "$release_root" show "$expected_live_revision:apps/platform/package.json" | sha256sum | awk '{print $1}')" || return 1
+	[[ "$checksum" == 0d76b8e37309b80169c96614dcf86bed4de401c2eac719146edbe8263396a179 ]] || return 1
+	checksum="$(sha256sum "$release_root/apps/platform/package.json" | awk '{print $1}') $(sha256sum "$release_root/apps/platform/pnpm-lock.yaml" | awk '{print $1}')" || return 1
+	case "$checksum" in
+		'0d76b8e37309b80169c96614dcf86bed4de401c2eac719146edbe8263396a179 6e05a87a7969056e5112832b76828f12ca0f9bb113928ca7081977651ab907f3' | \
+		'8a13a67914923aa88a4818aebfd2b202ce8878d378252bfd1dcb58854ed05522 50fdfebd27b207af7acbc18094ff4be5351cf8ef555845621fb6709d5d951714') ;;
+		*) return 1 ;;
+	esac
+	scoped_verifier platform-source || return 1
+}
+
+scoped_platform_image_inventory() {
+	local image="$1" mode="$2" output="$3"
+	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$mode" =~ ^(legacy|marketing)$ && "$output" =~ ^platform-image-(before|after).json$ ]] || return 1
+	(
+		umask 077; set -o noclobber
+		docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+			--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
+			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			--entrypoint timeout "$image" --signal=TERM --kill-after=5s 30s node /run/scoped-verifier.mjs platform-image-inventory "$mode" >"$scoped_work_directory/$output"
+	) || return 1
+}
+
+scoped_platform_neighbors() {
+	local ids id result
+	local -a container_ids=()
+	ids="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --format '{{.ID}}')" || return 1
+	while IFS= read -r id; do [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1; container_ids+=("$id"); done <<<"$ids"
+	[[ "${#container_ids[@]}" == 31 ]] || return 1
+	docker inspect "${container_ids[@]}" >"$scoped_work_directory/platform-neighbors.json" || return 1
+	chmod 600 "$scoped_work_directory/platform-neighbors.json" || return 1
+	result="$(scoped_verifier platform-neighbors)" || return 1
+	[[ "$result" =~ ^[a-f0-9]{64}$ ]] || return 1
+	printf '%s' "$result"
+}
+
+scoped_platform_database() {
+	local output
+	# Existing owner migration credential, but the executable is exclusively a
+	# bounded READ ONLY probe. No prisma migrate, write fence, GRANT or dump.
+	output="$(scoped_source_compose run --rm --no-deps --interactive --user 1001:1001 \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint timeout platform-migrate --signal=TERM --kill-after=5s 20s node /run/scoped-verifier.mjs platform-database)" || return 1
+	[[ "$output" =~ ^[a-f0-9]{64}$ ]] || return 1
+	[[ -z "${scoped_platform_state_sha256:-}" || "$output" == "$scoped_platform_state_sha256" ]] || return 1
+	scoped_platform_state_sha256="$output"
+}
+
+scoped_platform_http() {
+	docker run --rm --network host --read-only --cap-drop ALL --security-opt no-new-privileges \
+		--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint timeout "$scoped_platform_expected_image" --signal=TERM --kill-after=5s 30s \
+		node /run/scoped-verifier.mjs platform-http "$scoped_platform_expected_revision" || return 1
+}
+
+scoped_platform_assert_neighbors() {
+	local fingerprint
+	(scoped_assert_unchanged_neighbors) || return 1
+	fingerprint="$(scoped_platform_neighbors)" || return 1
+	[[ "$fingerprint" == "$scoped_platform_neighbors_before" ]] || return 1
+}
+
+scoped_platform_rollback() {
+	local id image revision
+	id="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=platform-api --format '{{.ID}}')" || return 1
+	[[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+	read -r image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
+	[[ "$image $revision" == "$scoped_image_id $services_revision" || "$image $revision" == "$scoped_platform_previous_image $expected_live_revision" ]] || return 1
+	# Stop the only content writer BEFORE checking content/version. A successful
+	# new-format write forbids silently returning the old strict validator.
+	scoped_workers_graceful_stop "$id" || return 1
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || return 1
+	(scoped_platform_database && scoped_platform_assert_neighbors) || return 1
+	scoped_compose rollback up -d --no-build --no-deps --force-recreate platform-api >/dev/null 2>&1 || return 1
+	scoped_wait_healthy || return 1
+	id="$(scoped_container_id platform-api)" || return 1
+	[[ "$(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")" == "$scoped_platform_previous_image $expected_live_revision" ]] || return 1
+	scoped_platform_expected_image="$scoped_platform_previous_image"; scoped_platform_expected_revision="$expected_live_revision"
+	(scoped_platform_http && scoped_platform_database && scoped_platform_assert_neighbors) || return 1
+}
+
+scoped_deploy_platform() {
+	local image_tag image_revision publisher
+	scoped_platform_previous_image="$1"; scoped_platform_previous_id="$2"
+	[[ -z "$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_operations_api_revision$expected_support_env_sha256" ]] || die 'Platform release accepts no foreign or destructive authority.'
+	scoped_platform_expected_image="$1"; scoped_platform_expected_revision="$expected_live_revision"
+	(scoped_platform_source) || die 'Platform source exceeds the exact CMS and qs-only allowlist.'
+	publisher="$(scoped_container_id platform-outbox-publisher)" || die 'Platform publisher is not uniquely running.'
+	[[ "$(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$publisher")" == "$scoped_platform_previous_image $expected_live_revision" ]] || die 'Platform publisher differs from the approved unchanged baseline.'
+	scoped_platform_neighbors_before="$(scoped_platform_neighbors)" || die 'Platform release requires 30 healthy unchanged neighbors.'
+	scoped_platform_image_inventory "$1" legacy platform-image-before.json || die 'Preserved Platform image inventory is invalid.'
+	scoped_platform_database || die 'Platform database identity/ledger/read-only baseline is invalid.'
+	scoped_platform_http || die 'Preserved Platform read-only HTTP contract is not ready.'
+	image_tag="winwidget-platform:git-$services_revision"
+	docker build --build-arg "APP_REVISION=$services_revision" --tag "$image_tag" "$release_root/apps/platform" >/dev/null 2>&1 || die 'Platform immutable image build failed.'
+	read -r scoped_image_id image_revision < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_tag")
+	[[ "$scoped_image_id" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" ]] || die 'Platform image revision is not the exact green candidate.'
+	scoped_platform_image_inventory "$scoped_image_id" marketing platform-image-after.json || die 'Candidate Platform image contract is invalid.'
+	scoped_verifier platform-image-pair || die 'Platform image changed another module, package, schema or migration.'
+	export PLATFORM_IMAGE="$scoped_image_id" PLATFORM_REVISION="$services_revision"
+	scoped_source_compose config --format json >"$scoped_work_directory/compose.json"
+	scoped_target_ids=("$scoped_platform_previous_id")
+	docker inspect "${scoped_target_ids[@]}" >"$scoped_work_directory/live.json"
+	docker image inspect "$scoped_image_id" >"$scoped_work_directory/image.json"
+	chmod 600 "$scoped_work_directory/compose.json" "$scoped_work_directory/live.json" "$scoped_work_directory/image.json"
+	scoped_verifier prepare || die 'Platform candidate changes unapproved runtime configuration.'
+	(scoped_platform_database && scoped_platform_assert_neighbors) || die 'Platform post-build admission changed.'
+	[[ "$(scoped_container_id platform-api)" == "$scoped_platform_previous_id" ]] || die 'Platform API changed identity before stop.'
+	scoped_workers_stop_started=true
+	scoped_workers_graceful_stop "$scoped_platform_previous_id" || die 'Platform graceful exit was not proven; no forced stop or replacement.'
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$scoped_platform_previous_id")" == 'false 0' ]] || die 'Old Platform API is not physically stopped.'
+	(scoped_platform_database && scoped_platform_assert_neighbors) || die 'Post-stop Platform state is unknown; preserved API remains stopped for review.'
+	scoped_cutover_started=true
+	scoped_compose desired up -d --no-build --no-deps --force-recreate platform-api >/dev/null 2>&1 || die 'Platform API replacement failed.'
+	(scoped_wait_healthy && scoped_verify_target_images) || die 'Platform candidate is not healthy on its exact immutable image.'
+	scoped_platform_expected_image="$scoped_image_id"; scoped_platform_expected_revision="$services_revision"
+	(scoped_platform_http && scoped_platform_database && scoped_platform_assert_neighbors) || die 'Platform postflight failed; safe rollback requires unchanged content.'
+	[[ "$(scoped_container_id platform-api)" != "$scoped_platform_previous_id" ]] || die 'Platform API replacement was not observed.'
+	printf 'Platform marketing API release completed without DDL or publisher replacement: infra=%s services=%s\n' "$infra_revision" "$services_revision"
+}
+
 scoped_workers_graceful_stop() {
 	local id state deadline=$((SECONDS + 45)) stopped
 	for id in "$@"; do
@@ -603,6 +755,12 @@ scoped_cleanup() {
 		else
 			printf '%s\n' 'RECOVERY_REQUIRED: pre-DDL Operations restart needs operator verification.' >&2
 		fi
+	elif [[ "$exit_code" != 0 && "$release_scope" == platform-marketing-runtime && "${scoped_cutover_started:-false}" == true ]]; then
+		if scoped_platform_rollback; then
+			printf '%s\n' 'Platform rollback restored the preserved API; content/version, database and all neighbors are unchanged.' >&2
+		else
+			printf '%s\n' 'RECOVERY_REQUIRED: Platform content/state or graceful stop is unknown; no incompatible validator, database rollback or forced stop was attempted.' >&2
+		fi
 	elif [[ "$exit_code" != 0 && "$release_scope" == operations-api-runtime && "${scoped_cutover_started:-false}" == true ]]; then
 		if scoped_api_rollback; then
 			printf '%s\n' 'API-only rollback restored the preserved Notes-free image/config; no database changes were made.' >&2
@@ -654,13 +812,14 @@ scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
-	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime)$ &&
+	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'
 	[[ "$(stat -Lc '%d:%i' "/proc/self/fd/$deploy_lock_fd")" == "$(stat -c '%d:%i' "$deploy_lock")" ]] ||
 		die 'Scoped deployment did not inherit the canonical production lock.'
 	flock -n "$deploy_lock_fd" || die 'Scoped deployment lost the canonical production lock.'
 	case "$release_scope" in
+		platform-marketing-runtime) scoped_owner=platform; scoped_targets=(platform-api) ;;
 		operations-federation-config | operations-api-runtime) scoped_owner=operations; scoped_targets=(operations-api) ;;
 		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-api billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
 		identity-with-operations-manifest) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
@@ -720,6 +879,10 @@ scoped_deploy_main() {
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
+	if [[ "$release_scope" == platform-marketing-runtime ]]; then
+		scoped_deploy_platform "$old_image" "$id"
+		return
+	fi
 	if [[ "$release_scope" == operations-api-runtime ]]; then
 		scoped_deploy_operations_api "$old_image" "$id"
 		return
