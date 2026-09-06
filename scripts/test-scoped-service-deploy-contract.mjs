@@ -885,6 +885,33 @@ test('API neighbor fingerprint excludes only API and notices every worker identi
 	assert.throws(() => operationsApiNeighborFingerprint(live.slice(1)))
 })
 
+test('API neighbor inventory ignores only mount enumeration order and still detects all mount properties', () => {
+	const { live } = apiPeersFixture()
+	for (let index = 0; index < 26; index++) { const item = structuredClone(live[4]); item.Id = (index + 20).toString(16).padStart(64, '0'); item.Config.Labels['com.docker.compose.service'] = `neighbor-${index}`; live.push(item) }
+	live[3].Mounts = [
+		{ Type: 'bind', Source: '/synthetic/source', Destination: '/run/input', Mode: 'ro', RW: false, Propagation: 'rprivate' },
+		{ Type: 'volume', Name: 'synthetic-volume', Source: '/synthetic/volume', Destination: '/data', Driver: 'local', Mode: 'rw', RW: true, Propagation: '' }
+	]
+	const original = structuredClone(live), before = operationsApiNeighborFingerprint(live)
+	for (let sample = 0; sample < 12; sample++) {
+		const next = structuredClone(live)
+		if (sample % 2) next[3].Mounts.reverse()
+		if (sample % 3) next[3].Mounts = next[3].Mounts.map(mount => Object.fromEntries(Object.entries(mount).reverse()))
+		assert.equal(operationsApiNeighborFingerprint(next), before)
+	}
+	assert.deepEqual(live, original, 'fingerprinting must not mutate Docker inspection data')
+	for (const [index, key, value] of [[0, 'Source', '/changed'], [0, 'Destination', '/changed'], [0, 'RW', true], [0, 'Mode', 'rw'], [0, 'Propagation', 'shared'], [0, 'Type', 'volume'], [1, 'Name', 'other-volume'], [1, 'Driver', 'other-driver'], [0, 'FutureDockerField', 'changed']]) {
+		const next = structuredClone(live); next[3].Mounts[index][key] = value
+		assert.notEqual(operationsApiNeighborFingerprint(next), before, `mount property ${key} must remain checked`)
+	}
+	for (const mutate of [value => value[3].Mounts.pop(), value => value[3].Mounts.push(value[3].Mounts[0]), value => { delete value[3].Mounts[0].Propagation }]) {
+		const next = structuredClone(live); mutate(next); assert.notEqual(operationsApiNeighborFingerprint(next), before)
+	}
+	const next = structuredClone(live); next[3].HostConfig.Dns = ['127.0.0.2', '127.0.0.3']
+	const dnsBefore = operationsApiNeighborFingerprint(next); next[3].HostConfig.Dns.reverse()
+	assert.notEqual(operationsApiNeighborFingerprint(next), dnsBefore, 'ordered configuration arrays must not be normalized')
+})
+
 test('API database admission is read-only and requires 13 applied migrations, pending Notes SQL, existing fence and idle restore', async () => {
 	const files = apiInventoryFixture().migrations
 	const context = { databaseId: '11111111-1111-1111-1111-111111111111', migrationManifestSha256: sha256(JSON.stringify({ schemaVersion: 1, target: 'operations', migrations: files.slice(0, -1) })), notesChecksum: files.at(-1).checksum }

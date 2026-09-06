@@ -603,6 +603,19 @@ export async function verifyOperationsApiHttp(revision, fetcher = fetch) {
 	}
 }
 
+function orderedMountInventory(mounts) {
+	assert.ok(Array.isArray(mounts));
+	// Docker may enumerate Mounts in a different order on successive inspections.
+	// Preserve every field and every entry; only this unordered inventory is sorted.
+	return mounts.map(mount => {
+		assert.ok(mount && typeof mount === 'object' && !Array.isArray(mount));
+		return Object.fromEntries(Object.entries(mount).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0));
+	}).sort((left, right) => {
+		const a = JSON.stringify(left), b = JSON.stringify(right);
+		return a < b ? -1 : a > b ? 1 : 0;
+	});
+}
+
 export function operationsApiNeighborFingerprint(live) {
 	assert.equal(live.length, 31);
 	assert.equal(new Set(live.map(item => item.Id)).size, 31);
@@ -612,7 +625,7 @@ export function operationsApiNeighborFingerprint(live) {
 		assert.match(item.Id, /^[a-f0-9]{64}$/);
 	}
 	const neighbors = live.filter(item => item.Config.Labels['com.docker.compose.service'] !== 'operations-api');
-	return sha256(JSON.stringify(neighbors.map(item => ({ id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: item.Mounts,
+	return sha256(JSON.stringify(neighbors.map(item => ({ id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: orderedMountInventory(item.Mounts),
 		status: item.State.Status, running: item.State.Running, startedAt: item.State.StartedAt, health: item.State.Health?.Status ?? null, restartCount: item.RestartCount }))
 		.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
 }
