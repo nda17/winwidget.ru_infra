@@ -53,6 +53,7 @@ infra_revision="${INFRA_REVISION:-}"
 release_scope="${RELEASE_SCOPE:-all}"
 expected_live_revision="${EXPECTED_LIVE_REVISION:-}"
 expected_service_env_sha256="${EXPECTED_SERVICE_ENV_SHA256:-}"
+expected_crm_upgrade_baseline_sha256="${EXPECTED_CRM_UPGRADE_BASELINE_SHA256:-}"
 expected_operations_revision="${EXPECTED_OPERATIONS_REVISION:-}"
 expected_operations_api_revision="${EXPECTED_OPERATIONS_API_REVISION:-}"
 expected_operations_env_sha256="${EXPECTED_OPERATIONS_ENV_SHA256:-}"
@@ -63,7 +64,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | billing-crm-commerce-acl)
+	identity-with-operations-manifest | operations-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | billing-crm-commerce-acl)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -81,6 +82,11 @@ case "$release_scope" in
 		fi ;;
 	*) die 'Unsupported production release scope.' ;;
 esac
+if [[ "$release_scope" == crm-upgrade ]]; then
+	[[ "$expected_crm_upgrade_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'CRM upgrade requires a fresh approved runtime baseline hash.'
+else
+	[[ -z "$expected_crm_upgrade_baseline_sha256" ]] || die 'CRM upgrade baseline authorization cannot be reused by another scope.'
+fi
 if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == workers-bootstrap-recovery ]]; then
 	[[ "$expected_operations_revision" =~ ^[a-f0-9]{40}$ && "$expected_operations_env_sha256" =~ ^[a-f0-9]{64}$ ]] ||
 		die 'Coordinated Identity release requires the exact Operations companion identities.'
@@ -117,7 +123,7 @@ esac
 
 scoped_shell_file="$controller_root/scripts/deploy-identity-operations-scoped.sh"
 scoped_node_file="$controller_root/scripts/scoped-service-release.mjs"
-if [[ "$release_scope" == crm-prepare || "$release_scope" == crm-databases || "$release_scope" == crm-runtime ]]; then
+if [[ "$release_scope" == crm-prepare || "$release_scope" == crm-databases || "$release_scope" == crm-runtime || "$release_scope" == crm-upgrade ]]; then
 	scoped_shell_file="$controller_root/scripts/deploy-crm-scoped.sh"
 	scoped_node_file="$controller_root/scripts/crm-release.mjs"
 elif [[ "$release_scope" == billing-crm-commerce-acl ]]; then
@@ -298,7 +304,8 @@ printf -v remote_controller_arguments ' %q' \
 	"$expected_operations_revision" \
 	"$expected_operations_env_sha256" \
 	"$expected_support_env_sha256" \
-	"$expected_operations_api_revision"
+	"$expected_operations_api_revision" \
+	"$expected_crm_upgrade_baseline_sha256"
 # The remote shell, not this local controller, must expand these variables.
 # shellcheck disable=SC2016
 remote_controller_command='set -euo pipefail
@@ -343,6 +350,7 @@ export expected_operations_revision="${15}"
 export expected_operations_env_sha256="${16}"
 export expected_support_env_sha256="${17}"
 export expected_operations_api_revision="${18}"
+export expected_crm_upgrade_baseline_sha256="${19}"
 
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'

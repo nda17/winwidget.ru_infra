@@ -168,8 +168,113 @@ CI canonical hash обновлён. `BILLING_WINCRM_PAYMENTS_ENABLED` и
 
 Первичная цепочка `crm-prepare -> crm-databases -> crm-runtime` уже не подходит
 для следующего production push: её закрытые baseline/env и Gateway revision
-устарели. Перед новым code rollout требуется проверенный steady-state scope;
+устарели. Для следующего code rollout предназначен scope `crm-upgrade` ниже;
 не обходить этот отказ через `all`, сброс env или удаление работающих приложений/БД.
+
+### Обычное обновление WinCRM: `crm-upgrade`
+
+Это отдельный code-only scope существующего pinned controller, не повтор
+первоначального provisioning. Наличие кода scope в Git не означает его выпуск
+в production. Сначала получить зелёный immutable infra SHA, затем отдельно
+обновить pin reusable workflow в Services и дождаться всех обязательных gates
+именно Services SHA, который совпадает с fetched `origin/prod`. Старый одноразовый
+`billing-crm-commerce-acl` pin не является разрешением на этот rollout.
+
+Обновляются только следующие группы в указанном порядке:
+
+| Порядок | Владелец | Процессы |
+| --- | --- | --- |
+| 1 | Identity | Только `identity-api`; workers/publisher остаются прежними |
+| 2 | Billing | worker, outbox-publisher, scheduler, API |
+| 3 | CRM Access | worker, outbox-publisher, API |
+| 4 | CRM Customers | API |
+| 5 | CRM Sales | API |
+| 6 | CRM Intake | 3 workers, 3 publishers, API |
+
+Всего 17 runtime-процессов. Перед стартом нового процесса останавливается вся
+старая группа владельца; остановка соседних групп, БД, Gateway, Notification
+Delivery, Widgets и остальных приложений запрещена. Identity API — companion
+для согласованного каталога сотрудников: его `schema.prisma` и весь каталог
+Prisma migrations должны побайтово совпадать со старым работающим image.
+
+Перед запуском нужны свежие read-only свидетельства, не ревизии из исторического
+раздела этого документа:
+
+1. Убедиться, что текущие контейнеры здоровы, не перезапускаются, PostgreSQL
+   service identities/ledger/ACL согласованы, хватает диска и не менее 2.5 GiB
+   `MemAvailable` для последовательной сборки/старта. Во время rollout остаётся
+   минимум 2 GiB; дополнительное потребление runtime ограничено 3 GiB.
+2. Через экспорт `crmUpgradeBaseline()` из проверенного `crm-release.mjs`
+   сформировать baseline из полного свежего `docker inspect` inventory
+   (включая остановленные контейнеры) и SHA-256 четырёх **полных** env-файлов:
+   canonical backend, CRM, Billing owner, Identity owner. Сам JSON baseline
+   содержит только IDs/image IDs/revisions/configuration hashes и общий hash
+   нетронутых соседей; значения env туда не попадают. Исходный inspect с env
+   нельзя выводить в логи. CLI `upgrade-baseline` принимает inspect через stdin,
+   `CRM_GATEWAY_REVISION` и `CRM_UPGRADE_ENV_HASHES` — только эти public hashes.
+3. После проверки exact target map и соседей зафиксировать approved baseline
+   как root-owned mode `0600`
+   `/opt/winwidget/deploy/backend/crm/upgrade-baseline.json`. Передать его SHA
+   отдельным input `expected_crm_upgrade_baseline_sha256`; Gateway revision —
+   `expected_live_revision`, CRM env SHA — `expected_service_env_sha256`.
+   Canonical env SHA передаётся существующим secret reusable workflow.
+   Счётчика «всегда 31/47 контейнеров» нет: проверяется точная свежая карта,
+   все нетронутые контейнеры и четыре существующие CRM БД.
+4. Запускать только pinned reusable workflow с `release_scope=crm-upgrade`.
+   Нельзя подменять scope, SHA, baseline или owner env ради прохождения gate.
+   Общий production lock и неизменность исходников/env повторно проверяются
+   перед SQL и переключениями. Ни env, ни paid flags, ни broker credentials,
+   permissions, topology, volume/DB bootstrap данный scope не меняет.
+
+Controller сначала собирает и проверяет шесть immutable owner images, их OCI
+revision/title/архитектуру; сравнивает старые Prisma-файлы со source candidate;
+запечатывает desired Compose только для 17 targets и пяти migration jobs.
+Runtime допускает только новые image/APP_REVISION: остальные env, isolation,
+healthchecks, ресурсы и конфигурация должны совпадать с approved live snapshot.
+Все шесть owner DB проходят read-only preflight **до первой мутации**.
+
+Миграции — только расширяющие, явно reviewed checksum allowlist в
+`CRM_UPGRADE_MIGRATIONS`: Billing manual days, Access employee profiles/branding,
+Sales workday. Старый Billing ACL release уже должен быть успешно завершён;
+единственная reviewed rolled-back попытка остаётся историей, не повторяется и
+не разрешает `migrate resolve`. Для Sales `add_task_in_progress` и следующий
+`expand_workday_tasks` остаются разными migration-файлами: Prisma завершает
+первую транзакцию с enum **до** использования значения следующей миграцией.
+Identity/Customers/Intake не допускают новых миграций в этом release scope.
+
+В каждом owner: при наличии pending применяется только `prisma migrate deploy`
+от migration-role, затем для CRM исполняется service-owned точный runtime grants
+contract (без bootstrap/смены паролей), проверяются ledger, database UUID,
+неизменность прежних ACL/ролей и Billing append-only/retention guards. Затем
+переключается группа и проверяется каждый image/config/health/zero-restart.
+SQL rollback/restore БД в автоматической recovery не выполняется.
+
+При обрыве запечатанный private план и исходные DB proofs сохраняются в
+`deploy/backend/crm/upgrades/<services-SHA>/` (root `0700`, файлы `0600`). Это
+временные release/recovery artifacts с приватной конфигурацией, **не backup**;
+их нельзя публиковать как CI artifacts, выводить или удалять до завершения
+recovery. Повторить можно только тот же Services/infra SHA, baseline и env:
+готовые группы не перезапускаются; остановленная/частичная активная группа
+завершается на том же новом image. Допустимы только готовый префикс групп,
+одна записанная активная группа и нетронутый суффикс. Потерянный исходный DB
+proof, неизвестный контейнер/image, changed neighbor, unfinished migration или
+ACL drift останавливают retry. После новых enum/standalone task записей старый
+Sales writer возвращать нельзя. Исправление — reviewed forward release после
+анализа, не откат БД или ослабление проверок.
+
+Перед объявлением MVP выпущенным отдельно проверить RabbitMQ consumer counts,
+main/retry/DLQ и текущие bindings/permissions без мутации broker; private/public
+HTTP contracts, employee directory/assignment, manual days + cancel receipts,
+существующий Widgets сценарий и авторизованный адаптивный browser smoke.
+Health-check controller не заменяет эти проверки и не открывает платёжные
+флаги. Новый Workday UI/writers включать только после совместимого backend и
+его собственных release gates; реальный платёж остаётся отдельной проверкой.
+
+Локальные infra тесты используют command doubles для порядка/partial retry
+и pure checks для exact map/source/ledger/ACL. Отдельный CI Services проверяет
+реальные owner migrations/grants, enum split и business contracts. Перед
+production нужно получить зелёные оба immutable SHA; локальный mock-прогон
+не объявлять проверкой production PostgreSQL или успешным деплоем.
 
 07.09.2026 успешно выполнен scope `billing-crm-commerce-acl`:
 одна immutable migration `20260909110000_restrict_wincrm_commerce_runtime_acl`,

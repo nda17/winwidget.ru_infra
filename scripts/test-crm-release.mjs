@@ -27,6 +27,15 @@ import {
 	crmRuntimeNeighbors,
 	crmRuntimeContainer,
 	crmRuntimeLedger,
+	CRM_UPGRADE_GROUPS,
+	CRM_UPGRADE_MIGRATIONS,
+	crmUpgradeBaseline,
+	crmUpgradeFence,
+	crmUpgradeSource,
+	crmUpgradeLedger,
+	crmUpgradeDatabasePreserved,
+	crmUpgradeDesired,
+	crmUpgradeOldImages,
 	assertCrmPublicGatesClosed
 } from './crm-release.mjs'
 
@@ -59,9 +68,7 @@ test('closed public API permits prepared specialized readers but not public feat
 		services['crm-intake-' + role] = {
 			environment: {
 				CRM_INTAKE_WIDGETS_ENABLED: 'true',
-				CRM_INTAKE_WIDGET_TRANSFERS_ENABLED: role.startsWith(
-					'widget-transfer-'
-				)
+				CRM_INTAKE_WIDGET_TRANSFERS_ENABLED: role.startsWith('widget-transfer-')
 					? 'true'
 					: 'false'
 			}
@@ -143,6 +150,674 @@ const neighbors = () =>
 			Health: { Status: 'healthy', Log: [] }
 		}
 	}))
+
+function upgradeFixture() {
+	const names = [
+		['winwidget', 'api-gateway'],
+		['winwidget', 'billing-postgres'],
+		['winwidget', 'identity-worker'],
+		...owners.map(owner => ['winwidget-crm', owner + '-postgres']),
+		...CRM_UPGRADE_GROUPS.flatMap(([owner, ...services]) =>
+			services.map(name => [
+				owner.startsWith('crm-') ? 'winwidget-crm' : 'winwidget',
+				name
+			])
+		)
+	]
+	const live = names.map(([project, name], index) => {
+		const item = structuredClone(neighbors()[0])
+		item.Id = id(index + 1)
+		item.Image = image(index + 1)
+		item.Name = `/${project}-${name}-1`
+		item.Config.Hostname = item.Id.slice(0, 12)
+		item.Config.Env.push(`APP_REVISION=${previous}`)
+		item.Config.Labels['com.docker.compose.project'] = project
+		item.Config.Labels['com.docker.compose.service'] = name
+		item.State.Dead = false
+		return item
+	})
+	const baseline = crmUpgradeBaseline(live, previous, {
+		billing: hash,
+		canonical: hash,
+		crm: hash,
+		identity: hash
+	})
+	return { live, baseline }
+}
+
+test('upgrade baseline seals exact target identities and all neighbors without a magic global count or secrets', () => {
+	const { live, baseline } = upgradeFixture()
+	assert.equal(Object.keys(baseline.targets).length, 17)
+	assert.equal(JSON.stringify(baseline).includes('SYNTHETIC_SECRET'), false)
+	assert.equal(crmUpgradeFence(live, baseline), true)
+	for (const mutate of [
+		rows => rows.pop(),
+		rows => rows.push(rows[0]),
+		rows => {
+			rows[0].State.Health.Status = 'unhealthy'
+		},
+		rows => {
+			rows[1].Id = id(999)
+		},
+		rows => {
+			rows.at(-1).Config.Env.push('PAID_FLAG=true')
+		},
+		rows => {
+			rows.at(-1).HostConfig.Privileged = true
+		}
+	]) {
+		const changed = structuredClone(live)
+		mutate(changed)
+		assert.throws(() => crmUpgradeFence(changed, baseline))
+	}
+})
+
+test('upgrade partial retry permits only the reviewed active group and exact old/new images', () => {
+	const { live, baseline } = upgradeFixture()
+	const item = live.find(
+		row => row.Config.Labels['com.docker.compose.service'] === 'billing-api'
+	)
+	const key = 'winwidget/billing-api'
+	const replacements = { [key]: { image: image(999), revision } }
+	const upgrade = (name, number) => {
+		const row = live.find(
+			item => item.Config.Labels['com.docker.compose.service'] === name
+		)
+		row.Image = image(number)
+		row.Id = id(number)
+		row.Config.Labels['org.opencontainers.image.revision'] = revision
+		row.Config.Env = row.Config.Env.map(value =>
+			value.startsWith('APP_REVISION=') ? `APP_REVISION=${revision}` : value
+		)
+		replacements[`winwidget/${name}`] = { image: row.Image, revision }
+	}
+	upgrade('identity-api', 800)
+	item.State.Running = false
+	item.State.Health.Status = 'unhealthy'
+	assert.throws(() => crmUpgradeFence(live, baseline, replacements))
+	assert.equal(crmUpgradeFence(live, baseline, replacements, 'billing'), true)
+	assert.throws(() =>
+		crmUpgradeFence(live, baseline, replacements, 'crm-access')
+	)
+	item.Image = image(999)
+	item.Id = id(777)
+	item.Config.Hostname = 'new-hostname'
+	item.Config.Labels['org.opencontainers.image.revision'] = revision
+	item.Config.Env = item.Config.Env.map(line =>
+		line.startsWith('APP_REVISION=') ? `APP_REVISION=${revision}` : line
+	)
+	item.State.Running = true
+	item.State.Health.Status = 'healthy'
+	assert.throws(() => crmUpgradeFence(live, baseline, replacements))
+	for (const name of [
+		'billing-worker',
+		'billing-outbox-publisher',
+		'billing-scheduler'
+	])
+		upgrade(name, 801 + Object.keys(replacements).length)
+	assert.equal(crmUpgradeFence(live, baseline, replacements), true)
+	item.Image = image(998)
+	assert.throws(() => crmUpgradeFence(live, baseline, replacements, 'billing'))
+})
+
+test('upgrade source inventories every distinct old image including historical API-only and worker-only releases', () => {
+	const { baseline } = upgradeFixture()
+	for (const [owner, ...names] of CRM_UPGRADE_GROUPS)
+		assert.equal(crmUpgradeOldImages(baseline, owner).length, names.length)
+	const oldApi = baseline.targets['winwidget/billing-api'].image
+	const oldWorker = baseline.targets['winwidget/billing-worker'].image
+	assert.notEqual(oldApi, oldWorker)
+	assert.ok(crmUpgradeOldImages(baseline, 'billing').includes(oldWorker))
+	baseline.targets['winwidget/billing-worker'].image = oldApi
+	assert.equal(crmUpgradeOldImages(baseline, 'billing').length, 3)
+	assert.throws(() => crmUpgradeOldImages(baseline, 'unknown'))
+	baseline.targets['winwidget/billing-worker'].image = 'mutable:tag'
+	assert.throws(() => crmUpgradeOldImages(baseline, 'billing'))
+})
+
+test('upgrade source permits only reviewed expansion SQL and proves Identity schema/migrations unchanged', () => {
+	const base = { 'schema.prisma': hash, '20260101000000_initial': hash }
+	assert.equal(crmUpgradeSource('identity', base, base), true)
+	assert.throws(() =>
+		crmUpgradeSource('identity', base, {
+			...base,
+			'schema.prisma': 'd'.repeat(64)
+		})
+	)
+	const changes = CRM_UPGRADE_MIGRATIONS['crm-sales']
+	const next = { ...base, ...changes, 'schema.prisma': 'd'.repeat(64) }
+	assert.equal(crmUpgradeSource('crm-sales', base, next), true)
+	assert.throws(() =>
+		crmUpgradeSource('crm-sales', base, {
+			...next,
+			'20260101000000_initial': 'e'.repeat(64)
+		})
+	)
+	assert.throws(() =>
+		crmUpgradeSource('crm-sales', base, {
+			...next,
+			'20270101000000_unreviewed': hash
+		})
+	)
+	assert.throws(() =>
+		crmUpgradeSource('crm-sales', base, {
+			...next,
+			'20260907120100_expand_workday_tasks': hash
+		})
+	)
+})
+
+test('upgrade ledgers distinguish pending, complete and the single retained Billing rolled-back attempt', () => {
+	const name = '20260101000000_initial'
+	const row = {
+		id: 'initial',
+		migration_name: name,
+		checksum: hash,
+		finished_at: '2026-01-01',
+		rolled_back_at: null
+	}
+	const files = { [name]: hash, ...CRM_UPGRADE_MIGRATIONS['crm-sales'] }
+	assert.deepEqual(
+		crmUpgradeLedger('crm-sales', files, [row]),
+		Object.keys(CRM_UPGRADE_MIGRATIONS['crm-sales']).sort()
+	)
+	assert.throws(() => crmUpgradeLedger('crm-sales', files, [row], true))
+	assert.throws(() =>
+		crmUpgradeLedger('crm-sales', files, [{ ...row, finished_at: null }])
+	)
+	assert.throws(() => crmUpgradeLedger('crm-sales', files, [row, row]))
+	const acl = '20260909110000_restrict_wincrm_commerce_runtime_acl'
+	const old = {
+		id: '412a6ec9-35c7-4c1a-ad94-b11dbae1e889',
+		migration_name: acl,
+		checksum: CRM_UPGRADE_MIGRATIONS.billing[acl],
+		finished_at: null,
+		rolled_back_at: '2026-09-07'
+	}
+	const success = {
+		...old,
+		id: 'success',
+		finished_at: '2026-09-07',
+		rolled_back_at: null
+	}
+	assert.deepEqual(
+		crmUpgradeLedger('billing', { [acl]: old.checksum }, [old, success], true),
+		[]
+	)
+	assert.throws(() =>
+		crmUpgradeLedger('billing', { [acl]: old.checksum }, [old])
+	)
+	assert.throws(() =>
+		crmUpgradeLedger('billing', { [acl]: old.checksum }, [
+			{ ...old, id: 'unknown-attempt' },
+			success
+		])
+	)
+})
+
+test('upgrade database proof preserves UUID and existing ACL while allowing new owned objects', () => {
+	const before = {
+		databaseId: 'owned-db',
+		pending: ['new'],
+		acl: [{ kind: 'relation', name: 'legacy', acl: 'unchanged' }]
+	}
+	const after = {
+		...before,
+		pending: [],
+		acl: [...before.acl, { kind: 'relation', name: 'new', acl: 'restricted' }]
+	}
+	assert.equal(crmUpgradeDatabasePreserved(before, after), true)
+	assert.throws(() =>
+		crmUpgradeDatabasePreserved(before, { ...after, databaseId: 'other-db' })
+	)
+	assert.throws(() =>
+		crmUpgradeDatabasePreserved(before, { ...after, acl: [] })
+	)
+	assert.throws(() =>
+		crmUpgradeDatabasePreserved(before, { ...after, pending: ['new'] })
+	)
+})
+
+function upgradeDesiredFixture() {
+	const { live } = upgradeFixture()
+	const crm = { name: 'winwidget-crm', services: {} }
+	const companions = { name: 'winwidget', services: {} }
+	const images = CRM_UPGRADE_GROUPS.map(([owner], index) => ({
+		Id: image(500 + index),
+		Os: 'linux',
+		Architecture: process.arch === 'x64' ? 'amd64' : process.arch,
+		Config: {
+			Labels: {
+				'org.opencontainers.image.title': `winwidget-${owner}`,
+				'org.opencontainers.image.revision': revision
+			},
+			Env: ['PATH=/usr/bin'],
+			Cmd: ['node', 'dist/main.js'],
+			Entrypoint: ['docker-entrypoint.sh'],
+			User: '1001:1001',
+			WorkingDir: '/app'
+		}
+	}))
+	for (const [index, [owner, ...names]] of CRM_UPGRADE_GROUPS.entries()) {
+		const config = owner.startsWith('crm-') ? crm : companions
+		const candidate = images[index]
+		for (const name of names) {
+			const service = {
+				image: candidate.Id,
+				user: '1001:1001',
+				labels: { 'com.winwidget.owner': owner },
+				environment: {
+					APP_REVISION: revision,
+					SYNTHETIC_SECRET: 'fixture-only'
+				},
+				network_mode: 'host',
+				read_only: true,
+				init: true,
+				cap_drop: ['ALL'],
+				restart: 'unless-stopped',
+				stop_grace_period: '45s',
+				mem_limit: 384 * 1048576,
+				memswap_limit: 384 * 1048576,
+				cpus: 1,
+				pids_limit: 128,
+				security_opt: ['no-new-privileges:true'],
+				logging: {
+					driver: 'json-file',
+					options: { 'max-size': '10m', 'max-file': '3' }
+				},
+				tmpfs: ['/tmp:rw,nosuid,nodev,noexec,size=64m'],
+				healthcheck: {
+					test: ['CMD', 'node', 'healthcheck.js'],
+					interval: '10s',
+					timeout: '5s',
+					start_period: '30s',
+					retries: 3
+				}
+			}
+			config.services[name] = service
+			const current = live.find(
+				row => row.Config.Labels['com.docker.compose.service'] === name
+			)
+			current.Mounts = []
+			Object.assign(current.Config, {
+				User: service.user,
+				Cmd: candidate.Config.Cmd,
+				Entrypoint: candidate.Config.Entrypoint,
+				WorkingDir: '/app',
+				StopTimeout: 45,
+				Env: [
+					'PATH=/usr/bin',
+					`APP_REVISION=${previous}`,
+					'SYNTHETIC_SECRET=fixture-only'
+				],
+				Healthcheck: {
+					Test: service.healthcheck.test,
+					Interval: 10e9,
+					Timeout: 5e9,
+					StartPeriod: 30e9,
+					Retries: 3
+				}
+			})
+			Object.assign(current.Config.Labels, service.labels, {
+				'com.docker.compose.oneoff': 'False',
+				'com.docker.compose.container-number': '1'
+			})
+			current.HostConfig = {
+				NetworkMode: 'host',
+				Privileged: false,
+				ReadonlyRootfs: true,
+				Init: true,
+				Memory: service.mem_limit,
+				MemorySwap: service.memswap_limit,
+				NanoCpus: 1e9,
+				PidsLimit: 128,
+				CapDrop: ['ALL'],
+				SecurityOpt: service.security_opt,
+				PidMode: '',
+				IpcMode: 'private',
+				RestartPolicy: { Name: 'unless-stopped', MaximumRetryCount: 0 },
+				LogConfig: { Type: 'json-file', Config: service.logging.options },
+				Tmpfs: { '/tmp': 'rw,nosuid,nodev,noexec,size=64m' }
+			}
+		}
+		if (owner !== 'identity') {
+			const schema = owner.replaceAll('-', '_')
+			config.services[`${owner}-migrate`] = {
+				network_mode: 'host',
+				restart: 'no',
+				entrypoint: ['./node_modules/.bin/prisma'],
+				command: ['migrate', 'deploy', '--schema', 'prisma/schema.prisma'],
+				environment: {
+					APP_REVISION: revision,
+					NODE_ENV: 'production',
+					...(owner.startsWith('crm-') ? { MODE: 'production' } : {}),
+					[`${schema.toUpperCase()}_DATABASE_URL`]: `postgresql://winwidget_${schema}_migration:synthetic@127.0.0.1:55442/winwidget_${schema}?schema=${schema}`
+				}
+			}
+		}
+	}
+	const baseline = crmUpgradeBaseline(live, previous, {
+		billing: hash,
+		canonical: hash,
+		crm: hash,
+		identity: hash
+	})
+	return { live, baseline, crm, companions, images, servicesRevision: revision }
+}
+
+test('upgrade desired contract selects only approved groups and isolated migration jobs without changing product env', () => {
+	const input = upgradeDesiredFixture()
+	const { desired, replacements } = crmUpgradeDesired(input, () => {})
+	assert.equal(Object.keys(replacements).length, 17)
+	assert.equal(Object.keys(desired.crm.services).length, 16)
+	assert.equal(Object.keys(desired.companions.services).length, 6)
+	assert.equal(
+		Object.hasOwn(desired.companions.services, 'identity-migrate'),
+		false
+	)
+	for (const config of Object.values(desired))
+		for (const [name, service] of Object.entries(config.services)) {
+			assert.equal(Object.hasOwn(service, 'build'), false)
+			assert.equal(Object.hasOwn(service, 'depends_on'), false)
+			if (name.endsWith('-migrate')) {
+				assert.equal(service.read_only, true)
+				assert.equal(service.logging.driver, 'none')
+				assert.deepEqual(service.cap_drop, ['ALL'])
+			}
+		}
+	for (const mutate of [
+		x => x.images.push(x.images[0]),
+		x => {
+			x.images[0].Config.Labels['org.opencontainers.image.revision'] = previous
+		},
+		x => {
+			x.companions.services[
+				'billing-api'
+			].environment.BILLING_WINCRM_PAYMENTS_ENABLED = 'true'
+		},
+		x => {
+			x.companions.services['identity-api'].privileged = true
+		},
+		x => {
+			x.companions.services['billing-migrate'].environment.EXTRA_SECRET =
+				'wrong'
+		},
+		x => {
+			x.crm.services['crm-sales-migrate'].command = [
+				'migrate',
+				'reset',
+				'--force'
+			]
+		},
+		x => {
+			x.crm.services['crm-access-worker'].mem_limit = 1
+		},
+		x => {
+			x.companions.services['identity-api'].command = ['node', 'worker.js']
+		}
+	]) {
+		const changed = structuredClone(input)
+		mutate(changed)
+		assert.throws(() => crmUpgradeDesired(changed, () => {}))
+	}
+	assert.throws(() =>
+		crmUpgradeDesired(input, () => {
+			throw new Error('invalid owner shape')
+		})
+	)
+})
+
+// Execute the real coordinator with isolated command/verification doubles.
+// No Docker daemon, production path, credentials or network are used here.
+function runUpgradeController(scenario = 'success', replay = false) {
+	const directory = mkdtempSync(join(tmpdir(), 'wincrm-upgrade-contract-'))
+	try {
+		for (const path of [
+			'deploy/backend/crm',
+			'services/apps/billing',
+			'services/apps/identity',
+			'release',
+			'payload'
+		])
+			mkdirSync(join(directory, path), { recursive: true, mode: 0o700 })
+		for (const path of [
+			'deploy/backend/.env.production',
+			'deploy/backend/crm/.env.production',
+			'deploy/backend/crm/upgrade-baseline.json',
+			'services/apps/billing/.env.production',
+			'services/apps/identity/.env.production'
+		])
+			writeFileSync(join(directory, path), '{}\n', { mode: 0o600 })
+		const script = `
+set -euo pipefail
+source "$TEST_LIBRARY"
+app_root="$TEST_DIRECTORY"
+services_repository="$app_root/services"
+release_root="$app_root/release"
+env_file="$app_root/deploy/backend/.env.production"
+scoped_payload_directory="$app_root/payload"
+services_revision="$TEST_REVISION"
+infra_revision="$TEST_REVISION"
+expected_live_revision="$TEST_PREVIOUS"
+expected_env_sha256="$TEST_HASH"
+expected_service_env_sha256="$TEST_HASH"
+expected_crm_upgrade_baseline_sha256="$TEST_HASH"
+release_scope=crm-upgrade
+die() { printf '%s\\n' "$1" >&2; exit 1; }
+assert_root_owned_directory() { [[ -d "$1" && ! -L "$1" ]] || die 'unsafe directory'; }
+assert_root_owned_file() { [[ -f "$1" && ! -L "$1" ]] || die 'unsafe file'; }
+stat() { if [[ -d "\${@: -1}" ]]; then printf '700\\n'; else printf '600\\n'; fi; }
+sha256sum() { printf '%s\\n' "$TEST_HASH"; }
+crm_assert_inputs() { [[ "$TEST_SCENARIO" != env-drift ]] || die 'env changed'; }
+crm_runtime_memory_check() { [[ "$TEST_SCENARIO" != low-memory ]] || die 'low memory'; }
+awk() { if [[ "$*" == *'/proc/meminfo'* ]]; then printf '17179869184'; else command awk "$@"; fi; }
+crm_upgrade_inventory() { printf '[]\\n'; }
+owner_names() {
+  case "$1" in
+    identity) printf 'identity-api' ;;
+    billing) printf 'billing-worker billing-outbox-publisher billing-scheduler billing-api' ;;
+    crm-access) printf 'crm-access-worker crm-access-outbox-publisher crm-access-api' ;;
+    crm-customers) printf 'crm-customers-api' ;;
+    crm-sales) printf 'crm-sales-api' ;;
+    crm-intake) printf 'crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher crm-intake-api' ;;
+  esac
+}
+crm_upgrade_probe() {
+  local mode="$1" owner="\${2:-}" name
+  printf 'PROBE %s %s %s\\n' "$mode" "$owner" "\${4:-}" >>"$TEST_TRACE"
+  case "$mode" in
+    upgrade-baseline-check|upgrade-fence)
+      while IFS= read -r line; do :; done
+      [[ "$TEST_SCENARIO" != baseline-drift ]] || return 10
+      printf 'true\\n' ;;
+    upgrade-source-check) [[ "$TEST_SCENARIO" != identity-schema-drift || "$owner" != identity ]] || return 11 ;;
+    upgrade-source|upgrade-prepare|upgrade-compose|upgrade-database) printf '{}\\n' ;;
+    upgrade-old-images)
+      printf '%s\\n' "$TEST_IMAGE"
+      if [[ "$TEST_SCENARIO" == mixed-old-images && "$owner" == billing ]]; then printf '%s\\n' "$TEST_OLD_IMAGE"; fi ;;
+    upgrade-env) printf 'APP_REVISION=%s\\n' "$TEST_REVISION" ;;
+    upgrade-database-check)
+      [[ "$TEST_SCENARIO" != uuid-drift || "$owner" != crm-access || ! -f "$TEST_DIRECTORY/migrated-crm-access" ]] || return 12 ;;
+    upgrade-pending)
+      if [[ "$owner" == billing || "$owner" == crm-access || "$owner" == crm-sales ]] && [[ ! -f "$TEST_DIRECTORY/migrated-$owner" ]]; then printf '1\\n'; else printf '0\\n'; fi ;;
+    upgrade-grants)
+      [[ "$TEST_SCENARIO" != grants-failed || "$owner" != crm-access ]] || return 13
+      printf 'PRIVATE_SQL_SENTINEL\\n' ;;
+    upgrade-complete)
+      while IFS= read -r line; do :; done
+      if [[ "$owner" == all ]]; then
+        for name in $TEST_TARGETS; do [[ -f "$TEST_DIRECTORY/new-$name" ]] || return 14; done
+      else
+        for name in $(owner_names "$owner"); do [[ -f "$TEST_DIRECTORY/new-$name" ]] || return 15; done
+      fi ;;
+    *) return 90 ;;
+  esac
+}
+crm_upgrade_compose() {
+  local unit="$1" operation="$2" last="\${@: -1}" arg
+  printf 'COMPOSE %s\\n' "$*" >>"$TEST_TRACE"
+  case "$operation" in
+    run)
+      [[ "$last" != identity-migrate && "$*" == *'--rm --no-deps --pull never'* ]] || return 16
+      [[ "$TEST_SCENARIO" != migration-failed || "$last" != crm-sales-migrate ]] || return 17
+      touch "$TEST_DIRECTORY/migrated-\${last%-migrate}" ;;
+    stop)
+      for arg in "$@"; do
+        if [[ " $TEST_TARGETS " == *" $arg "* ]]; then touch "$TEST_DIRECTORY/stopped-$arg"; fi
+      done ;;
+    up)
+      [[ "$*" == *'--no-deps --no-build --pull never --force-recreate'* && " $TEST_TARGETS " == *" $last "* ]] || return 18
+      if [[ "$TEST_SCENARIO" == partial-start && "$last" == crm-access-api && ! -f "$TEST_DIRECTORY/failure-observed" ]]; then touch "$TEST_DIRECTORY/failure-observed"; return 19; fi
+      touch "$TEST_DIRECTORY/new-$last"
+      rm -f -- "$TEST_DIRECTORY/stopped-$last" ;;
+    *) return 91 ;;
+  esac
+}
+docker() {
+  local last="\${@: -1}" owner
+  printf 'DOCKER %s\\n' "$*" >>"$TEST_TRACE"
+  case "$1" in
+    context) printf 'unix:///var/run/docker.sock\\n' ;;
+    ps) printf '%s\\n' "$TEST_ID" ;;
+    inspect)
+      if [[ "$*" == *'.State.Running'* ]]; then printf 'false 0\\n'
+      elif [[ "$*" == *'.State.Status'* ]]; then printf 'running healthy 0 false\\n'
+      else printf '%s %s\\n' "$TEST_IMAGE" "$TEST_PREVIOUS"; fi ;;
+    image)
+      [[ "$2" == inspect ]] || return 92
+      if [[ "$3" == --format ]]; then owner="\${last#winwidget-}"; owner="\${owner%%:*}"; printf '%s %s winwidget-%s\\n' "$TEST_IMAGE" "$TEST_REVISION" "$owner"
+      else printf '[]\\n'; fi ;;
+    exec)
+      [[ "$*" == *'psql -X -q -v ON_ERROR_STOP=1'* ]] || return 20
+      while IFS= read -r line; do :; done ;;
+    *) return 93 ;;
+  esac
+}
+env() {
+  [[ "$1" == -i && "$2" == PATH=* ]] || return 21
+  shift 2
+  while [[ "$1" != docker ]]; do [[ "$1" == *_IMAGE=* || "$1" == *_REVISION=* || "$1" == APP_VERSION=* ]] || return 22; shift; done
+  [[ "$*" == *'compose '* && "$*" == *'config --format json'* ]] || return 23
+  printf '{}\\n'
+}
+scoped_deploy_main
+`
+		const execute = () =>
+			spawnSync('/bin/bash', ['-c', script], {
+				encoding: 'utf8',
+				timeout: 15000,
+				env: {
+					PATH: process.env.PATH,
+					TEST_DIRECTORY: directory,
+					TEST_TRACE: join(directory, 'trace'),
+					TEST_LIBRARY: join(root, 'deploy-crm-scoped.sh'),
+					TEST_SCENARIO: scenario,
+					TEST_REVISION: revision,
+					TEST_PREVIOUS: previous,
+					TEST_HASH: hash,
+					TEST_IMAGE: image(900),
+					TEST_OLD_IMAGE: image(901),
+					TEST_ID: id(900),
+					TEST_TARGETS: CRM_UPGRADE_GROUPS.flatMap(
+						([, ...names]) => names
+					).join(' ')
+				}
+			})
+		const first = execute()
+		const firstCalls = existsSync(join(directory, 'trace'))
+			? readFileSync(join(directory, 'trace'), 'utf8')
+			: ''
+		const second = replay ? execute() : null
+		return {
+			first,
+			second,
+			firstCalls,
+			calls: existsSync(join(directory, 'trace'))
+				? readFileSync(join(directory, 'trace'), 'utf8')
+				: ''
+		}
+	} finally {
+		rmSync(directory, { recursive: true, force: true })
+	}
+}
+
+test('upgrade coordinator validates both old Billing image sources before its first mutation', () => {
+	const result = runUpgradeController('mixed-old-images')
+	assert.equal(result.first.status, 0, result.first.stderr)
+	const beforeMutation = result.calls.slice(0, result.calls.indexOf('COMPOSE '))
+	assert.equal(
+		beforeMutation
+			.split('\n')
+			.filter(line => line.startsWith('PROBE upgrade-source-check billing '))
+			.length,
+		2
+	)
+})
+
+test('upgrade coordinator switches exactly 17 targets in dependency groups and replay never restarts completed groups', () => {
+	const result = runUpgradeController('success', true)
+	assert.equal(result.first.status, 0, result.first.stderr)
+	assert.equal(result.second.status, 0, result.second.stderr)
+	const starts = result.calls
+		.split('\n')
+		.filter(line => line.startsWith('COMPOSE ') && line.includes(' up '))
+	assert.deepEqual(
+		starts.map(line => line.split(' ').at(-1)),
+		CRM_UPGRADE_GROUPS.flatMap(([, ...names]) => names)
+	)
+	assert.equal(result.calls.includes('identity-migrate'), false)
+	assert.equal(result.calls.includes('DOCKER build'), false)
+	assert.equal(result.calls.includes('DOCKER volume'), false)
+	assert.equal(result.calls.includes('DOCKER network'), false)
+	assert.equal(result.first.stdout.includes('PRIVATE_SQL_SENTINEL'), false)
+	const firstMutation = result.firstCalls.indexOf('COMPOSE companions stop')
+	for (const [owner] of CRM_UPGRADE_GROUPS)
+		assert.ok(
+			result.firstCalls.indexOf(`PROBE upgrade-database ${owner}`) <
+				firstMutation
+		)
+	for (const [owner, ...names] of CRM_UPGRADE_GROUPS) {
+		const stop = result.firstCalls.indexOf(
+			`stop --timeout 90 ${names.join(' ')}`
+		)
+		const start = result.firstCalls.indexOf(`--force-recreate ${names[0]}`)
+		assert.ok(stop >= 0 && stop < start)
+		if (owner.startsWith('crm-'))
+			assert.ok(
+				result.firstCalls.indexOf(`PROBE upgrade-grants ${owner}`) < stop
+			)
+	}
+})
+
+test('upgrade coordinator fails closed before unsafe mutation and retains exact partial release for retry', () => {
+	for (const scenario of [
+		'env-drift',
+		'baseline-drift',
+		'identity-schema-drift',
+		'low-memory'
+	]) {
+		const result = runUpgradeController(scenario)
+		assert.notEqual(result.first.status, 0, scenario)
+		assert.equal(result.calls.includes('COMPOSE '), false, scenario)
+	}
+	for (const scenario of ['migration-failed', 'grants-failed', 'uuid-drift']) {
+		const result = runUpgradeController(scenario)
+		assert.notEqual(result.first.status, 0, scenario)
+		assert.equal(
+			result.calls.includes('--force-recreate crm-intake-api'),
+			false,
+			scenario
+		)
+	}
+	const result = runUpgradeController('partial-start', true)
+	assert.notEqual(result.first.status, 0)
+	assert.equal(result.second.status, 0, result.second.stderr)
+	const secondCalls = result.calls.slice(result.firstCalls.length)
+	assert.equal(secondCalls.includes('--force-recreate identity-api'), false)
+	assert.equal(secondCalls.includes('--force-recreate billing-api'), false)
+	assert.equal(secondCalls.includes('--force-recreate crm-access-api'), true)
+	assert.equal(secondCalls.includes('--force-recreate crm-intake-api'), true)
+})
 
 const databaseFixture = (owner = owners[0]) => {
 	const schema = owner.replaceAll('-', '_')
@@ -306,10 +981,7 @@ test('database-only neighbor fence excludes only four unique owned database serv
 		)
 	}
 	assert.throws(() =>
-		crmDatabaseNeighbors(
-			[...neighbors(), databases[0], databases[0]],
-			previous
-		)
+		crmDatabaseNeighbors([...neighbors(), databases[0], databases[0]], previous)
 	)
 })
 
@@ -347,12 +1019,7 @@ for (const owner of owners)
 			const imageWithoutDefaultUser = structuredClone(postgresImage)
 			delete imageWithoutDefaultUser.Config.User
 			assert.equal(
-				crmDatabaseContainer(
-					container,
-					config,
-					imageWithoutDefaultUser,
-					owner
-				),
+				crmDatabaseContainer(container, config, imageWithoutDefaultUser, owner),
 				container.Id
 			)
 			for (const key of ['mem_limit', 'memswap_limit', 'shm_size'])
@@ -381,22 +1048,13 @@ for (const owner of owners)
 					owner
 				)
 			)
-			assert.deepEqual(
-				crmDatabaseCredentials(config, owner, 'c'.repeat(64)),
-				{
-					runtime: 'a'.repeat(64),
-					migration: 'b'.repeat(64),
-					backup: 'c'.repeat(64)
-				}
-			)
-			for (const password of [
-				'short',
-				'a'.repeat(64),
-				'c'.repeat(64) + '\n'
-			])
-				assert.throws(() =>
-					crmDatabaseCredentials(config, owner, password)
-				)
+			assert.deepEqual(crmDatabaseCredentials(config, owner, 'c'.repeat(64)), {
+				runtime: 'a'.repeat(64),
+				migration: 'b'.repeat(64),
+				backup: 'c'.repeat(64)
+			})
+			for (const password of ['short', 'a'.repeat(64), 'c'.repeat(64) + '\n'])
+				assert.throws(() => crmDatabaseCredentials(config, owner, password))
 			for (const mutate of [
 				value => {
 					value.Image = image(91)
@@ -531,10 +1189,7 @@ test('preparation refuses wrong owner, image, architecture, revision, artifact o
 		mutate(value)
 		// Infra may intentionally differ from services; both must be immutable.
 		if (value.infraRevision === previous) {
-			assert.equal(
-				crmPreparationReceipt(value, shape).infraRevision,
-				previous
-			)
+			assert.equal(crmPreparationReceipt(value, shape).infraRevision, previous)
 			continue
 		}
 		assert.throws(() => crmPreparationReceipt(value, shape))
@@ -604,8 +1259,7 @@ test('neighbor fingerprint ignores health-log churn and mount order but detects 
 			value[0].State.Restarting = true
 		},
 		value => {
-			value[0].Config.Labels['org.opencontainers.image.revision'] =
-				revision
+			value[0].Config.Labels['org.opencontainers.image.revision'] = revision
 		},
 		value => {
 			value.push(value[0])
@@ -622,16 +1276,12 @@ test('neighbor fingerprint ignores health-log churn and mount order but detects 
 
 test('actual inventory CLI emits only a fingerprint or a sanitized failure', () => {
 	const run = input =>
-		spawnSync(
-			process.execPath,
-			[join(root, 'crm-release.mjs'), 'inventory'],
-			{
-				input,
-				encoding: 'utf8',
-				timeout: 5000,
-				env: { CRM_GATEWAY_REVISION: previous }
-			}
-		)
+		spawnSync(process.execPath, [join(root, 'crm-release.mjs'), 'inventory'], {
+			input,
+			encoding: 'utf8',
+			timeout: 5000,
+			env: { CRM_GATEWAY_REVISION: previous }
+		})
 	const good = run(JSON.stringify(neighbors()))
 	assert.equal(good.status, 0, good.stderr)
 	assert.equal(
@@ -683,11 +1333,9 @@ function runController(
 			{ mode: 0o444 }
 		)
 		const input = fixture()
-		writeFileSync(
-			join(directory, 'input-compose.json'),
-			input.composeBytes,
-			{ mode: 0o600 }
-		)
+		writeFileSync(join(directory, 'input-compose.json'), input.composeBytes, {
+			mode: 0o600
+		})
 		writeFileSync(
 			join(directory, 'input-images.json'),
 			JSON.stringify(input.images),
@@ -712,11 +1360,7 @@ function runController(
 				'// synthetic SQL module\n',
 				{ mode: 0o444 }
 			)
-			const prepared = join(
-				directory,
-				'deploy/backend/crm/releases',
-				revision
-			)
+			const prepared = join(directory, 'deploy/backend/crm/releases', revision)
 			mkdirSync(prepared, { recursive: true, mode: 0o700 })
 			writeFileSync(join(prepared, 'desired.json'), input.composeBytes, {
 				mode: 0o600
@@ -908,9 +1552,7 @@ scoped_deploy_main
 					TEST_HASH: hash,
 					TEST_ENV_HASH:
 						scenario === 'env-drift' ? hash : sha('synthetic-only\n'),
-					TEST_VERIFIER_HASH: sha(
-						readFileSync(join(root, 'crm-release.mjs'))
-					),
+					TEST_VERIFIER_HASH: sha(readFileSync(join(root, 'crm-release.mjs'))),
 					TEST_PROBE_IMAGE: image(9),
 					TEST_CONTAINER: id(9),
 					TEST_IMAGE_1: image(1),
@@ -948,8 +1590,7 @@ scoped_deploy_main
 				: null,
 			temporary: readdirSync(join(directory, 'deploy/backend')).filter(
 				name =>
-					name.startsWith('.crm-prepare.') ||
-					name.startsWith('.crm-runtime.')
+					name.startsWith('.crm-prepare.') || name.startsWith('.crm-runtime.')
 			)
 		}
 	} finally {
@@ -1105,10 +1746,7 @@ test('each runtime process requires its exact immutable image, env, isolation an
 				Tmpfs: { '/tmp': 'rw,nosuid,nodev,noexec,size=64m' }
 			}
 		}
-		assert.equal(
-			crmRuntimeContainer(live, config, [candidate], name),
-			live.Id
-		)
+		assert.equal(crmRuntimeContainer(live, config, [candidate], name), live.Id)
 		for (const mutate of [
 			x => {
 				x.Image = image(2)
@@ -1163,10 +1801,7 @@ test('actual CRM runtime controller starts exactly twelve applications and accep
 	const result = runController('success', true, 'crm-runtime')
 	assert.equal(result.first.status, 0, result.first.stderr)
 	assert.equal(result.second.status, 0, result.second.stderr)
-	assert.match(
-		result.first.stdout,
-		/Twelve isolated CRM processes verified/
-	)
+	assert.match(result.first.stdout, /Twelve isolated CRM processes verified/)
 	assert.deepEqual(result.temporary, [])
 	assert.doesNotMatch(
 		result.calls,
@@ -1182,9 +1817,7 @@ test('actual CRM runtime controller starts exactly twelve applications and accep
 	)
 	const starts = result.calls
 		.split('\n')
-		.filter(
-			line => line.startsWith('DOCKER compose ') && line.includes(' up ')
-		)
+		.filter(line => line.startsWith('DOCKER compose ') && line.includes(' up '))
 	assert.equal(starts.length, 24)
 	assert.deepEqual(
 		starts.slice(0, 12).map(line => line.split(' ').at(-1)),
@@ -1232,9 +1865,8 @@ test('actual CRM controller prepares four images, preserves immutable artifacts 
 	assert.equal(result.first.status, 0, result.first.stderr)
 	assert.equal(result.second.status, 0, result.second.stderr)
 	assert.equal(
-		result.calls
-			.split('\n')
-			.filter(line => line.startsWith('DOCKER build ')).length,
+		result.calls.split('\n').filter(line => line.startsWith('DOCKER build '))
+			.length,
 		4
 	)
 	assert.equal(
@@ -1275,10 +1907,7 @@ test('CRM preparation cannot overwrite an existing receipt with different inputs
 	const result = runController('different-artifact', true)
 	assert.equal(result.first.status, 0, result.first.stderr)
 	assert.equal(result.second.status, 1)
-	assert.match(
-		result.second.stderr,
-		/immutable CRM preparation already exists/
-	)
+	assert.match(result.second.stderr, /immutable CRM preparation already exists/)
 	assert.equal(result.receipt.infraRevision, revision)
 	assert.deepEqual(result.temporary, [])
 })
@@ -1299,8 +1928,7 @@ test('actual database stage initializes only four owners, migrates exact images 
 		result.calls
 			.split('\n')
 			.filter(
-				line =>
-					line.startsWith('DOCKER compose ') && line.includes(' run ')
+				line => line.startsWith('DOCKER compose ') && line.includes(' run ')
 			).length,
 		8
 	)
@@ -1517,21 +2145,14 @@ test(
 			assert.match(container, /^[a-f0-9]{64}$/)
 			for (let attempt = 0; attempt < 90; attempt++) {
 				const health = output(
-					docker([
-						'inspect',
-						'--format',
-						'{{.State.Health.Status}}',
-						container
-					])
+					docker(['inspect', '--format', '{{.State.Health.Status}}', container])
 				)
 				if (health === 'healthy') break
 				assert.equal(health, 'starting')
 				await delay(1000)
 			}
 			stage = 'actual-container-identity'
-			const config = JSON.parse(
-				output(compose(['config', '--format', 'json']))
-			)
+			const config = JSON.parse(output(compose(['config', '--format', 'json'])))
 			const actual = JSON.parse(output(docker(['inspect', container])))[0]
 			const postgresImage = JSON.parse(
 				output(docker(['image', 'inspect', image]))
@@ -1586,9 +2207,7 @@ crm_database_auth crm-access "$TEST_CONTAINER" admin
 				if (created.status === 0) container = created.stdout.trim()
 			}
 			if (container) {
-				const actual = JSON.parse(
-					output(docker(['inspect', container]))
-				)[0]
+				const actual = JSON.parse(output(docker(['inspect', container])))[0]
 				assert.equal(actual.Config.Labels['com.winwidget.owner'], owner)
 				assert.equal(
 					actual.Config.Labels['com.docker.compose.project'],

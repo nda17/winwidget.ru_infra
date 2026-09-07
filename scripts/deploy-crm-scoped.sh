@@ -106,6 +106,7 @@ crm_initialize() {
 scoped_deploy_main() {
 	local owner prefix image_tag image_revision image_title image_id file destination
 	local -a images=() image_env=()
+	if [[ "$release_scope" == crm-upgrade ]]; then crm_upgrade_main; return; fi
 	case "$release_scope" in
 		# Preparation and its following database stage must seal the same
 		# neighbors, including when the four owned databases already exist.
@@ -484,4 +485,271 @@ crm_runtime_memory_check() {
 	available="$(awk '/^MemAvailable:/ {printf "%.0f", $2*1024}' /proc/meminfo)"
 	[[ "$available" =~ ^[0-9]+$ && "$crm_runtime_memory_before" =~ ^[0-9]+$ ]] || die 'Cannot measure CRM memory headroom.'
 	(( available >= reserve && crm_runtime_memory_before - available <= 3221225472 )) || die 'CRM startup exceeded its memory envelope; keep public access closed.'
+}
+
+# Steady-state upgrade only. Baseline/plan are bounded, root-private release
+# evidence, not database backups. No env, DB-container, broker or flag writes.
+crm_upgrade_inventory() {
+	local ids id
+	local -a values=()
+	ids="$(docker ps -aq --no-trunc)" || return 1
+	[[ -n "$ids" ]] || return 1
+	while IFS= read -r id; do [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1; values+=("$id"); done <<<"$ids"
+	docker inspect "${values[@]}"
+}
+
+crm_upgrade_verify_inventory() {
+	local status=0
+	# Finish enumeration before starting the verifier container: a pipeline
+	# would race docker ps against the ephemeral verifier's own creation.
+	crm_upgrade_inventory >"$crm_work_directory/current-live.pending" || return 1
+	crm_upgrade_probe "$@" <"$crm_work_directory/current-live.pending" || status=$?
+	rm -f -- "$crm_work_directory/current-live.pending"
+	return "$status"
+}
+
+crm_upgrade_probe() {
+	local mode="$1" owner="${2:-}" selected="${3:-$crm_probe_image}" phase="${4:-}" network=none
+	local -a private_mount=()
+	if [[ "$mode" == upgrade-database ]]; then
+		network=host
+		if [[ "$owner" == crm-* ]]; then private_mount=(--volume "$crm_env_file:/run/crm/crm.env:ro")
+		else private_mount=(--volume "$services_repository/apps/$owner/.env.production:/run/crm/$owner.env:ro"); fi
+	fi
+	docker run --rm --interactive --network "$network" --read-only --log-driver none \
+		--cap-drop ALL --security-opt no-new-privileges --user 0:0 --memory 256m --memory-swap 256m --cpus 1 --pids-limit 64 \
+		--tmpfs /tmp:rw,noexec,nosuid,size=16m \
+		--env "CRM_GATEWAY_REVISION=$expected_live_revision" --env "CRM_SERVICES_REVISION=$services_revision" \
+		--env "CRM_INFRA_REVISION=$infra_revision" --env "CRM_UPGRADE_ENV_HASHES=$crm_upgrade_env_hashes" \
+		--env "CRM_UPGRADE_SWITCHING_OWNER=${crm_upgrade_switching_owner:-}" \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/crm-release.mjs:ro" \
+		--volume "$release_root/.github/scripts/validate-crm-compose.mjs:/run/crm-compose-validator.mjs:ro" \
+		--volume "$release_root/deploy/crm/database-access.mjs:/run/crm-database-access.mjs:ro" \
+		--volume "$crm_work_directory:/run/crm:ro" ${private_mount[@]+"${private_mount[@]}"} \
+		--entrypoint node "$selected" /run/crm-release.mjs "$mode" "$owner" "$phase"
+}
+
+crm_upgrade_env_fence() {
+	local owner file hash
+	crm_assert_inputs
+	[[ "$(sha256sum "$crm_upgrade_baseline_file" | awk '{print $1}')" == "$expected_crm_upgrade_baseline_sha256" ]] || die 'Approved CRM upgrade baseline changed.'
+	cmp -s "$crm_upgrade_baseline_file" "$crm_work_directory/baseline.json" || die 'CRM baseline handoff changed.'
+	for owner in billing identity; do
+		file="$services_repository/apps/$owner/.env.production"
+		assert_root_owned_file "$file"
+		hash="$(sha256sum "$file" | awk '{print $1}')"
+		[[ "$hash" == "$(<"$crm_work_directory/$owner-env.sha256")" ]] || die 'A companion owner env changed during CRM upgrade.'
+	done
+	if [[ -n "${crm_upgrade_plan_hash:-}" ]]; then
+		[[ "$(sha256sum "$crm_work_directory/plan.json" | awk '{print $1}')" == "$crm_upgrade_plan_hash" ]] || die 'Immutable CRM upgrade plan changed.'
+	fi
+	for file in "$crm_work_directory"/*; do
+		[[ -e "$file" || -L "$file" ]] || continue
+		assert_root_owned_file "$file"
+		[[ "$(stat -c '%a' "$file")" == 600 ]] || die 'CRM upgrade artifact is not private.'
+	done
+}
+
+crm_upgrade_fence() {
+	crm_upgrade_env_fence
+	crm_upgrade_verify_inventory upgrade-fence >/dev/null || die 'CRM upgrade target or neighbor drifted; no automatic rollback.'
+}
+
+crm_upgrade_compose() {
+	local unit="$1"; shift
+	local expected
+	case "$unit" in crm) expected="$crm_upgrade_runtime_hash" ;; companions) expected="$crm_upgrade_companion_hash" ;; *) die 'Invalid CRM upgrade Compose unit.' ;; esac
+	[[ "$(sha256sum "$crm_work_directory/$unit-runtime.json" | awk '{print $1}')" == "$expected" ]] || die 'CRM upgrade runtime artifact changed.'
+	env -i PATH="$PATH" docker compose --project-name "$([[ "$unit" == crm ]] && printf winwidget-crm || printf winwidget)" \
+		--env-file /dev/null --profile '*' -f "$crm_work_directory/$unit-runtime.json" "$@"
+}
+
+crm_upgrade_main() {
+	local owner prefix tag image revision title gateway_id before before_images file hash name id attempt state unit
+	local -a images=() image_env=() base_image_env=() names=()
+	umask 077
+	[[ -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}" && "$(docker context inspect --format '{{.Endpoints.docker.Host}}')" == unix:///var/run/docker.sock ]] || die 'CRM upgrade requires the local production daemon.'
+	crm_env_file="$app_root/deploy/backend/crm/.env.production"
+	crm_upgrade_baseline_file="$app_root/deploy/backend/crm/upgrade-baseline.json"
+	assert_root_owned_file "$crm_upgrade_baseline_file"
+	[[ "$(stat -c '%a' "$crm_upgrade_baseline_file")" == 600 && "$(sha256sum "$crm_upgrade_baseline_file" | awk '{print $1}')" == "$expected_crm_upgrade_baseline_sha256" ]] || die 'CRM upgrade requires the freshly approved exact baseline.'
+	crm_assert_inputs
+	gateway_id="$(docker ps -q --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=api-gateway)"
+	[[ "$gateway_id" =~ ^[a-f0-9]{64}$ ]] || die 'Gateway baseline is not uniquely running.'
+	read -r crm_probe_image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$gateway_id")
+	[[ "$crm_probe_image" =~ ^sha256:[a-f0-9]{64}$ && "$revision" == "$expected_live_revision" ]] || die 'Gateway baseline revision changed.'
+	file="$app_root/deploy/backend/crm/upgrades"
+	[[ -e "$file" ]] || install -d -m 700 "$file"
+	assert_root_owned_directory "$file"
+	crm_work_directory="$file/$services_revision"
+	[[ -e "$crm_work_directory" ]] || install -d -m 700 "$crm_work_directory"
+	assert_root_owned_directory "$crm_work_directory"
+	[[ "$(stat -c '%a' "$crm_work_directory")" == 700 ]] || die 'CRM upgrade directory must be private.'
+	for file in "$crm_work_directory"/*; do
+		[[ -e "$file" || -L "$file" ]] || continue
+		assert_root_owned_file "$file"
+		[[ "$(stat -c '%a' "$file")" == 600 ]] || die 'CRM upgrade artifact must be private.'
+	done
+	if [[ ! -e "$crm_work_directory/baseline.json" ]]; then install -m 600 "$crm_upgrade_baseline_file" "$crm_work_directory/baseline.json"; fi
+	crm_upgrade_env_hashes="{\"canonical\":\"$expected_env_sha256\",\"crm\":\"$expected_service_env_sha256\""
+	for owner in billing identity; do
+		file="$services_repository/apps/$owner/.env.production"
+		assert_root_owned_file "$file"
+		[[ "$(stat -c '%a' "$file")" == 600 ]] || die 'Companion owner env must be private.'
+		hash="$(sha256sum "$file" | awk '{print $1}')"
+		if [[ -e "$crm_work_directory/$owner-env.sha256" ]]; then [[ "$(<"$crm_work_directory/$owner-env.sha256")" == "$hash" ]] || die 'Companion env differs from the existing release.'
+		else printf '%s\n' "$hash" >"$crm_work_directory/$owner-env.sha256"; fi
+		crm_upgrade_env_hashes+=",\"$owner\":\"$hash\""
+	done
+	crm_upgrade_env_hashes+='}'
+	crm_upgrade_switching_owner=''
+	if [[ -e "$crm_work_directory/switching-owner" ]]; then
+		crm_upgrade_switching_owner="$(<"$crm_work_directory/switching-owner")"
+		case "$crm_upgrade_switching_owner" in identity|billing|crm-access|crm-customers|crm-sales|crm-intake) ;; *) die 'Invalid interrupted CRM upgrade group.' ;; esac
+	fi
+	if [[ -e "$crm_work_directory/plan.json" ]]; then
+		assert_root_owned_file "$crm_work_directory/plan.json"
+		crm_upgrade_plan_hash="$(sha256sum "$crm_work_directory/plan.json" | awk '{print $1}')"
+		crm_upgrade_fence
+	else
+		[[ -z "$crm_upgrade_switching_owner" ]] || die 'Interrupted CRM upgrade is missing its immutable plan.'
+		crm_upgrade_verify_inventory upgrade-baseline-check >/dev/null || die 'Live runtime/env no longer matches the approved baseline.'
+	fi
+	# Tags are immutable. All owner images and source-pair checks precede SQL.
+	crm_runtime_memory_before="$(awk '/^MemAvailable:/ {printf "%.0f", $2*1024}' /proc/meminfo)"
+	for owner in identity billing crm-access crm-customers crm-sales crm-intake; do
+		crm_upgrade_env_fence
+		crm_runtime_memory_check before-start
+		tag="winwidget-$owner:git-$services_revision"
+		if ! docker image inspect "$tag" >/dev/null 2>&1; then
+			docker build --build-arg "APP_REVISION=$services_revision" --tag "$tag" "$release_root/apps/$owner" >/dev/null 2>&1 || die 'CRM upgrade image build failed.'
+		fi
+		read -r image revision title < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}} {{index .Config.Labels "org.opencontainers.image.title"}}' "$tag")
+		[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$revision" == "$services_revision" && "$title" == "winwidget-$owner" ]] || die 'CRM upgrade candidate image identity mismatch.'
+		images+=("$image")
+		prefix="${owner//-/_}"; prefix="$(printf '%s' "$prefix" | tr '[:lower:]' '[:upper:]')"
+		image_env+=("${prefix}_IMAGE=$image" "${prefix}_REVISION=$services_revision")
+		crm_upgrade_probe upgrade-source "$owner" "$image" >"$crm_work_directory/$owner-source-after.json"
+		before_images="$(crm_upgrade_probe upgrade-old-images "$owner")" || die 'Cannot resolve approved old owner images.'
+		[[ -n "$before_images" ]] || die 'Missing immutable old owner image.'
+		while IFS= read -r before; do
+			[[ "$before" =~ ^sha256:[a-f0-9]{64}$ ]] || die 'Invalid immutable old owner image.'
+			crm_upgrade_probe upgrade-source "$owner" "$before" >"$crm_work_directory/$owner-source-before.json"
+			crm_upgrade_probe upgrade-source-check "$owner" >/dev/null || die 'Owner schema/migrations exceed the reviewed CRM upgrade.'
+		done <<<"$before_images"
+	done
+	docker image inspect "${images[@]}" >"$crm_work_directory/images.json"
+	if [[ ! -e "$crm_work_directory/plan.json" ]]; then
+		crm_upgrade_inventory >"$crm_work_directory/live.json"
+		while IFS= read -r file; do [[ "$file" =~ ^[A-Z_]+=(sha256:[a-f0-9]{64}|[a-f0-9]{40}|git-[a-f0-9]{40})$ ]] || die 'Invalid public image override.'; base_image_env+=("$file"); done < <(crm_upgrade_probe upgrade-env <"$crm_work_directory/live.json")
+		for owner in billing identity; do
+			env -i PATH="$PATH" "${base_image_env[@]}" "${image_env[@]}" docker compose --project-name winwidget --profile '*' \
+				--env-file "$env_file" --env-file "$services_repository/apps/$owner/.env.production" -f "$release_root/deploy/docker-compose.prod.yml" config --format json \
+				>"$crm_work_directory/$owner.json" 2>/dev/null || die 'CRM companion Compose cannot be materialized safely.'
+		done
+		env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$crm_env_file" \
+			-f "$release_root/deploy/docker-compose.crm.yml" config --format json >"$crm_work_directory/crm.json" 2>/dev/null || die 'CRM upgrade Compose cannot be materialized.'
+		crm_upgrade_probe upgrade-prepare >"$crm_work_directory/plan.pending" || die 'CRM upgrade configuration changes more than the approved code/images.'
+		mv -- "$crm_work_directory/plan.pending" "$crm_work_directory/plan.json"
+		crm_upgrade_plan_hash="$(sha256sum "$crm_work_directory/plan.json" | awk '{print $1}')"
+	else
+		crm_upgrade_probe upgrade-prepare >"$crm_work_directory/plan.pending" || die 'Cannot revalidate the sealed CRM upgrade plan.'
+		cmp -s "$crm_work_directory/plan.pending" "$crm_work_directory/plan.json" || die 'Sealed CRM upgrade inputs no longer reproduce the same plan.'
+		rm -f -- "$crm_work_directory/plan.pending"
+	fi
+	for unit in crm companions; do crm_upgrade_probe upgrade-compose "$unit" >"$crm_work_directory/$unit-runtime.json"; done
+	crm_upgrade_runtime_hash="$(sha256sum "$crm_work_directory/crm-runtime.json" | awk '{print $1}')"
+	crm_upgrade_companion_hash="$(sha256sum "$crm_work_directory/companions-runtime.json" | awk '{print $1}')"
+	# Every owner preflight, including unchanged Identity, must pass before the
+	# first migration or runtime stop. A retry first proves the same databases.
+	for owner in identity billing crm-access crm-customers crm-sales crm-intake; do
+		crm_upgrade_fence
+		image="winwidget-$owner:git-$services_revision"
+		if [[ ! -e "$crm_work_directory/$owner-database-before.json" ]]; then
+			[[ ! -e "$crm_work_directory/mutation-started" && -z "$crm_upgrade_switching_owner" ]] || die 'Interrupted CRM upgrade is missing its original database proof.'
+			crm_upgrade_probe upgrade-database "$owner" "$image" >"$crm_work_directory/$owner-database.pending" || die 'CRM owner migration preflight failed.'
+			mv -- "$crm_work_directory/$owner-database.pending" "$crm_work_directory/$owner-database-before.json"
+		fi
+		# Freshly re-read even after a partial attempt: unfinished Prisma rows are
+		# never silently recovered, and applied migration files are not replayed.
+		crm_upgrade_probe upgrade-database "$owner" "$image" >"$crm_work_directory/$owner-database-after.json" || die 'CRM owner has an unresolved migration state.'
+		crm_upgrade_probe upgrade-database-check "$owner" '' pending >/dev/null || die 'CRM database or previous ACL changed before mutation.'
+	done
+	printf '%s\n' "$services_revision" >"$crm_work_directory/mutation-started"
+	crm_runtime_memory_before="$(awk '/^MemAvailable:/ {printf "%.0f", $2*1024}' /proc/meminfo)"
+	# Within each dependency-ordered group: migrate, grant, verify, then switch.
+	# Prisma commits the Sales enum file before the next constraints migration.
+	for owner in identity billing crm-access crm-customers crm-sales crm-intake; do
+		crm_upgrade_fence
+		image="winwidget-$owner:git-$services_revision"
+		unit=companions; [[ "$owner" != crm-* ]] || unit=crm
+		crm_upgrade_probe upgrade-database "$owner" "$image" >"$crm_work_directory/$owner-database-after.json" || die 'CRM owner changed after preflight.'
+		crm_upgrade_probe upgrade-database-check "$owner" '' pending >/dev/null || die 'CRM database continuity failed before owner upgrade.'
+		if [[ "$owner" != identity && "$(crm_upgrade_probe upgrade-pending "$owner")" != 0 ]]; then
+			crm_upgrade_compose "$unit" run --rm --no-deps --pull never --interactive=false -T "$owner-migrate" </dev/null >/dev/null 2>&1 || die 'CRM owner migration failed; inspect ledger before retry, never reset data.'
+		fi
+		crm_upgrade_fence
+		if [[ "$owner" == crm-* ]]; then
+			id="$(docker ps -q --no-trunc --filter label=com.docker.compose.project=winwidget-crm --filter "label=com.docker.compose.service=$owner-postgres")"
+			[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'CRM owner PostgreSQL is not unique.'
+			prefix="${owner//-/_}"
+			crm_upgrade_probe upgrade-grants "$owner" "$image" | docker exec --user postgres --interactive "$id" \
+				psql -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=sqlstate -U "winwidget_${prefix}_admin" -d "winwidget_$prefix" >/dev/null 2>&1 || die 'CRM exact runtime grants failed; role bootstrap is not allowed.'
+		fi
+		crm_upgrade_probe upgrade-database "$owner" "$image" complete >"$crm_work_directory/$owner-database-after.json" || die 'CRM owner post-migration verification failed.'
+		crm_upgrade_probe upgrade-database-check "$owner" >/dev/null || die 'CRM database UUID or previous ACL changed.'
+		if crm_upgrade_verify_inventory upgrade-complete "$owner" >/dev/null 2>&1; then
+			if [[ "$crm_upgrade_switching_owner" == "$owner" ]]; then
+				crm_upgrade_switching_owner=''
+				rm -f -- "$crm_work_directory/switching-owner"
+			fi
+			continue
+		fi
+		crm_upgrade_fence
+		case "$owner" in
+			identity) names=(identity-api) ;;
+			billing) names=(billing-worker billing-outbox-publisher billing-scheduler billing-api) ;;
+			crm-access) names=(crm-access-worker crm-access-outbox-publisher crm-access-api) ;;
+			crm-customers) names=(crm-customers-api) ;;
+			crm-sales) names=(crm-sales-api) ;;
+			crm-intake) names=(crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher crm-intake-api) ;;
+		esac
+		unit=companions; [[ "$owner" != crm-* ]] || unit=crm
+		crm_runtime_memory_check before-start
+		printf '%s\n' "$owner" >"$crm_work_directory/switching-owner.pending"
+		mv -- "$crm_work_directory/switching-owner.pending" "$crm_work_directory/switching-owner"
+		crm_upgrade_switching_owner="$owner"
+		crm_upgrade_compose "$unit" stop --timeout 90 "${names[@]}" </dev/null >/dev/null 2>&1 || die 'CRM group failed to stop; do not start a mixed group.'
+		for name in "${names[@]}"; do
+			id="$(docker ps -aq --no-trunc --filter "label=com.docker.compose.project=$([[ "$unit" == crm ]] && printf winwidget-crm || printf winwidget)" --filter "label=com.docker.compose.service=$name")"
+			[[ -z "$id" || "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Duplicate CRM upgrade target.'
+			if [[ -n "$id" ]]; then [[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || die 'Old CRM group still has a live process.'; fi
+		done
+		for name in "${names[@]}"; do
+			crm_upgrade_fence
+			crm_upgrade_compose "$unit" up --detach --no-deps --no-build --pull never --force-recreate "$name" </dev/null >/dev/null 2>&1 || die 'CRM replacement failed; retain desired image/SQL and retry the same release.'
+			id="$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=$([[ "$unit" == crm ]] && printf winwidget-crm || printf winwidget)" --filter "label=com.docker.compose.service=$name")"
+			[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'CRM replacement is not uniquely running.'
+			for ((attempt=0; attempt<90; attempt++)); do
+				state="$(docker inspect --format '{{.State.Status}} {{.State.Health.Status}} {{.RestartCount}} {{.State.OOMKilled}}' "$id")"
+				[[ "$state" != 'running healthy 0 false' ]] || break
+				[[ "$state" == 'running starting 0 false' ]] || die 'CRM replacement is not healthy; no old-writer rollback.'
+				sleep 2
+			done
+			[[ "$state" == 'running healthy 0 false' ]] || die 'CRM replacement readiness timed out.'
+			crm_runtime_memory_check
+		done
+		crm_upgrade_switching_owner=''
+		crm_upgrade_verify_inventory upgrade-complete "$owner" >/dev/null || die 'CRM group final image/config/health verification failed.'
+		rm -f -- "$crm_work_directory/switching-owner"
+		printf '%s\n' "CRM upgrade group verified: $owner."
+	done
+	crm_upgrade_fence
+	crm_upgrade_verify_inventory upgrade-complete all >/dev/null || die 'CRM upgrade is incomplete.'
+	for owner in identity billing crm-access crm-customers crm-sales crm-intake; do
+		crm_upgrade_probe upgrade-database "$owner" "winwidget-$owner:git-$services_revision" complete >"$crm_work_directory/$owner-database-after.json" || die 'CRM final database verification failed.'
+		crm_upgrade_probe upgrade-database-check "$owner" >/dev/null || die 'CRM final database continuity failed.'
+	done
+	crm_upgrade_fence
+	printf '%s\n' 'CRM steady-state code upgrade verified: 17 processes; existing database UUIDs/ACL, neighbors and env preserved. No broker or product-gate mutations; queue and browser/payment checks remain separate.'
 }

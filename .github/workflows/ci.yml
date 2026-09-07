@@ -132,7 +132,7 @@ jobs:
       - name: Verify closed CRM companion environment preparation
         run: node --test scripts/test-crm-companion-env.mjs scripts/test-crm-companion-release.mjs scripts/test-crm-public-release.mjs scripts/test-billing-crm-acl-release.mjs
 
-      - name: Verify CRM preparation and database-only release without application activation
+      - name: Verify CRM preparation and steady-state upgrade preservation contracts
         shell: bash
         run: node --test scripts/test-crm-release.mjs
 

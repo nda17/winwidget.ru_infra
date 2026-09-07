@@ -49,6 +49,7 @@ const scopedControllerPath = join(scriptsRoot, 'deploy-identity-operations-scope
 const revision = 'a'.repeat(40)
 const oldRevision = 'b'.repeat(40)
 const envHash = 'c'.repeat(64)
+const crmScopes = ['crm-prepare', 'crm-databases', 'crm-runtime', 'crm-upgrade']
 const identityScope = 'identity-with-operations-manifest'
 const workerScope = 'workers-bootstrap-recovery'
 const apiScope = 'operations-api-runtime'
@@ -361,7 +362,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope, platformScope, 'crm-prepare', 'crm-databases', 'crm-runtime']) {
+	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope, platformScope, ...crmScopes]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -379,12 +380,19 @@ test('Platform controller rejects destructive and foreign companion authority be
 	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: platformScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization|baseline/i)
 })
 
-for (const scope of ['crm-prepare', 'crm-databases', 'crm-runtime']) test(scope + ' cannot receive destructive or foreign companion authorization', () => {
+for (const scope of crmScopes) test(scope + ' cannot receive destructive or foreign companion authorization', () => {
 	for (const authority of [
 		{ OPERATIONS_RUNTIME_REVISION: oldRevision }, { OPERATIONS_EVIDENCE_SHA256: envHash },
 		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_OPERATIONS_ENV_SHA256: envHash },
 		{ EXPECTED_OPERATIONS_API_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash }
-	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: scope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization|baseline/i)
+	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: scope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...(scope === 'crm-upgrade' ? { EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash } : {}), ...authority }, /authorization|baseline/i)
+})
+
+test('crm-upgrade requires fresh baseline authorization which cannot leak into another scope', () => {
+	for (const value of ['', 'mutable', 'A'.repeat(64)])
+		rejectBeforeTransport([revision], { RELEASE_SCOPE: 'crm-upgrade', EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, EXPECTED_CRM_UPGRADE_BASELINE_SHA256: value }, /fresh approved runtime baseline/)
+	for (const scope of ['all', 'crm-prepare', 'crm-databases', 'crm-runtime'])
+		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope, ...(scope === 'all' ? {} : { EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash }), EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash }, /cannot be reused/)
 })
 
 test('worker release requires all three exact owner envs and no foreign authority', () => {
@@ -2084,8 +2092,8 @@ test('successful or unknown Identity DDL never restores any old Operations manif
 
 function runTransport(scenario = 'success', scope = identityScope) {
 	return privateFixture(directory => {
-		const shellPayload = ['crm-prepare', 'crm-databases', 'crm-runtime'].includes(scope) ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
-		const nodePayload = ['crm-prepare', 'crm-databases', 'crm-runtime'].includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
+		const shellPayload = crmScopes.includes(scope) ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
+		const nodePayload = crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
 		const checkout = join(directory, 'infra')
 		const bin = join(directory, 'bin')
 		const trace = join(directory, 'transport.jsonl')
@@ -2143,6 +2151,7 @@ if (name === 'git') {
 				INFRA_REVISION: revision, RELEASE_SCOPE: scope,
 				TEST_NODE_PAYLOAD: nodePayload, TEST_SHELL_PAYLOAD: shellPayload,
 				EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash,
+				...(scope === 'crm-upgrade' ? { EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash } : {}),
 				...(scope === identityScope ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}),
 				PRODUCTION_SSH_HOST: 'synthetic.invalid', PRODUCTION_SSH_PORT: '2222', PRODUCTION_SSH_USER: 'root',
 				PRODUCTION_SSH_IDENTITY_FILE: identity, PRODUCTION_SSH_KNOWN_HOSTS_FILE: knownHosts,
@@ -2177,10 +2186,10 @@ test('actual transport sends both exact tracked payloads through one pinned SSH 
 	// All admitted parameters are hex/base64, scope names, or empty shell tokens.
 	// Decode only this constrained argument list; never evaluate the SSH command.
 	const parameters = encodedArguments[1].split(' ').map(value => value === "''" ? '' : value)
-	assert.equal(parameters.length, 18)
+	assert.equal(parameters.length, 19)
 	assert.deepEqual(parameters.slice(0, 3), [revision, revision, envHash])
 	assert.deepEqual(parameters.slice(5, 10), [identityScope, oldRevision, envHash, '', ''])
-	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, '', ''])
+	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, '', '', ''])
 	for (const [hashIndex, encodedIndex, filename] of [
 		[10, 11, 'deploy-identity-operations-scoped.sh'], [12, 13, 'scoped-service-release.mjs']
 	]) {
@@ -2205,7 +2214,7 @@ test('actual transport rejects missing/untracked/malformed payload and optional 
 	}
 })
 
-for (const scope of ['crm-prepare', 'crm-databases', 'crm-runtime']) test(scope + ' uses only its two bounded hash-pinned payloads through the existing root transport', () => {
+for (const scope of crmScopes) test(scope + ' uses only its two bounded hash-pinned payloads through the existing root transport', () => {
 	const result = runTransport('success', scope)
 	assert.equal(result.status, 0, result.stderr)
 	assert.equal(result.calls.length, 1)
@@ -2213,9 +2222,9 @@ for (const scope of ['crm-prepare', 'crm-databases', 'crm-runtime']) test(scope 
 	const encoded = args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
 	assert.ok(encoded)
 	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
-	assert.equal(parameters.length, 18)
+	assert.equal(parameters.length, 19)
 	assert.equal(parameters[5], scope)
-	assert.deepEqual(parameters.slice(14), ['', '', '', ''])
+	assert.deepEqual(parameters.slice(14), ['', '', '', '', scope === 'crm-upgrade' ? envHash : ''])
 	for (const [hashIndex, encodedIndex, filename] of [
 		[10, 11, 'deploy-crm-scoped.sh'], [12, 13, 'crm-release.mjs']
 	]) {
@@ -2230,7 +2239,7 @@ for (const scope of ['crm-prepare', 'crm-databases', 'crm-runtime']) test(scope 
 	assert.ok(args.includes('StrictHostKeyChecking=yes'))
 })
 
-for (const scope of ['crm-prepare', 'crm-databases', 'crm-runtime']) test(scope + ' rejects malformed payloads and any frontend companion before SSH', () => {
+for (const scope of crmScopes) test(scope + ' rejects malformed payloads and any frontend companion before SSH', () => {
 	for (const scenario of ['missing-payload', 'untracked-payload', 'invalid-payload-hash', 'forbidden-frontend', 'oversized-payload', 'empty-payload', 'encoded-envelope']) {
 		const result = runTransport(scenario, scope)
 		assert.notEqual(result.status, 0, scenario)
