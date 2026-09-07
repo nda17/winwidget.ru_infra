@@ -357,6 +357,35 @@ test('baseline contains exact seven immutable readers and no secret-bearing fiel
 	}
 })
 
+test('baseline serializes environment hashes in the CLI canonical order for every caller key order', () => {
+	const f = fixture()
+	const hashes = {
+		canonical: '1'.repeat(64),
+		billing: '2'.repeat(64),
+		crm: '3'.repeat(64)
+	}
+	const expected = crmCommerceBaseline(f.live, revision, hashes)
+	assert.deepEqual(Object.keys(expected.environmentHashes), [
+		'canonical',
+		'billing',
+		'crm'
+	])
+	for (const order of [
+		['canonical', 'billing', 'crm'],
+		['canonical', 'crm', 'billing'],
+		['billing', 'canonical', 'crm'],
+		['billing', 'crm', 'canonical'],
+		['crm', 'canonical', 'billing'],
+		['crm', 'billing', 'canonical']
+	]) {
+		const input = Object.fromEntries(order.map(key => [key, hashes[key]]))
+		const actual = crmCommerceBaseline(f.live, revision, input)
+		assert.equal(JSON.stringify(actual), JSON.stringify(expected))
+		assert.deepEqual(Object.keys(input), order)
+		assert.notEqual(actual.environmentHashes, input)
+	}
+})
+
 test('prepare preserves images and every unrelated effective env byte, with only the exact opt-in transitions', () => {
 	for (const dadata of ['enabled', 'disabled']) {
 		const f = fixture(dadata)

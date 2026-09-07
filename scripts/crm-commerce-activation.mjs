@@ -187,7 +187,11 @@ export function crmCommerceBaseline(live, gatewayRevision, hashes) {
 			schemaVersion: 1,
 			kind: `${KIND}.baseline`,
 			gatewayRevision,
-			environmentHashes: structuredClone(hashes),
+			environmentHashes: {
+				canonical: hashes.canonical,
+				billing: hashes.billing,
+				crm: hashes.crm
+			},
 			neighborsSha256: neighbors(live, gatewayRevision),
 			targets
 		}
