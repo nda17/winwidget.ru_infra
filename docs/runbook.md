@@ -171,7 +171,7 @@ CI canonical hash обновлён. `BILLING_WINCRM_PAYMENTS_ENABLED` и
 устарели. Перед новым code rollout требуется проверенный steady-state scope;
 не обходить этот отказ через `all`, сброс env или удаление работающих приложений/БД.
 
-Для следующего узкого выпуска подготовлен scope `billing-crm-commerce-acl`:
+07.09.2026 успешно выполнен scope `billing-crm-commerce-acl`:
 одна immutable migration `20260909110000_restrict_wincrm_commerce_runtime_acl`,
 без новых images, restart, env/broker изменений и включения платежей. Inputs —
 фактическая ревизия Billing и SHA его полного owner env. Preflight сверяет
@@ -197,6 +197,18 @@ memberships не меняются), а Billing migration-role выполняет
 запись сохраняется; SQL не переписывается и не помечается applied без запуска.
 Это не автоматический recovery неизвестных ошибок и не разрешение удалить
 ledger, расширить права или включить оплату.
+
+Recovery и миграция завершены production CI `34081704073` для services
+`bb86a0c2e1d4feb21171f8b6562dbf80fe783b8c`, pinned infra
+`d7186926fae0133ce4fa90a4ab4acc554df1ed6e`. Повторная read-only проверка:
+11 успешных миграций, одна сохранённая rolled-back попытка, незавершённых нет;
+у всех девяти таблиц DELETE/TRUNCATE false, consent UPDATE false,
+защитная routine EXECUTE false. Runtime-роли выставлен NOINHERIT,
+memberships по-прежнему 0. Прежние таблицы/default ACL, env и все 47
+контейнеров сохранены; healthy, 0 restarts, без OOM.
+Замер 04:07 UTC: 4.19 GiB MemAvailable, 14.97 GiB диска. Платные gates
+не менялись. Повторять этот одноразовый recovery после успеха нельзя:
+его admission требует исходную конкретную unfinished запись.
 
 При первой попытке дочерняя Compose-команда прочитала остаток SSH-сценария
 из stdin после миграций Identity. Три Identity-процесса были восстановлены
@@ -246,8 +258,9 @@ Shape validator проверяет только точный путь, не на
 `winwidget-crm-<service>-<role>` в существующем vhost `winwidget`.
 Наличие URL не доказывает ACL, durable bindings, delivery или восстановление.
 Пары HTTP-токенов проверяются на совпадение внутри CRM; согласованность
-с существующими Identity/Billing/Widgets ещё должна быть доказана controller.
-Commerce и оба native Widgets flags по умолчанию выключены.
+с Identity/Billing/Widgets также проверяется companion controller.
+Commerce и оба native Widgets flags в исходном шаблоне выключены;
+фактическая активация native в production описана выше отдельно.
 
 Shape-проверка выполняется без Docker daemon, контейнеров и чтения production:
 
@@ -380,10 +393,10 @@ SQL с паролями идёт только по приватному stdin pi
 откат DDL запрещены. Перед повтором устранить причину и восстановить те же
 проверяемые inputs. Удаляются только временные verification files.
 Успех этапа не меняет preparation receipt на `releaseApproved:true` и не
-включает приложения, RabbitMQ, payments, Trial или Gateway routes. Отдельные
-broker provisioning и согласованный rollout companion/runtime ещё не подключены
-к этому scope; production-применение и полный runtime load proof остаются
-обязательными gates.
+включает приложения, RabbitMQ, payments, Trial или Gateway routes.
+Broker provisioning и rollout companion/runtime выполняются отдельными
+этапами, не внутри database scope; их production evidence описан выше.
+Полный runtime load proof остаётся отдельной проверкой перед ростом нагрузки.
 
 До первого CRM provisioning выпустить совместимый routine controller.
 Его canonical backend env принимает `CRM_RABBITMQ_CONTRACT=disabled`
@@ -444,9 +457,10 @@ Canonical env должен содержать все документирова�
 Identity/Billing inbound CRM credentials остаются обязательными. Перед первым
 применением выполнить обычную двустороннюю env-синхронизацию. Новый controller
 требует services revision с companion validator; старую ревизию без него
-нельзя выпускать этим controller. Production wiring ещё не проверена.
+нельзя выпускать этим controller. Проверка production wiring и её точные
+ревизии описаны в разделе companion cutover выше.
 
-`scripts/crm-broker-topology.mjs` — AMQP-компонент будущего CRM controller,
+`scripts/crm-broker-topology.mjs` — AMQP-компонент первичного CRM provisioning,
 не самостоятельная команда деплоя. Он содержит точные 9 ACL-профилей,
 создаёт только 7 собственных exchanges, 14 durable classic queues и 18 bindings.
 Три общих exchanges должны уже существовать с правильным типом; компонент
@@ -468,7 +482,7 @@ hashes и не удаляет сообщения. Частичная ошибк�
 
 Caller обязан передать проверку актуального lock/env/image fence перед каждой
 мутацией и финальным чтением. Эти проверки, приватный transport, исходные
-credentials и включение контракта ещё должны быть связаны CRM controller;
+credentials и включение контракта обеспечивает вызывающий CRM controller;
 сам модуль их не подменяет и не открывает продукт. Metadata-only вызов
 возвращает `credentialsProvisioned:false`, полный bootstrap — `true` только
 после проверки всех девяти подключений. Оба возвращают `releaseApproved:false`.
@@ -928,7 +942,16 @@ deploy `34079166307` (успешная попытка 2). Сохранены п�
 ширина формы 1446 px с границами 12 px, таблица пользователей имеет свой
 `overflow:auto`; горизонтального переполнения страницы нет. Фактическая
 мобильная проверка остаётся в backlog: команда viewport текущего browser
-bridge не изменяет реальный размер страницы.
+bridge не изменяет реальный размер страницы. Дополнительно проверены
+плашка Trial WinCRM в кабинете (прежний Hard Widgets сохранён), переключение
+продукта оплаты с клавиатуры и реальные месячная/годовая карточки CRM
+с двумя включёнными местами. Платёж не создавался.
+
+В `/admin/messaging` проверены пять вариантов статуса и фильтры категории/
+обработчика. `RESOLVED` вернул 4 строки, `CLOSED` — 12 строк с явной
+пометкой «Закрыто без повтора», без подмены на «Доставлено»; RETRYING — пустой
+список. Ошибки недоступности Notification Delivery нет. Retry/закрытие/внешние
+отправки не выполнялись; фильтры возвращены в исходное состояние.
 
 Первая попытка этого же immutable frontend SHA остановилась на disk gate
 до переключения traffic. Под общим frontend lock удалён только неиспользуемый
