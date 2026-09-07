@@ -30,6 +30,9 @@ import {
 	crmRuntimeContainer,
 	crmRuntimeLedger,
 	CRM_UPGRADE_GROUPS,
+	crmUpgradeGroups,
+	crmUpgradeRemindersContract,
+	crmUpgradeRemindersContractFromEnv,
 	CRM_UPGRADE_MIGRATIONS,
 	crmUpgradeNotificationDatabaseIdentity,
 	crmUpgradeBaseline,
@@ -159,13 +162,26 @@ const neighbors = () =>
 		}
 	}))
 
-function upgradeFixture() {
+const reminderKinds =
+	'email,telegram,payment-email,payment-telegram,limit-email,limit-telegram,campaign-email,campaign-telegram,daily-summary-delivery-telegram,subscription-expiry-email,subscription-expiry-telegram,wincrm-invitation-email,wincrm-task-reminder-email,wincrm-task-reminder-telegram'
+function reminderEnvironment(name) {
+	if (name === 'notification-delivery-worker')
+		return { NOTIFICATION_DELIVERY_KINDS: reminderKinds }
+	if (['crm-sales-api', 'crm-sales-reminders'].includes(name))
+		return {
+			CRM_TASK_REMINDERS_ENABLED: 'true',
+			CRM_SALES_PROCESS_ROLE:
+				name === 'crm-sales-api' ? 'api' : 'reminders'
+		}
+	return {}
+}
+function upgradeFixture(contract = 'disabled') {
 	const names = [
 		['winwidget', 'api-gateway'],
 		['winwidget', 'billing-postgres'],
 		['winwidget', 'identity-worker'],
 		...owners.map(owner => ['winwidget-crm', owner + '-postgres']),
-		...CRM_UPGRADE_GROUPS.flatMap(([owner, ...services]) =>
+		...crmUpgradeGroups(contract).flatMap(([owner, ...services]) =>
 			services.map(name => [
 				owner.startsWith('crm-') ? 'winwidget-crm' : 'winwidget',
 				name
@@ -179,20 +195,128 @@ function upgradeFixture() {
 		item.Name = `/${project}-${name}-1`
 		item.Config.Hostname = item.Id.slice(0, 12)
 		item.Config.Env.push(`APP_REVISION=${previous}`)
+		if (contract !== 'disabled')
+			item.Config.Env.push(
+				...Object.entries(reminderEnvironment(name)).map(
+					([key, value]) => `${key}=${value}`
+				)
+			)
 		item.Config.Labels['com.docker.compose.project'] = project
 		item.Config.Labels['com.docker.compose.service'] = name
 		item.State.Dead = false
 		return item
 	})
-	const baseline = crmUpgradeBaseline(live, previous, {
-		billing: hash,
-		canonical: hash,
-		crm: hash,
-		identity: hash,
-		'notification-delivery': hash
-	})
+	const baseline = crmUpgradeBaseline(
+		live,
+		previous,
+		{
+			billing: hash,
+			canonical: hash,
+			crm: hash,
+			identity: hash,
+			'notification-delivery': hash
+		},
+		contract
+	)
 	return { live, baseline }
 }
+
+test('upgrade reminder marker is explicit, bounded and never guessed from the running process', () => {
+	assert.equal(crmUpgradeRemindersContract(), 'disabled')
+	assert.equal(crmUpgradeGroups(), CRM_UPGRADE_GROUPS)
+	assert.equal(
+		crmUpgradeRemindersContractFromEnv(
+			'SECRET=synthetic\n# CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1\n'
+		),
+		'disabled'
+	)
+	for (const mode of ['disabled', 'task-reminders-v1'])
+		for (const quote of ['', "'", '"'])
+			assert.equal(
+				crmUpgradeRemindersContractFromEnv(
+					`SECRET=synthetic\nCRM_REMINDERS_RABBITMQ_CONTRACT=${quote}${mode}${quote}\n`
+				),
+				mode
+			)
+	for (const value of ['', 'true', 'mvp-v1', null, 1])
+		assert.throws(() => crmUpgradeRemindersContract(value))
+	for (const value of [
+		'CRM_REMINDERS_RABBITMQ_CONTRACT=',
+		'CRM_REMINDERS_RABBITMQ_CONTRACT=true',
+		'CRM_REMINDERS_RABBITMQ_CONTRACT=disabled\nCRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1',
+		'export CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1',
+		' CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1',
+		'CRM_REMINDERS_RABBITMQ_CONTRACT="task-reminders-v1',
+		'x'.repeat(1048577)
+	])
+		assert.throws(() => crmUpgradeRemindersContractFromEnv(value))
+	const { live, baseline } = upgradeFixture('task-reminders-v1')
+	assert.equal(Object.keys(baseline.targets).length, 19)
+	assert.equal(baseline.remindersContract, 'task-reminders-v1')
+	assert.equal(crmUpgradeFence(live, baseline), true)
+	assert.deepEqual(
+		crmUpgradeGroups(baseline.remindersContract).find(
+			([owner]) => owner === 'crm-sales'
+		),
+		['crm-sales', 'crm-sales-reminders', 'crm-sales-api']
+	)
+	assert.equal(crmUpgradeOldImages(baseline, 'crm-sales').length, 2)
+	assert.throws(() =>
+		crmUpgradeBaseline(live, previous, baseline.environmentHashes)
+	)
+	for (const change of [
+		value => delete value.remindersContract,
+		value => {
+			value.remindersContract = 'unknown'
+		},
+		value => {
+			delete value.targets['winwidget-crm/crm-sales-reminders']
+		}
+	]) {
+		const altered = structuredClone(baseline)
+		change(altered)
+		assert.throws(() => crmUpgradeFence(live, altered))
+	}
+	for (const change of [
+		rows =>
+			rows.splice(
+				rows.findIndex(
+					row =>
+						row.Config.Labels['com.docker.compose.service'] ===
+						'crm-sales-reminders'
+				),
+				1
+			),
+		rows => {
+			const extra = structuredClone(rows.at(-1))
+			extra.Id = id(999)
+			extra.Config.Labels['com.docker.compose.service'] =
+				'crm-sales-unknown'
+			rows.push(extra)
+		},
+		rows => {
+			rows.find(
+				row =>
+					row.Config.Labels['com.docker.compose.service'] ===
+					'crm-sales-api'
+			).Config.Env = [
+				`APP_REVISION=${previous}`,
+				'CRM_TASK_REMINDERS_ENABLED=false'
+			]
+		}
+	]) {
+		const altered = structuredClone(live)
+		change(altered)
+		assert.throws(() =>
+			crmUpgradeBaseline(
+				altered,
+				previous,
+				baseline.environmentHashes,
+				'task-reminders-v1'
+			)
+		)
+	}
+})
 
 test('upgrade baseline seals exact target identities and all neighbors without a magic global count or secrets', () => {
 	const { live, baseline } = upgradeFixture()
@@ -950,7 +1074,7 @@ test('bounded database handoff parser rejects duplicate keys and malformed bytes
 		assert.throws(() => parseCrmUpgradeDatabaseHandoff(bytes))
 })
 
-function probeArguments(mode, owner, producer = 'success') {
+function probeArguments(mode, owner, producer = 'success', contract = 'disabled') {
 	const directory = mkdtempSync(join(tmpdir(), 'wincrm-upgrade-argv-'))
 	try {
 		const result = spawnSync(
@@ -965,10 +1089,12 @@ release_root='/synthetic release'
 crm_work_directory='/private workdir'
 services_repository='/synthetic services'
 crm_env_file='/private CRM/.env.production'
+env_file='/private canonical/.env.production'
 expected_live_revision="$TEST_REVISION"
 services_revision="$TEST_REVISION"
 infra_revision="$TEST_REVISION"
 crm_upgrade_env_hashes='{}'
+crm_upgrade_reminders_contract="$TEST_CONTRACT"
 crm_probe_image="$TEST_GATEWAY"
 export crm_upgrade_handoff='inherited-public-value'
 docker() {
@@ -1001,7 +1127,8 @@ crm_upgrade_probe "$TEST_MODE" "$TEST_OWNER" "$TEST_IMAGE" complete
 					TEST_IMAGE: image(2),
 					TEST_GATEWAY: image(1),
 					TEST_REVISION: revision,
-					TEST_PRODUCER: producer
+					TEST_PRODUCER: producer,
+					TEST_CONTRACT: contract
 				}
 			}
 		)
@@ -1021,6 +1148,7 @@ crm_upgrade_probe "$TEST_MODE" "$TEST_OWNER" "$TEST_IMAGE" complete
 
 test('real upgrade probe argv isolates source and piped database reads without adding capabilities or private mounts', () => {
 	const ordinary = [
+		'upgrade-contract',
 		'upgrade-baseline',
 		'upgrade-old-images',
 		'upgrade-baseline-check',
@@ -1084,8 +1212,15 @@ test('real upgrade probe argv isolates source and piped database reads without a
 							? '/private CRM/.env.production:/run/crm/crm.env:ro'
 							: `/synthetic services/apps/${owner}/.env.production:/run/crm/${owner}.env:ro`
 					])
-				} else
-					assert.ok(values('--volume').includes('/private workdir:/run/crm:ro'))
+				} else if (actualMode === 'upgrade-contract')
+					assert.deepEqual(values('--volume'), [
+						'/synthetic public payload/verifier.mjs:/run/crm-release.mjs:ro',
+						'/private canonical/.env.production:/run/crm/canonical.env:ro'
+					])
+				else
+					assert.ok(
+						values('--volume').includes('/private workdir:/run/crm:ro')
+					)
 			}
 			assert.equal(
 				Object.keys(calls).length,
@@ -1099,6 +1234,18 @@ test('real upgrade probe argv isolates source and piped database reads without a
 		assert.equal(failed.result.stdout, '')
 		assert.deepEqual(Object.keys(failed.calls), ['upgrade-database-input'])
 	}
+})
+
+test('real enabled upgrade probe binds only the nonsecret marker and read-only overlay validator', () => {
+	const { result, calls } = probeArguments('upgrade-prepare', 'crm-sales', 'success', 'task-reminders-v1')
+	assert.equal(result.status, 0, result.stderr)
+	const args = calls['upgrade-prepare']
+	assert.ok(args.includes('CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1'))
+	assert.ok(args.includes('/synthetic release/.github/scripts/validate-crm-reminders-compose.mjs:/run/crm-reminders-compose-validator.mjs:ro'))
+	assert.equal(args.some(value => value.includes('/private canonical/')), false)
+	assert.equal(args[args.indexOf('--network') + 1], 'none')
+	assert.equal(args[args.indexOf('--log-driver') + 1], 'none')
+	assert.equal(args.includes('--cap-add'), false)
 })
 
 test('upgrade ledgers distinguish pending, complete and the single retained Billing rolled-back attempt', () => {
@@ -1399,8 +1546,8 @@ test('upgrade database proof preserves UUID, roles, memberships and existing ACL
 	}
 })
 
-function upgradeDesiredFixture() {
-	const { live } = upgradeFixture()
+function upgradeDesiredFixture(contract = 'disabled') {
+	const { live } = upgradeFixture(contract)
 	const crm = { name: 'winwidget-crm', services: {} }
 	const companions = { name: 'winwidget', services: {} }
 	const images = CRM_UPGRADE_GROUPS.map(([owner], index) => ({
@@ -1421,7 +1568,9 @@ function upgradeDesiredFixture() {
 			WorkingDir: '/app'
 		}
 	}))
-	for (const [index, [owner, ...names]] of CRM_UPGRADE_GROUPS.entries()) {
+	for (const [index, [owner, ...names]] of crmUpgradeGroups(
+		contract
+	).entries()) {
 		const config = owner.startsWith('crm-') ? crm : companions
 		const candidate = images[index]
 		for (const name of names) {
@@ -1437,14 +1586,16 @@ function upgradeDesiredFixture() {
 				labels: { 'com.winwidget.owner': owner },
 				environment: {
 					APP_REVISION: revision,
-					SYNTHETIC_SECRET: 'fixture-only'
+					SYNTHETIC_SECRET: 'fixture-only',
+					...(contract === 'disabled' ? {} : reminderEnvironment(name))
 				},
 				network_mode: 'host',
 				read_only: true,
 				init: true,
 				cap_drop: ['ALL'],
 				restart: 'unless-stopped',
-				stop_grace_period: stopSeconds === 90 ? '1m30s' : `${stopSeconds}s`,
+				stop_grace_period:
+					stopSeconds === 90 ? '1m30s' : `${stopSeconds}s`,
 				mem_limit: 384 * 1048576,
 				memswap_limit: 384 * 1048576,
 				cpus: 1,
@@ -1478,8 +1629,10 @@ function upgradeDesiredFixture() {
 				StopTimeout: stopSeconds,
 				Env: [
 					'PATH=/usr/bin',
-					`APP_REVISION=${previous}`,
-					'SYNTHETIC_SECRET=fixture-only'
+					...Object.entries({
+						...service.environment,
+						APP_REVISION: previous
+					}).map(([key, value]) => `${key}=${value}`)
 				],
 				Healthcheck: {
 					Test: service.healthcheck.test,
@@ -1495,7 +1648,8 @@ function upgradeDesiredFixture() {
 			})
 			current.HostConfig = {
 				NetworkMode: 'host',
-				ExtraHosts: owner === 'identity' ? ['tg.winwidget.ru:127.0.0.1'] : [],
+				ExtraHosts:
+					owner === 'identity' ? ['tg.winwidget.ru:127.0.0.1'] : [],
 				Privileged: false,
 				ReadonlyRootfs: true,
 				Init: true,
@@ -1528,15 +1682,215 @@ function upgradeDesiredFixture() {
 			}
 		}
 	}
-	const baseline = crmUpgradeBaseline(live, previous, {
-		billing: hash,
-		canonical: hash,
-		crm: hash,
-		identity: hash,
-		'notification-delivery': hash
-	})
-	return { live, baseline, crm, companions, images, servicesRevision: revision }
+	const baseline = crmUpgradeBaseline(
+		live,
+		previous,
+		{
+			billing: hash,
+			canonical: hash,
+			crm: hash,
+			identity: hash,
+			'notification-delivery': hash
+		},
+		contract
+	)
+	const reminderBase =
+		contract === 'disabled'
+			? undefined
+			: {
+					crm: structuredClone(crm),
+					notification: structuredClone(companions),
+					notificationAfter: structuredClone(companions)
+				}
+	if (reminderBase) {
+		delete reminderBase.crm.services['crm-sales-reminders']
+		delete reminderBase.crm.services['crm-sales-api'].environment
+			.CRM_TASK_REMINDERS_ENABLED
+		reminderBase.notification.services[
+			'notification-delivery-worker'
+		].environment.NOTIFICATION_DELIVERY_KINDS = reminderKinds
+			.split(',')
+			.slice(0, 12)
+			.join(',')
+	}
+	return {
+		live,
+		baseline,
+		crm,
+		companions,
+		images,
+		servicesRevision: revision,
+		...(reminderBase ? { reminderBase } : {})
+	}
 }
+
+test('upgrade enabled reminder desired preserves both owner overlays, exact credentials/config and legacy disabled output', () => {
+	const disabled = upgradeDesiredFixture()
+	assert.equal(
+		Object.hasOwn(disabled.baseline, 'remindersContract'),
+		false
+	)
+	assert.deepEqual(
+		crmUpgradeBaseline(
+			disabled.live,
+			previous,
+			disabled.baseline.environmentHashes,
+			'disabled'
+		),
+		disabled.baseline
+	)
+	const input = upgradeDesiredFixture('task-reminders-v1')
+	let baseCalls = 0,
+		overlayCalls = 0
+	const validateBase = value => {
+		assert.deepEqual(value, input.reminderBase.crm)
+		baseCalls++
+	}
+	const validateOverlay = value => {
+		assert.deepEqual(value, {
+			crmBefore: input.reminderBase.crm,
+			crmAfter: input.crm,
+			notificationBefore: input.reminderBase.notification,
+			notificationAfter: input.reminderBase.notificationAfter
+		})
+		overlayCalls++
+	}
+	const { desired, replacements } = crmUpgradeDesired(
+		input,
+		validateBase,
+		validateOverlay
+	)
+	assert.equal(baseCalls, 1)
+	assert.equal(overlayCalls, 1)
+	assert.equal(Object.keys(replacements).length, 19)
+	assert.equal(
+		desired.crm.services['crm-sales-reminders'].image,
+		desired.crm.services['crm-sales-api'].image
+	)
+	assert.equal(
+		desired.crm.services['crm-sales-api'].environment
+			.CRM_TASK_REMINDERS_ENABLED,
+		'true'
+	)
+	assert.equal(
+		desired.companions.services['notification-delivery-worker'].environment
+			.NOTIFICATION_DELIVERY_KINDS,
+		reminderKinds
+	)
+	assert.throws(() => crmUpgradeDesired(input, () => {}))
+	assert.throws(() =>
+		crmUpgradeDesired(
+			input,
+			() => {},
+			() => {
+				throw Error('invalid overlay')
+			}
+		)
+	)
+	for (const mutate of [
+		value => {
+			delete value.reminderBase
+		},
+		value => {
+			delete value.baseline.remindersContract
+		},
+		value => {
+			delete value.crm.services['crm-sales-reminders']
+		},
+		value => {
+			value.crm.services[
+				'crm-sales-api'
+			].environment.CRM_TASK_REMINDERS_ENABLED = 'false'
+		},
+		value => {
+			value.crm.services['crm-sales-reminders'].environment.RABBITMQ_URL =
+				'amqp://foreign:synthetic@127.0.0.1:5672/winwidget'
+		},
+		value => {
+			value.crm.services[
+				'crm-sales-reminders'
+			].environment.CRM_SALES_DATABASE_URL =
+				'postgresql://wrong:synthetic@127.0.0.1/foreign'
+		},
+		value => {
+			value.crm.services[
+				'crm-sales-reminders'
+			].environment.CRM_SALES_NOTIFICATION_DELIVERY_TOKEN =
+				'different-synthetic'
+		},
+		value => {
+			value.crm.services['crm-sales-reminders'].mem_limit = 1
+		},
+		value => {
+			value.crm.services['crm-sales-reminders'].cap_add = ['ALL']
+			value.live.find(
+				item =>
+					item.Config.Labels['com.docker.compose.service'] ===
+					'crm-sales-reminders'
+			).HostConfig.CapAdd = ['ALL']
+		},
+		value => {
+			value.companions.services[
+				'notification-delivery-worker'
+			].environment.NOTIFICATION_DELIVERY_KINDS = reminderKinds
+				.split(',')
+				.slice(0, 12)
+				.join(',')
+		}
+	]) {
+		const changed = structuredClone(input)
+		mutate(changed)
+		assert.throws(() =>
+			crmUpgradeDesired(
+				changed,
+				() => {},
+				() => {}
+			)
+		)
+	}
+})
+
+test('upgrade enabled reminder group allows only a completed prefix and an explicit two-process Sales switch', () => {
+	const { live, baseline } = upgradeFixture('task-reminders-v1')
+	const groups = crmUpgradeGroups(baseline.remindersContract)
+	const replacements = {}
+	const replace = name => {
+		const current = live.find(
+			item => item.Config.Labels['com.docker.compose.service'] === name
+		)
+		const key = `${current.Config.Labels['com.docker.compose.project']}/${name}`
+		current.Id = id(600 + Object.keys(replacements).length)
+		current.Image = image(600 + Object.keys(replacements).length)
+		current.Config.Env = current.Config.Env.map(value =>
+			value.startsWith('APP_REVISION=')
+				? `APP_REVISION=${revision}`
+				: value
+		)
+		current.Config.Labels['org.opencontainers.image.revision'] = revision
+		replacements[key] = { image: current.Image, revision }
+	}
+	for (const [owner, ...names] of groups) {
+		if (owner === 'crm-sales') break
+		for (const name of names) replace(name)
+	}
+	const api = live.find(
+		item =>
+			item.Config.Labels['com.docker.compose.service'] === 'crm-sales-api'
+	)
+	api.State.Running = false
+	replace('crm-sales-reminders')
+	assert.throws(() => crmUpgradeFence(live, baseline, replacements))
+	assert.equal(
+		crmUpgradeFence(live, baseline, replacements, 'crm-sales'),
+		true
+	)
+	assert.throws(() =>
+		crmUpgradeFence(live, baseline, replacements, 'crm-intake')
+	)
+	replace('crm-sales-api')
+	api.State.Running = true
+	assert.equal(crmUpgradeFence(live, baseline, replacements), true)
+})
 
 test('upgrade desired contract selects only approved groups and isolated migration jobs without changing product env', () => {
 	const input = upgradeDesiredFixture()
@@ -1774,7 +2128,11 @@ test('upgrade desired rejects changed or invalid durations instead of rounding o
 
 // Execute the real coordinator with isolated command/verification doubles.
 // No Docker daemon, production path, credentials or network are used here.
-function runUpgradeController(scenario = 'success', replay = false) {
+function runUpgradeController(
+	scenario = 'success',
+	replay = false,
+	contract = 'disabled'
+) {
 	const directory = mkdtempSync(join(tmpdir(), 'wincrm-upgrade-contract-'))
 	try {
 		for (const path of [
@@ -1826,7 +2184,7 @@ owner_names() {
     crm-access) printf 'crm-access-worker crm-access-outbox-publisher crm-access-api' ;;
     crm-customers) printf 'crm-customers-api' ;;
     notification-delivery) printf 'notification-delivery-worker' ;;
-    crm-sales) printf 'crm-sales-api' ;;
+    crm-sales) if [[ "$TEST_CONTRACT" == task-reminders-v1 ]]; then printf 'crm-sales-reminders crm-sales-api'; else printf 'crm-sales-api'; fi ;;
     crm-intake) printf 'crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher crm-intake-api' ;;
   esac
 }
@@ -1834,6 +2192,9 @@ crm_upgrade_probe() {
   local mode="$1" owner="\${2:-}" name
   printf 'PROBE %s %s %s\\n' "$mode" "$owner" "\${4:-}" >>"$TEST_TRACE"
   case "$mode" in
+    upgrade-contract)
+      [[ "$TEST_SCENARIO" != contract-read-failed ]] || return 9
+      if [[ "$TEST_SCENARIO" == invalid-contract ]]; then printf 'unknown\\n'; else printf '%s\\n' "$TEST_CONTRACT"; fi ;;
     upgrade-baseline-check|upgrade-fence)
       while IFS= read -r line; do :; done
       [[ "$TEST_SCENARIO" != baseline-drift ]] || return 10
@@ -1876,6 +2237,7 @@ crm_upgrade_compose() {
     up)
       [[ "$*" == *'--no-deps --no-build --pull never --force-recreate'* && " $TEST_TARGETS " == *" $last "* ]] || return 18
       if [[ "$TEST_SCENARIO" == partial-start && "$last" == crm-access-api && ! -f "$TEST_DIRECTORY/failure-observed" ]]; then touch "$TEST_DIRECTORY/failure-observed"; return 19; fi
+      if [[ "$TEST_SCENARIO" == partial-sales && "$last" == crm-sales-api && ! -f "$TEST_DIRECTORY/failure-observed" ]]; then touch "$TEST_DIRECTORY/failure-observed"; return 19; fi
       touch "$TEST_DIRECTORY/new-$last"
       rm -f -- "$TEST_DIRECTORY/stopped-$last" ;;
     *) return 91 ;;
@@ -1906,6 +2268,7 @@ env() {
   shift 2
   while [[ "$1" != docker ]]; do [[ "$1" == *_IMAGE=* || "$1" == *_REVISION=* || "$1" == APP_VERSION=* ]] || return 22; shift; done
   [[ "$*" == *'compose '* && "$*" == *'config --format json'* ]] || return 23
+  printf 'MATERIALIZE %s\\n' "$*" >>"$TEST_TRACE"
   printf '{}\\n'
 }
 scoped_deploy_main
@@ -1920,15 +2283,16 @@ scoped_deploy_main
 					TEST_TRACE: join(directory, 'trace'),
 					TEST_LIBRARY: join(root, 'deploy-crm-scoped.sh'),
 					TEST_SCENARIO: scenario,
+					TEST_CONTRACT: contract,
 					TEST_REVISION: revision,
 					TEST_PREVIOUS: previous,
 					TEST_HASH: hash,
 					TEST_IMAGE: image(900),
 					TEST_OLD_IMAGE: image(901),
 					TEST_ID: id(900),
-					TEST_TARGETS: CRM_UPGRADE_GROUPS.flatMap(
-						([, ...names]) => names
-					).join(' ')
+					TEST_TARGETS: crmUpgradeGroups(contract)
+						.flatMap(([, ...names]) => names)
+						.join(' ')
 				}
 			})
 		const first = execute()
@@ -2002,7 +2366,9 @@ test('upgrade coordinator fails closed before unsafe mutation and retains exact 
 		'env-drift',
 		'baseline-drift',
 		'identity-schema-drift',
-		'low-memory'
+		'low-memory',
+		'invalid-contract',
+		'contract-read-failed'
 	]) {
 		const result = runUpgradeController(scenario)
 		assert.notEqual(result.first.status, 0, scenario)
@@ -2025,6 +2391,84 @@ test('upgrade coordinator fails closed before unsafe mutation and retains exact 
 	assert.equal(secondCalls.includes('--force-recreate billing-api'), false)
 	assert.equal(secondCalls.includes('--force-recreate crm-access-api'), true)
 	assert.equal(secondCalls.includes('--force-recreate crm-intake-api'), true)
+})
+
+test('upgrade enabled coordinator materializes both overlays and switches Sales together without starting neighbors', () => {
+	const result = runUpgradeController('success', true, 'task-reminders-v1')
+	assert.equal(result.first.status, 0, result.first.stderr)
+	assert.equal(result.second.status, 0, result.second.stderr)
+	const starts = result.calls
+		.split('\n')
+		.filter(line => line.startsWith('COMPOSE ') && line.includes(' up '))
+	assert.deepEqual(
+		starts.map(line => line.split(' ').at(-1)),
+		crmUpgradeGroups('task-reminders-v1').flatMap(([, ...names]) => names)
+	)
+	const materialized = result.calls
+		.split('\n')
+		.filter(line => line.startsWith('MATERIALIZE '))
+	assert.equal(
+		materialized.filter(line =>
+			line.includes('docker-compose.crm-reminders.yml')
+		).length,
+		1
+	)
+	assert.equal(
+		materialized.filter(line =>
+			line.includes('docker-compose.notification-reminders.yml')
+		).length,
+		1
+	)
+	const stopped = result.calls.indexOf(
+		'COMPOSE crm stop --timeout 90 crm-sales-reminders crm-sales-api'
+	)
+	const workerStarted = result.calls.indexOf(
+		'--force-recreate crm-sales-reminders'
+	)
+	const apiStarted = result.calls.indexOf('--force-recreate crm-sales-api')
+	assert.ok(
+		stopped > 0 && stopped < workerStarted && workerStarted < apiStarted
+	)
+	assert.ok(
+		result.calls.indexOf('--force-recreate notification-delivery-worker') <
+			stopped
+	)
+	assert.equal(result.calls.includes('broker'), false)
+	const disabled = runUpgradeController()
+	assert.equal(disabled.first.status, 0, disabled.first.stderr)
+	assert.equal(
+		disabled.calls.includes('docker-compose.crm-reminders.yml'),
+		false
+	)
+	assert.equal(
+		disabled.calls.includes('docker-compose.notification-reminders.yml'),
+		false
+	)
+	assert.equal(
+		disabled.calls.includes('--force-recreate crm-sales-reminders'),
+		false
+	)
+	const retry = runUpgradeController(
+		'partial-sales',
+		true,
+		'task-reminders-v1'
+	)
+	assert.notEqual(retry.first.status, 0)
+	assert.equal(retry.second.status, 0, retry.second.stderr)
+	const resumed = retry.calls.slice(retry.firstCalls.length)
+	assert.equal(
+		resumed.includes('--force-recreate notification-delivery-worker'),
+		false
+	)
+	assert.ok(
+		resumed.includes(
+			'COMPOSE crm stop --timeout 90 crm-sales-reminders crm-sales-api'
+		)
+	)
+	assert.ok(
+		resumed.includes('--force-recreate crm-sales-reminders') &&
+			resumed.includes('--force-recreate crm-sales-api')
+	)
 })
 
 const databaseFixture = (owner = owners[0]) => {

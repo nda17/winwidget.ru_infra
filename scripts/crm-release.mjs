@@ -60,6 +60,43 @@ export const CRM_UPGRADE_GROUPS = Object.freeze(
 		]
 	].map(Object.freeze)
 )
+const reminderUpgradeGroups = Object.freeze(
+	CRM_UPGRADE_GROUPS.map(group =>
+		group[0] === 'crm-sales'
+			? Object.freeze([
+					'crm-sales',
+					'crm-sales-reminders',
+					'crm-sales-api'
+				])
+			: group
+	)
+)
+export function crmUpgradeRemindersContract(value = 'disabled') {
+	assert.ok(['disabled', 'task-reminders-v1'].includes(value))
+	return value
+}
+export function crmUpgradeRemindersContractFromEnv(source) {
+	assert.equal(typeof source, 'string')
+	assert.ok(Buffer.byteLength(source) <= 1048576)
+	const lines = source
+		.split(/\r?\n/)
+		.filter(line =>
+			/^\s*(?:export\s+)?CRM_REMINDERS_RABBITMQ_CONTRACT\b/.test(line)
+		)
+	assert.ok(lines.length <= 1)
+	if (!lines.length) return 'disabled'
+	const match =
+		/^CRM_REMINDERS_RABBITMQ_CONTRACT=(disabled|task-reminders-v1|"(?:disabled|task-reminders-v1)"|'(?:disabled|task-reminders-v1)')$/.exec(
+			lines[0]
+		)
+	assert.ok(match)
+	return crmUpgradeRemindersContract(match[1].replace(/^['"]|['"]$/g, ''))
+}
+export function crmUpgradeGroups(contract = 'disabled') {
+	return crmUpgradeRemindersContract(contract) === 'disabled'
+		? CRM_UPGRADE_GROUPS
+		: reminderUpgradeGroups
+}
 export const CRM_UPGRADE_MIGRATIONS = Object.freeze({
 	identity: {},
 	billing: {
@@ -102,9 +139,10 @@ const upgradeProject = owner =>
 	owner.startsWith('crm-') ? 'winwidget-crm' : 'winwidget'
 const upgradeKey = item =>
 	`${item.Config?.Labels?.['com.docker.compose.project']}/${item.Config?.Labels?.['com.docker.compose.service']}`
-const upgradeTargets = CRM_UPGRADE_GROUPS.flatMap(([owner, ...names]) =>
-	names.map(name => `${upgradeProject(owner)}/${name}`)
-)
+const upgradeTargetsFor = contract =>
+	crmUpgradeGroups(contract).flatMap(([owner, ...names]) =>
+		names.map(name => `${upgradeProject(owner)}/${name}`)
+	)
 const envObject = entries => {
 	const result = {}
 	for (const entry of entries) {
@@ -160,7 +198,13 @@ function upgradeHealthy(item) {
 }
 
 // Public baseline contains only identities/hashes, never container env values.
-export function crmUpgradeBaseline(live, gatewayRevision, environmentHashes) {
+export function crmUpgradeBaseline(
+	live,
+	gatewayRevision,
+	environmentHashes,
+	remindersContract = 'disabled'
+) {
+	const upgradeTargets = upgradeTargetsFor(remindersContract)
 	assert.ok(Array.isArray(live) && live.length <= 200)
 	assert.equal(new Set(live.map(upgradeKey)).size, live.length)
 	assert.equal(new Set(live.map(item => item.Id)).size, live.length)
@@ -171,7 +215,8 @@ export function crmUpgradeBaseline(live, gatewayRevision, environmentHashes) {
 		'identity',
 		'notification-delivery'
 	])
-	for (const value of Object.values(environmentHashes)) assert.ok(sha(value))
+	for (const value of Object.values(environmentHashes))
+		assert.ok(sha(value))
 	for (const key of upgradeTargets)
 		assert.equal(live.filter(item => upgradeKey(item) === key).length, 1)
 	// No stopped/unknown CRM one-offs may be hidden from the snapshot.
@@ -186,9 +231,49 @@ export function crmUpgradeBaseline(live, gatewayRevision, environmentHashes) {
 		].sort()
 	)
 	for (const item of live) upgradeHealthy(item)
+	if (remindersContract !== 'disabled') {
+		for (const name of ['crm-sales-api', 'crm-sales-reminders']) {
+			const env = envObject(
+				live.find(item => upgradeKey(item) === `winwidget-crm/${name}`)
+					.Config.Env
+			)
+			assert.equal(env.CRM_TASK_REMINDERS_ENABLED, 'true')
+			assert.equal(
+				env.CRM_SALES_PROCESS_ROLE,
+				name === 'crm-sales-api' ? 'api' : 'reminders'
+			)
+		}
+		const env = envObject(
+			live.find(
+				item =>
+					upgradeKey(item) === 'winwidget/notification-delivery-worker'
+			).Config.Env
+		)
+		const kinds = (env.NOTIFICATION_DELIVERY_KINDS ?? '').split(',')
+		assert.deepEqual(
+			[...kinds].sort(),
+			[
+				'email',
+				'telegram',
+				'payment-email',
+				'payment-telegram',
+				'limit-email',
+				'limit-telegram',
+				'campaign-email',
+				'campaign-telegram',
+				'daily-summary-delivery-telegram',
+				'subscription-expiry-email',
+				'subscription-expiry-telegram',
+				'wincrm-invitation-email',
+				'wincrm-task-reminder-email',
+				'wincrm-task-reminder-telegram'
+			].sort()
+		)
+	}
 	return {
 		schemaVersion: 1,
 		kind: 'winwidget.crm.upgrade-baseline.v1',
+		...(remindersContract === 'disabled' ? {} : { remindersContract }),
 		gatewayRevision,
 		environmentHashes,
 		neighborsSha256: crmNeighborFingerprint(
@@ -202,14 +287,19 @@ export function crmUpgradeBaseline(live, gatewayRevision, environmentHashes) {
 					item.Config.Labels['org.opencontainers.image.revision'] ??
 					envObject(item.Config.Env).APP_REVISION
 				assert.ok(revision(currentRevision))
-				assert.equal(envObject(item.Config.Env).APP_REVISION, currentRevision)
+				assert.equal(
+					envObject(item.Config.Env).APP_REVISION,
+					currentRevision
+				)
 				return [
 					key,
 					{
 						id: item.Id,
 						image: item.Image,
 						revision: currentRevision,
-						configurationSha256: digest(stableJson(upgradeConfiguration(item)))
+						configurationSha256: digest(
+							stableJson(upgradeConfiguration(item))
+						)
 					}
 				]
 			})
@@ -262,7 +352,9 @@ export function crmUpgradeImageSource(prismaRoot) {
 
 export function crmUpgradeOldImages(baseline, owner) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
-	const group = CRM_UPGRADE_GROUPS.find(([name]) => name === owner).slice(1)
+	const group = crmUpgradeGroups(baseline.remindersContract)
+		.find(([name]) => name === owner)
+		.slice(1)
 	const values = [
 		...new Set(
 			group.map(
@@ -374,6 +466,8 @@ export function crmUpgradeFence(
 ) {
 	assert.equal(baseline.kind, 'winwidget.crm.upgrade-baseline.v1')
 	assert.equal(baseline.schemaVersion, 1)
+	const groups = crmUpgradeGroups(baseline.remindersContract)
+	const upgradeTargets = upgradeTargetsFor(baseline.remindersContract)
 	assert.deepEqual(
 		Object.keys(baseline.targets).sort(),
 		[...upgradeTargets].sort()
@@ -385,7 +479,7 @@ export function crmUpgradeFence(
 	const switching =
 		switchingOwner === null
 			? []
-			: CRM_UPGRADE_GROUPS.find(([owner]) => owner === switchingOwner)?.slice(1)
+			: groups.find(([owner]) => owner === switchingOwner)?.slice(1)
 	assert.ok(switching)
 	assert.equal(
 		crmNeighborFingerprint(
@@ -424,7 +518,7 @@ export function crmUpgradeFence(
 	// switching group and untouched suffix. Never accept a skipped dependency
 	// or a mixed old/new worker group as an already completed deployment.
 	let remaining = false
-	for (const [owner, ...names] of CRM_UPGRADE_GROUPS) {
+	for (const [owner, ...names] of groups) {
 		const states = names.map(name => {
 			const key = `${upgradeProject(owner)}/${name}`
 			return live.find(item => upgradeKey(item) === key)?.Image ===
@@ -554,14 +648,51 @@ function upgradeCompanionConfiguration(service, live, image) {
 }
 
 export function crmUpgradeDesired(
-	{ crm, companions, images, live, baseline, servicesRevision },
-	validateCrmCompose
+	{
+		crm,
+		companions,
+		images,
+		live,
+		baseline,
+		servicesRevision,
+		reminderBase
+	},
+	validateCrmCompose,
+	validateCrmReminderDeployment
 ) {
 	assert.ok(revision(servicesRevision))
-	validateCrmCompose(crm)
+	const contract = crmUpgradeRemindersContract(baseline.remindersContract)
+	const groups = crmUpgradeGroups(contract)
+	if (contract === 'disabled') {
+		assert.equal(reminderBase, undefined)
+		validateCrmCompose(crm)
+	} else {
+		assert.ok(
+			reminderBase && typeof validateCrmReminderDeployment === 'function'
+		)
+		validateCrmCompose(reminderBase.crm)
+		validateCrmReminderDeployment({
+			crmBefore: reminderBase.crm,
+			crmAfter: crm,
+			notificationBefore: reminderBase.notification,
+			notificationAfter: reminderBase.notificationAfter
+		})
+		assert.deepEqual(
+			companions.services['notification-delivery-worker'],
+			reminderBase.notificationAfter.services[
+				'notification-delivery-worker'
+			]
+		)
+		assert.deepEqual(
+			companions.services['notification-delivery-migrate'],
+			reminderBase.notificationAfter.services[
+				'notification-delivery-migrate'
+			]
+		)
+	}
 	assert.equal(crm.name, 'winwidget-crm')
 	assert.equal(companions.name, 'winwidget')
-	assert.equal(images.length, CRM_UPGRADE_GROUPS.length)
+	assert.equal(images.length, groups.length)
 	assert.equal(new Set(images.map(item => item.Id)).size, images.length)
 	crmUpgradeFence(live, baseline)
 	const desired = {
@@ -569,7 +700,7 @@ export function crmUpgradeDesired(
 		companions: { name: 'winwidget', services: {} }
 	}
 	const replacements = {}
-	for (const [index, [owner, ...names]] of CRM_UPGRADE_GROUPS.entries()) {
+	for (const [index, [owner, ...names]] of groups.entries()) {
 		// The sealed image inventory follows the explicit owner build order.
 		// Legacy ND has only a revision label; keep its exact node runtime.
 		const image = images[index]
@@ -590,7 +721,9 @@ export function crmUpgradeDesired(
 			process.arch === 'x64' ? 'amd64' : process.arch
 		)
 		const project = upgradeProject(owner)
-		const selected = owner.startsWith('crm-') ? desired.crm : desired.companions
+		const selected = owner.startsWith('crm-')
+			? desired.crm
+			: desired.companions
 		const config = owner.startsWith('crm-') ? crm : companions
 		for (const name of names) {
 			const key = `${project}/${name}`
@@ -616,7 +749,7 @@ export function crmUpgradeDesired(
 				)
 				candidate.Config.Labels['org.opencontainers.image.revision'] =
 					servicesRevision
-				crmRuntimeContainer(candidate, config, images, name)
+				crmRuntimeContainer(candidate, config, images, name, contract)
 			} else upgradeCompanionConfiguration(service, current, image)
 			delete service.build
 			delete service.depends_on
@@ -625,20 +758,27 @@ export function crmUpgradeDesired(
 			replacements[key] = { image: image.Id, revision: servicesRevision }
 		}
 		if (owner !== 'identity') {
-			const migration = structuredClone(config.services[`${owner}-migrate`])
+			const migration = structuredClone(
+				config.services[`${owner}-migrate`]
+			)
 			assert.ok(
-				migration && !migration.volumes?.length && !migration.secrets?.length
+				migration &&
+					!migration.volumes?.length &&
+					!migration.secrets?.length
 			)
 			assert.equal(migration.network_mode, 'host')
 			assert.equal(migration.restart ?? 'no', 'no')
-			assert.deepEqual(migration.entrypoint, ['./node_modules/.bin/prisma'])
+			assert.deepEqual(migration.entrypoint, [
+				'./node_modules/.bin/prisma'
+			])
 			assert.deepEqual(migration.command, [
 				'migrate',
 				'deploy',
 				'--schema',
 				'prisma/schema.prisma'
 			])
-			const key = owner.replaceAll('-', '_').toUpperCase() + '_DATABASE_URL'
+			const key =
+				owner.replaceAll('-', '_').toUpperCase() + '_DATABASE_URL'
 			assert.deepEqual(
 				Object.keys(migration.environment).sort(),
 				[
@@ -663,8 +803,14 @@ export function crmUpgradeDesired(
 				url.username,
 				`winwidget_${owner.replaceAll('-', '_')}_migration`
 			)
-			assert.equal(url.pathname, `/winwidget_${owner.replaceAll('-', '_')}`)
-			assert.equal(url.searchParams.get('schema'), owner.replaceAll('-', '_'))
+			assert.equal(
+				url.pathname,
+				`/winwidget_${owner.replaceAll('-', '_')}`
+			)
+			assert.equal(
+				url.searchParams.get('schema'),
+				owner.replaceAll('-', '_')
+			)
 			delete migration.build
 			delete migration.depends_on
 			migration.image = image.Id
@@ -1085,11 +1231,32 @@ async function crmUpgradeCommand(mode) {
 		return parseCrmUpgradeDatabaseHandoff(buffer.subarray(0, size))
 	}
 	const json = name => JSON.parse(readFileSync(`/run/crm/${name}.json`, 'utf8'))
+	const baselineInput = () => {
+		const baseline = json('baseline')
+		assert.equal(
+			crmUpgradeRemindersContract(baseline.remindersContract),
+			crmUpgradeRemindersContract(
+				process.env.CRM_REMINDERS_RABBITMQ_CONTRACT
+			)
+		)
+		return baseline
+	}
+	if (mode === 'upgrade-contract') {
+		const file = '/run/crm/canonical.env'
+		assert.ok(lstatSync(file).size <= 1048576)
+		process.stdout.write(
+			crmUpgradeRemindersContractFromEnv(readFileSync(file, 'utf8')) + '\n'
+		)
+		return undefined
+	}
 	if (mode === 'upgrade-baseline')
 		return crmUpgradeBaseline(
 			input(),
 			process.env.CRM_GATEWAY_REVISION,
-			JSON.parse(process.env.CRM_UPGRADE_ENV_HASHES)
+			JSON.parse(process.env.CRM_UPGRADE_ENV_HASHES),
+			crmUpgradeRemindersContract(
+				process.env.CRM_REMINDERS_RABBITMQ_CONTRACT
+			)
 		)
 	if (mode === 'upgrade-source') return crmUpgradeImageSource('/app/prisma')
 	if (mode === 'upgrade-old-images') {
@@ -1098,7 +1265,7 @@ async function crmUpgradeCommand(mode) {
 		return undefined
 	}
 	if (mode === 'upgrade-baseline-check') {
-		const baseline = json('baseline')
+		const baseline = baselineInput()
 		assert.deepEqual(
 			baseline.environmentHashes,
 			JSON.parse(process.env.CRM_UPGRADE_ENV_HASHES)
@@ -1195,8 +1362,16 @@ async function crmUpgradeCommand(mode) {
 		return undefined
 	}
 	if (mode === 'upgrade-prepare') {
+		const baseline = baselineInput()
 		const { validateCrmCompose } =
 			await import('/run/crm-compose-validator.mjs')
+		const enabled =
+			crmUpgradeRemindersContract(baseline.remindersContract) ===
+			'task-reminders-v1'
+		const validateReminders = enabled
+			? (await import('/run/crm-reminders-compose-validator.mjs'))
+					.validateCrmReminderDeployment
+			: undefined
 		const billing = json('billing'),
 			identity = json('identity'),
 			notification = json('notification-delivery')
@@ -1217,10 +1392,20 @@ async function crmUpgradeCommand(mode) {
 				companions,
 				images: json('images'),
 				live: json('live'),
-				baseline: json('baseline'),
-				servicesRevision: process.env.CRM_SERVICES_REVISION
+				baseline,
+				servicesRevision: process.env.CRM_SERVICES_REVISION,
+				...(enabled
+					? {
+							reminderBase: {
+								crm: json('crm-base'),
+								notification: json('notification-delivery-base'),
+								notificationAfter: notification
+							}
+						}
+					: {})
 			},
-			validateCrmCompose
+			validateCrmCompose,
+			validateReminders
 		)
 		return {
 			schemaVersion: 1,
@@ -1232,6 +1417,8 @@ async function crmUpgradeCommand(mode) {
 		}
 	}
 	if (mode === 'upgrade-fence') {
+		const baseline = baselineInput()
+		const upgradeTargets = upgradeTargetsFor(baseline.remindersContract)
 		const plan = json('plan')
 		assert.equal(plan.schemaVersion, 1)
 		assert.equal(plan.servicesRevision, process.env.CRM_SERVICES_REVISION)
@@ -1245,33 +1432,35 @@ async function crmUpgradeCommand(mode) {
 			[...upgradeTargets].sort()
 		)
 		assert.deepEqual(
-			json('baseline').environmentHashes,
+			baseline.environmentHashes,
 			JSON.parse(process.env.CRM_UPGRADE_ENV_HASHES)
 		)
 		assert.equal(
-			json('baseline').gatewayRevision,
+			baseline.gatewayRevision,
 			process.env.CRM_GATEWAY_REVISION
 		)
 		return crmUpgradeFence(
 			input(),
-			json('baseline'),
+			baseline,
 			plan.replacements,
 			process.env.CRM_UPGRADE_SWITCHING_OWNER || null
 		)
 	}
 	if (mode === 'upgrade-complete') {
+		const baseline = baselineInput()
 		const plan = json('plan'),
 			live = input()
 		crmUpgradeFence(
 			live,
-			json('baseline'),
+			baseline,
 			plan.replacements,
 			process.env.CRM_UPGRADE_SWITCHING_OWNER || null
 		)
 		const group =
 			process.argv[3] === 'all'
-				? upgradeTargets
-				: CRM_UPGRADE_GROUPS.find(([owner]) => owner === process.argv[3])
+				? upgradeTargetsFor(baseline.remindersContract)
+				: crmUpgradeGroups(baseline.remindersContract)
+						.find(([owner]) => owner === process.argv[3])
 						?.slice(1)
 						.map(name => `${upgradeProject(process.argv[3])}/${name}`)
 		assert.ok(group)
@@ -1391,8 +1580,19 @@ export function crmRuntimeNeighbors(containers, gatewayRevision) {
 	)
 }
 
-export function crmRuntimeContainer(container, config, images, name) {
-	assert.ok(CRM_RUNTIME_NAMES.includes(name))
+export function crmRuntimeContainer(
+	container,
+	config,
+	images,
+	name,
+	remindersContract = 'disabled'
+) {
+	assert.ok(
+		CRM_RUNTIME_NAMES.includes(name) ||
+			(crmUpgradeRemindersContract(remindersContract) ===
+				'task-reminders-v1' &&
+				name === 'crm-sales-reminders')
+	)
 	const expected = config.services[name]
 	const image = images.find(item => item.Id === expected.image)
 	assert.ok(image && sha(container.Id))
@@ -1429,7 +1629,10 @@ export function crmRuntimeContainer(container, config, images, name) {
 		...expected.environment
 	})
 	assert.equal(container.Config.User, expected.user)
-	assert.deepEqual(container.Config.Cmd, expected.command ?? image.Config.Cmd)
+	assert.deepEqual(
+		container.Config.Cmd,
+		expected.command ?? image.Config.Cmd
+	)
 	assert.deepEqual(
 		container.Config.Entrypoint,
 		expected.entrypoint ?? image.Config.Entrypoint
@@ -1474,7 +1677,10 @@ export function crmRuntimeContainer(container, config, images, name) {
 			mount => mount.Type === 'tmpfs' && mount.Destination === '/tmp'
 		)
 	)
-	assert.deepEqual(container.Config.Healthcheck.Test, expected.healthcheck.test)
+	assert.deepEqual(
+		container.Config.Healthcheck.Test,
+		expected.healthcheck.test
+	)
 	const duration = value => {
 		const match = /^(\d+)(ms|s|m)$/.exec(value)
 		assert.ok(match)

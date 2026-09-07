@@ -513,6 +513,7 @@ crm_upgrade_probe() {
 	export -n crm_upgrade_handoff
 	local -a mounts=() command=()
 	case "$mode" in
+		upgrade-contract) mounts=(--volume "$env_file:/run/crm/canonical.env:ro") ;;
 		upgrade-source) user=1001:1001 ;;
 		upgrade-database) user=1001:1001; network=host ;;
 		upgrade-database-input)
@@ -526,6 +527,9 @@ crm_upgrade_probe() {
 			--volume "$crm_work_directory:/run/crm:ro"
 		) ;;
 	esac
+	if [[ "${crm_upgrade_reminders_contract:-disabled}" == task-reminders-v1 && "$mode" == upgrade-prepare ]]; then
+		mounts+=(--volume "$release_root/.github/scripts/validate-crm-reminders-compose.mjs:/run/crm-reminders-compose-validator.mjs:ro")
+	fi
 	if [[ "$owner" == notification-delivery && ( "$mode" == upgrade-source || "$mode" == upgrade-database ) ]]; then user=1000:1000; fi
 	# The image owns Prisma/package files as UID 1001, including historical
 	# 0600/0700 files. Do not add DAC capabilities or widen private artifact ACLs.
@@ -535,6 +539,7 @@ crm_upgrade_probe() {
 		--env "CRM_GATEWAY_REVISION=$expected_live_revision" --env "CRM_SERVICES_REVISION=$services_revision" \
 		--env "CRM_INFRA_REVISION=$infra_revision" --env "CRM_UPGRADE_ENV_HASHES=$crm_upgrade_env_hashes" \
 		--env "CRM_UPGRADE_SWITCHING_OWNER=${crm_upgrade_switching_owner:-}" \
+		--env "CRM_REMINDERS_RABBITMQ_CONTRACT=${crm_upgrade_reminders_contract:-disabled}" \
 		--volume "$scoped_payload_directory/verifier.mjs:/run/crm-release.mjs:ro"
 		${mounts[@]+"${mounts[@]}"}
 		--entrypoint node "$selected" /run/crm-release.mjs "$mode" "$owner" "$phase")
@@ -599,6 +604,10 @@ crm_upgrade_main() {
 	[[ "$gateway_id" =~ ^[a-f0-9]{64}$ ]] || die 'Gateway baseline is not uniquely running.'
 	read -r crm_probe_image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$gateway_id")
 	[[ "$crm_probe_image" =~ ^sha256:[a-f0-9]{64}$ && "$revision" == "$expected_live_revision" ]] || die 'Gateway baseline revision changed.'
+	# Read the explicit canonical marker, never infer activation from containers.
+	crm_upgrade_env_hashes='{}'
+	crm_upgrade_reminders_contract="$(crm_upgrade_probe upgrade-contract)" || die 'Cannot read CRM reminder contract.'
+	case "$crm_upgrade_reminders_contract" in disabled|task-reminders-v1) ;; *) die 'Unknown CRM reminder contract.' ;; esac
 	file="$app_root/deploy/backend/crm/upgrades"
 	[[ -e "$file" ]] || install -d -m 700 "$file"
 	assert_root_owned_directory "$file"
@@ -672,9 +681,22 @@ crm_upgrade_main() {
 			env -i PATH="$PATH" "${base_image_env[@]}" "${image_env[@]}" docker compose --project-name winwidget --profile '*' \
 				--env-file "$env_file" --env-file "$services_repository/apps/$owner/.env.production" -f "$release_root/deploy/docker-compose.prod.yml" config --format json \
 				>"$crm_work_directory/$owner.json" 2>/dev/null || die 'CRM companion Compose cannot be materialized safely.'
+			if [[ "$owner" == notification-delivery && "$crm_upgrade_reminders_contract" == task-reminders-v1 ]]; then
+				mv -- "$crm_work_directory/$owner.json" "$crm_work_directory/$owner-base.json"
+				env -i PATH="$PATH" "${base_image_env[@]}" "${image_env[@]}" docker compose --project-name winwidget --profile '*' \
+					--env-file "$env_file" --env-file "$services_repository/apps/$owner/.env.production" \
+					-f "$release_root/deploy/docker-compose.prod.yml" -f "$release_root/deploy/docker-compose.notification-reminders.yml" config --format json \
+					>"$crm_work_directory/$owner.json" 2>/dev/null || die 'CRM reminder reader Compose cannot be materialized safely.'
+			fi
 		done
 		env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$crm_env_file" \
 			-f "$release_root/deploy/docker-compose.crm.yml" config --format json >"$crm_work_directory/crm.json" 2>/dev/null || die 'CRM upgrade Compose cannot be materialized.'
+		if [[ "$crm_upgrade_reminders_contract" == task-reminders-v1 ]]; then
+			mv -- "$crm_work_directory/crm.json" "$crm_work_directory/crm-base.json"
+			env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$crm_env_file" \
+				-f "$release_root/deploy/docker-compose.crm.yml" -f "$release_root/deploy/docker-compose.crm-reminders.yml" config --format json \
+				>"$crm_work_directory/crm.json" 2>/dev/null || die 'CRM reminder Sales Compose cannot be materialized safely.'
+		fi
 		crm_upgrade_probe upgrade-prepare >"$crm_work_directory/plan.pending" || die 'CRM upgrade configuration changes more than the approved code/images.'
 		mv -- "$crm_work_directory/plan.pending" "$crm_work_directory/plan.json"
 		crm_upgrade_plan_hash="$(sha256sum "$crm_work_directory/plan.json" | awk '{print $1}')"
@@ -738,7 +760,9 @@ crm_upgrade_main() {
 			crm-access) names=(crm-access-worker crm-access-outbox-publisher crm-access-api) ;;
 			crm-customers) names=(crm-customers-api) ;;
 			notification-delivery) names=(notification-delivery-worker) ;;
-			crm-sales) names=(crm-sales-api) ;;
+			crm-sales)
+				names=(crm-sales-api)
+				[[ "$crm_upgrade_reminders_contract" != task-reminders-v1 ]] || names=(crm-sales-reminders crm-sales-api) ;;
 			crm-intake) names=(crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher crm-intake-api) ;;
 		esac
 		unit=companions; [[ "$owner" != crm-* ]] || unit=crm
@@ -778,5 +802,7 @@ crm_upgrade_main() {
 		crm_upgrade_probe upgrade-database-check "$owner" >/dev/null || die 'CRM final database continuity failed.'
 	done
 	crm_upgrade_fence
-	printf '%s\n' 'CRM steady-state code upgrade verified: 18 processes; existing database identities/ACL, neighbors and env preserved. No broker or product-gate mutations; queue and browser/payment checks remain separate.'
+	local process_count=18
+	[[ "$crm_upgrade_reminders_contract" != task-reminders-v1 ]] || process_count=19
+	printf '%s\n' "CRM steady-state code upgrade verified: $process_count processes; existing database identities/ACL, neighbors and env preserved. No broker or product-gate mutations; queue and browser/payment checks remain separate."
 }
