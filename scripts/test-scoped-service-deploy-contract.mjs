@@ -2849,6 +2849,37 @@ console.log('non_root_verifier_permissions=PASS');`
 	}
 })
 
+function imageOwnerInventorySetupFixture(image, volume, manifests, verifier) {
+	return {
+		args: [
+			'--interactive', '--user', '0:0', '--mount', `type=volume,src=${volume},dst=/fixture`,
+			'--env', `MANIFESTS=${JSON.stringify(manifests)}`, '--entrypoint', 'node', image, '-e', `
+const fs=require('node:fs'); fs.chmodSync('/fixture',0o700);
+fs.writeFileSync('/fixture/verifier.mjs',fs.readFileSync(0),{mode:0o444,flag:'wx'});
+fs.mkdirSync('/fixture/app'); fs.chmodSync('/fixture/app',0o777);
+fs.mkdirSync('/fixture/snapshots',{mode:0o700});
+for(const [name,value] of Object.entries(JSON.parse(process.env.MANIFESTS))) fs.writeFileSync('/fixture/snapshots/operations-manifest-'+name+'.json',JSON.stringify(value),{mode:0o600,flag:'wx'});`
+		],
+		input: verifier
+	}
+}
+
+test('image-owner fixture transfers exact verifier bytes through stdin with bounded argv', () => {
+	const actual = readFileSync(join(scriptsRoot, 'scoped-service-release.mjs'))
+	for (const verifier of [actual, Buffer.concat([actual, Buffer.alloc(256 * 1024, 35)])]) {
+		const fixture = imageOwnerInventorySetupFixture(`sha256:${envHash}`, 'synthetic-fixture', { before: {}, after: {} }, verifier)
+		assert.equal(fixture.input, verifier)
+		assert.ok(fixture.args.includes('--interactive'))
+		assert.ok(fixture.args.every(argument => Buffer.byteLength(argument) + 1 < 4096), 'fixture arguments stay well below the Linux per-string exec limit')
+		assert.ok(!fixture.args.some(argument => argument.includes('VERIFIER_BASE64') || argument.includes(verifier.toString('base64'))))
+		assert.match(fixture.args.at(-1), /fs\.writeFileSync\('\/fixture\/verifier\.mjs',fs\.readFileSync\(0\),\{mode:0o444,flag:'wx'\}\)/)
+		const received = spawnSync(process.execPath, ['-e', "const fs=require('node:fs'),crypto=require('node:crypto');process.stdout.write(crypto.createHash('sha256').update(fs.readFileSync(0)).digest('hex'))"], { input: fixture.input, encoding: 'utf8', timeout: 10000 })
+		assert.equal(received.error, undefined)
+		assert.equal(received.status, 0, received.stderr)
+		assert.equal(received.stdout, sha256(verifier))
+	}
+})
+
 test('real image-owner inventory crosses into root-only validation without weakening 0700/0600 permissions', { skip: !process.env.SCOPED_TEST_DOCKER_IMAGE }, () => {
 	const image = process.env.SCOPED_TEST_DOCKER_IMAGE
 	assert.match(image, /^(?:node(?::[a-z0-9.-]+)?@)?sha256:[a-f0-9]{64}$/)
@@ -2881,16 +2912,9 @@ test('real image-owner inventory crosses into root-only validation without weake
 		const publicMount = ['--mount', `type=bind,src=${join(directory, 'verifier.mjs')},dst=/run/scoped-verifier.mjs,readonly`]
 		const appMount = readonly => ['--mount', `type=bind,src=${join(directory, 'app')},dst=/app${readonly ? ',readonly' : ''}`]
 		const privateMount = ['--mount', `type=bind,src=${join(directory, 'snapshots')},dst=/run/scoped,readonly`]
-		const setup = docker([
-			'--user', '0:0', '--mount', `type=volume,src=${volume},dst=/fixture`,
-			'--env', `VERIFIER_BASE64=${readFileSync(join(scriptsRoot, 'scoped-service-release.mjs')).toString('base64')}`,
-			'--env', `MANIFESTS=${JSON.stringify(manifests)}`, '--entrypoint', 'node', image, '-e', `
-const fs=require('node:fs'); fs.chmodSync('/fixture',0o700);
-fs.writeFileSync('/fixture/verifier.mjs',Buffer.from(process.env.VERIFIER_BASE64,'base64'),{mode:0o444,flag:'wx'});
-fs.mkdirSync('/fixture/app'); fs.chmodSync('/fixture/app',0o777);
-fs.mkdirSync('/fixture/snapshots',{mode:0o700});
-for(const [name,value] of Object.entries(JSON.parse(process.env.MANIFESTS))) fs.writeFileSync('/fixture/snapshots/operations-manifest-'+name+'.json',JSON.stringify(value),{mode:0o600,flag:'wx'});`
-		])
+		const fixture = imageOwnerInventorySetupFixture(image, volume, manifests, readFileSync(join(scriptsRoot, 'scoped-service-release.mjs')))
+		const setup = docker(fixture.args, { input: fixture.input })
+		assert.equal(setup.error, undefined)
 		assert.equal(setup.status, 0, setup.stderr)
 		const ownerSetup = docker([
 			'--user', '1001:1001', ...appMount(false), '--env', `MIGRATIONS=${JSON.stringify(files)}`,
