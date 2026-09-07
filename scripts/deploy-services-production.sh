@@ -54,6 +54,7 @@ release_scope="${RELEASE_SCOPE:-all}"
 expected_live_revision="${EXPECTED_LIVE_REVISION:-}"
 expected_service_env_sha256="${EXPECTED_SERVICE_ENV_SHA256:-}"
 expected_crm_upgrade_baseline_sha256="${EXPECTED_CRM_UPGRADE_BASELINE_SHA256:-}"
+expected_operations_backup_baseline_sha256="${EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256:-}"
 expected_operations_revision="${EXPECTED_OPERATIONS_REVISION:-}"
 expected_operations_api_revision="${EXPECTED_OPERATIONS_API_REVISION:-}"
 expected_operations_env_sha256="${EXPECTED_OPERATIONS_ENV_SHA256:-}"
@@ -64,7 +65,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | billing-crm-commerce-acl)
+	identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | billing-crm-commerce-acl)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -82,6 +83,11 @@ case "$release_scope" in
 		fi ;;
 	*) die 'Unsupported production release scope.' ;;
 esac
+if [[ "$release_scope" == operations-backup-runtime ]]; then
+	[[ "$expected_operations_backup_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Operations backup release requires a fresh approved runtime baseline hash.'
+else
+	[[ -z "$expected_operations_backup_baseline_sha256" ]] || die 'Operations backup baseline authorization cannot be reused by another scope.'
+fi
 if [[ "$release_scope" == crm-upgrade ]]; then
 	[[ "$expected_crm_upgrade_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'CRM upgrade requires a fresh approved runtime baseline hash.'
 else
@@ -305,7 +311,8 @@ printf -v remote_controller_arguments ' %q' \
 	"$expected_operations_env_sha256" \
 	"$expected_support_env_sha256" \
 	"$expected_operations_api_revision" \
-	"$expected_crm_upgrade_baseline_sha256"
+	"$expected_crm_upgrade_baseline_sha256" \
+	"$expected_operations_backup_baseline_sha256"
 # The remote shell, not this local controller, must expand these variables.
 # shellcheck disable=SC2016
 remote_controller_command='set -euo pipefail
@@ -351,6 +358,7 @@ export expected_operations_env_sha256="${16}"
 export expected_support_env_sha256="${17}"
 export expected_operations_api_revision="${18}"
 export expected_crm_upgrade_baseline_sha256="${19}"
+export expected_operations_backup_baseline_sha256="${20}"
 
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'
@@ -1505,6 +1513,43 @@ try {
 	const operationsApi = services['operations-api'];
 	const operationsWorker = services['operations-worker'];
 	if (!restoreWorker || !operationsApi || !operationsWorker) fail();
+	// Backup-only endpoints; never extend databaseTargets or restore authority.
+	const crmBackupTargets = [
+		['CRM_ACCESS_BACKUP_URL', 'crm_access', '55442'],
+		['CRM_INTAKE_BACKUP_URL', 'crm_intake', '55443'],
+		['CRM_CUSTOMERS_BACKUP_URL', 'crm_customers', '55444'],
+		['CRM_SALES_BACKUP_URL', 'crm_sales', '55445']
+	];
+	for (const [key, schema, port] of crmBackupTargets) {
+		for (const [name, service] of Object.entries(services)) {
+			if (
+				Object.hasOwn(service.environment ?? {}, key) !==
+					(name === 'operations-worker')
+			) fail('CRM backup-only process boundary is invalid');
+		}
+		const value = operationsWorker.environment?.[key];
+		if (typeof value !== 'string' || !value) fail('CRM backup-only process boundary is invalid');
+		let url;
+		let principal;
+		try {
+			url = new URL(value);
+			principal = decodeURIComponent(url.username);
+		} catch {
+			fail('CRM backup-only process boundary is invalid');
+		}
+		if (
+			url.protocol !== 'postgresql:' ||
+			url.hostname !== '127.0.0.1' ||
+			url.port !== port ||
+			url.pathname !== `/winwidget_${schema}` ||
+			url.hash ||
+			!url.password ||
+			principal !== `winwidget_${schema}_backup` ||
+			url.searchParams.get('schema') !== schema ||
+			url.searchParams.get('sslmode') !== 'disable' ||
+			[...url.searchParams.keys()].sort().join(',') !== 'schema,sslmode'
+		) fail('CRM backup-only process boundary is invalid');
+	}
 	for (const name of [
 		'operations-api',
 		'operations-outbox-publisher',

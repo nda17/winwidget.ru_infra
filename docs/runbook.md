@@ -979,6 +979,46 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   автоматический откат запрещён — нужен совместимый fix-forward, не
   восстановление БД или потеря новых полей. Поэтому frontend с новым
   редактором выпускается только после успешного Platform rollout.
+- `operations-backup-runtime` — отдельный runtime-only выпуск четырёх процессов
+  Operations для четырёх новых backup-only целей CRM. Это **не** Notes scope:
+  bootstrap, migration runner, writer fence, restore activation, изменения
+  CRM runtime и соседних сервисов не выполняются. Требуются exact green SHA,
+  обычные root deploy-lock/immutable payload gates, byte-identical canonical
+  и Operations owner env, `expected_live_revision` текущего Operations API и
+  отдельный `expected_operations_backup_baseline_sha256`. Последний — свежий
+  SHA256 функции `operationsBackupFingerprint` из закреплённого verifier по
+  private Docker inspect всех running containers проектов `winwidget` и
+  `winwidget-crm`. Он фиксирует точные IDs/images/config, в том числе разные
+  ревизии четырёх Operations ролей, StartedAt/RestartCount и соседей. В workflow
+  передаётся только digest, не содержимое inspect/env.
+  Разрешённый env diff — `APP_REVISION` и только четыре новых worker-only ключа
+  `CRM_ACCESS_BACKUP_URL`, `CRM_INTAKE_BACKUP_URL`, `CRM_CUSTOMERS_BACKUP_URL`,
+  `CRM_SALES_BACKUP_URL`: `127.0.0.1:55442..55445`, собственные БД/schema и
+  `_backup` principals, ровно query `schema` + `sslmode=disable`. Они запрещены
+  в inherited image ENV, API, publisher и restore worker. Остальная runtime
+  конфигурация, включая root→gosu bootstrap maintenance-worker и его caps,
+  сохраняется. Существующие семь restore targets/keyring, Operations schema,
+  generated schema и миграционные файлы должны совпадать до/после; новый
+  backup manifest подписывает 11 целей и сохраняет семь прежних записей.
+  Один Operations image строится до остановки. Image inventories читаются
+  UID1001 без сети/private mounts/capabilities. Root/no-network input probe
+  выбирает только Operations migration URL и четыре backup URL; bounded
+  private stdin передаёт их UID1001 read-only probe без Docker ENV, argv,
+  signing key или полного owner env. PostgreSQL 18 identity/ledger/schema и
+  least-privilege CRM backup ACL проверяются до/после; SQL только read-only.
+  После повторного exact baseline и quiet проверки четыре старых процесса
+  мягко останавливаются, без SIGKILL. **Перед первым новым API** сохраняется
+  durable `.../scoped-releases/operations-backup-runtime/<sha>/admission.json`:
+  API тоже может создать ручное CRM backup-задание. Затем запускаются API,
+  publisher и restore worker; только после их health — maintenance-worker
+  с планировщиком. До admission можно возобновить лишь exact original stopped
+  IDs после проверки config/DB/соседей. После admission любая ошибка/тайм-аут —
+  `RECOVERY_REQUIRED`, исключительно совместимый fix-forward: старый runtime
+  автоматически не возвращается, protected snapshots/marker не удаляются.
+  Повторный запуск того же scope при existing admission требует отдельного
+  разбора, не удаления marker. Успешный postflight сохраняет `completed.json`.
+  Этот runtime health/ACL gate не доказывает реальные dump и Telegram delivery:
+  четыре успешных артефакта и доставки проверяются отдельно после activation.
 - `operations-runtime` — фаза A удаления административного Backlog. Только
   четыре Operations runtime, без вызова migration runner. Pending migration
   должна быть ровно `20260910110000_remove_admin_backlog`, предыдущий ledger —

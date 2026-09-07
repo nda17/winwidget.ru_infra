@@ -15,6 +15,7 @@ export const SCOPED_SERVICES = Object.freeze({
 	'workers-bootstrap-recovery': ['billing-api', 'billing-worker', 'billing-outbox-publisher', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker', 'support-worker', 'support-outbox-publisher'],
 	'identity-with-operations-manifest': ['identity-api', 'identity-worker', 'identity-outbox-publisher', 'operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-runtime': ['operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
+	'operations-backup-runtime': ['operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-backlog-backup': [],
 	'operations-backlog-finalize': [],
 	'gateway-remove-notes': ['api-gateway']
@@ -320,7 +321,7 @@ export function assertServiceConfiguration(service, live, image, allSecrets) {
 	assert.equal(duration(service.stop_grace_period), Number(live.Config.StopTimeout ?? 10) * 1e9);
 }
 
-export function prepareScopedCompose({ scope, revision, previousRevision, operationsPreviousRevision, operationsApiPreviousRevision, compose, live, image, operationsImage, supportImage }) {
+export function prepareScopedCompose({ scope, revision, previousRevision, operationsPreviousRevision, operationsApiPreviousRevision, compose, live, image, operationsImage, supportImage, backupBaseline, backupBaselineSha256 }) {
 	assert.ok(Object.hasOwn(SCOPED_SERVICES, scope));
 	assert.match(revision, /^[a-f0-9]{40}$/);
 	assert.match(previousRevision, /^[a-f0-9]{40}$/);
@@ -331,6 +332,13 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 	const targets = SCOPED_SERVICES[scope];
 	assert.ok(targets.length > 0);
 	assert.equal(live.length, targets.length);
+	if (scope === 'operations-backup-runtime') {
+		assert.match(backupBaselineSha256 ?? '', /^[a-f0-9]{64}$/);
+		assert.equal(operationsBackupFingerprint(backupBaseline), backupBaselineSha256);
+		assert.equal(operationsBackupFingerprint(live), operationsBackupFingerprint(backupBaseline.filter(item => item.Config.Labels['com.docker.compose.project'] === 'winwidget' && targets.includes(item.Config.Labels['com.docker.compose.service']))));
+		assertCrmBackupEnvironment(compose.services);
+		for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) assert.equal(Object.hasOwn(envObject(image.Config.Env), key), false);
+	}
 	const desired = { name: 'winwidget', services: {}, volumes: {}, secrets: {} };
 	const rollback = structuredClone(desired);
 	for (const name of targets) {
@@ -338,7 +346,9 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		const federation = scope === 'operations-federation-config';
 		const operationsApi = scope === 'operations-api-runtime';
 		const companion = scope === 'identity-with-operations-manifest' && name.startsWith('operations-');
-		const expectedPreviousRevision = companion ? (name === 'operations-api' && operationsApiPreviousRevision ? operationsApiPreviousRevision : operationsPreviousRevision) : previousRevision;
+		const backup = scope === 'operations-backup-runtime';
+		const expectedPreviousRevision = backup && name !== 'operations-api' ? live.find(item => item.Config.Labels['com.docker.compose.service'] === name)?.Config.Labels['org.opencontainers.image.revision']
+			: companion ? (name === 'operations-api' && operationsApiPreviousRevision ? operationsApiPreviousRevision : operationsPreviousRevision) : previousRevision;
 		const expectedImage = companion || (workers && name.startsWith('operations-')) ? operationsImage
 			: workers && name.startsWith('support-') ? supportImage : image;
 		assert.match(expectedPreviousRevision ?? '', /^[a-f0-9]{40}$/);
@@ -358,11 +368,17 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		assertServiceConfiguration(service, container, expectedImage, compose.secrets ?? {});
 		const before = envObject(container.Config.Env);
 		const after = Object.fromEntries(Object.entries(service.environment).map(([key, value]) => [key, String(value ?? '')]));
+		if (backup) {
+			assert.equal(new Set(container.Config.Env.map(row => row.slice(0, row.indexOf('=')))).size, container.Config.Env.length);
+			assert.equal(before.APP_REVISION, expectedPreviousRevision);
+			for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) assert.equal(Object.hasOwn(before, key), false);
+		}
 		if (scope === 'platform-marketing-runtime') {
 			assert.equal(name, 'platform-api'); assert.equal(before.APP_REVISION, previousRevision);
 			assert.equal(before.PLATFORM_PROCESS_ROLE, 'api'); assert.equal(after.PLATFORM_PROCESS_ROLE, 'api');
 		}
 		const inherited = envObject(expectedImage.Config.Env);
+		if (backup) for (const [key, value] of Object.entries(inherited)) if (!Object.hasOwn(after, key)) assert.equal(value, before[key]);
 		for (const [key, value] of Object.entries(before)) {
 			if (!Object.hasOwn(after, key)) assert.equal(inherited[key], value);
 		}
@@ -373,6 +389,9 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 				// One reviewed legacy configuration, not a general private-URL rewrite.
 				assert.equal(before[key], 'http://127.0.0.1:4401/internal/notification-delivery');
 				assert.equal(value, 'http://127.0.0.1:4401');
+			} else if (backup && name === 'operations-worker' && OPERATIONS_CRM_BACKUP_TARGETS.some(([backupKey]) => backupKey === key)) {
+				// Exactly the four validated backup-only additions; never a runtime URL.
+				assert.equal(Object.hasOwn(before, key), false);
 			} else if (key === 'APP_REVISION' && scope !== 'gateway-remove-notes') {
 				assert.equal(value, revision);
 			} else if (scope === 'identity-with-operations-manifest' && name === 'identity-api' && key === 'IDENTITY_LOGIN_OTP_ENABLED') {
@@ -389,7 +408,7 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 			assert.equal(revision, previousRevision);
 			assert.equal(after.NOTIFICATION_DELIVERY_INTERNAL_URL, 'http://127.0.0.1:4401');
 		}
-		if (operationsApi || federation || (companion && ['operations-api', 'operations-restore-worker'].includes(name)) || (workers && name === 'operations-restore-worker')) {
+		if (operationsApi || federation || ((companion || backup) && ['operations-api', 'operations-restore-worker'].includes(name)) || (workers && name === 'operations-restore-worker')) {
 			assert.equal(before.DATABASE_RESTORE_ENABLED, 'false');
 			assert.equal(after.DATABASE_RESTORE_ENABLED, 'false');
 		}
@@ -412,6 +431,105 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 	rollback.volumes = structuredClone(desired.volumes);
 	rollback.secrets = structuredClone(desired.secrets);
 	return { desired, rollback };
+}
+
+export const OPERATIONS_CRM_BACKUP_TARGETS = Object.freeze([
+	['CRM_ACCESS_BACKUP_URL', 'crm_access', '55442'],
+	['CRM_INTAKE_BACKUP_URL', 'crm_intake', '55443'],
+	['CRM_CUSTOMERS_BACKUP_URL', 'crm_customers', '55444'],
+	['CRM_SALES_BACKUP_URL', 'crm_sales', '55445']
+].map(Object.freeze));
+
+export function parseOperationsCrmBackupUrl(value, schema, port) {
+	assert.ok(typeof value === 'string' && value.length > 0 && value.length <= 4096);
+	assert.ok(OPERATIONS_CRM_BACKUP_TARGETS.some(target => target[1] === schema && target[2] === port));
+	const url = new URL(value);
+	assert.equal(url.protocol, 'postgresql:'); assert.equal(url.hostname, '127.0.0.1'); assert.equal(url.port, port);
+	assert.equal(url.pathname, `/winwidget_${schema}`); assert.equal(url.hash, ''); assert.ok(url.password);
+	assert.equal(decodeURIComponent(url.username), `winwidget_${schema}_backup`);
+	same([...url.searchParams.keys()].sort(), ['schema', 'sslmode']);
+	assert.equal(url.searchParams.get('schema'), schema); assert.equal(url.searchParams.get('sslmode'), 'disable');
+	return url;
+}
+
+export function assertCrmBackupEnvironment(services) {
+	assert.ok(services['operations-worker']);
+	for (const [key, schema, port] of OPERATIONS_CRM_BACKUP_TARGETS) {
+		for (const [name, service] of Object.entries(services)) assert.equal(Object.hasOwn(service.environment ?? {}, key), name === 'operations-worker');
+		parseOperationsCrmBackupUrl(services['operations-worker'].environment[key], schema, port);
+	}
+}
+
+// Exclude only volatile health-probe timestamps/output. Every configuration,
+// mount, immutable image and container identity stays in the approved digest.
+export function operationsBackupFingerprint(live, neighborsOnly = false) {
+	assert.ok(Array.isArray(live) && live.length > 0 && live.length <= 200);
+	const keys = new Set(), targetNames = new Set(), rows = [];
+	for (const item of live) {
+		const project = item.Config?.Labels?.['com.docker.compose.project'], name = item.Config?.Labels?.['com.docker.compose.service'];
+		assert.ok(['winwidget', 'winwidget-crm'].includes(project)); assert.match(name ?? '', /^[a-z][a-z0-9-]*$/);
+		const key = `${project}/${name}`; assert.equal(keys.has(key), false); keys.add(key);
+		const target = project === 'winwidget' && SCOPED_SERVICES['operations-backup-runtime'].includes(name);
+		if (target) targetNames.add(name);
+		if (neighborsOnly && target) continue;
+		assert.match(item.Id ?? '', /^[a-f0-9]{64}$/); assert.match(item.Image ?? '', /^sha256:[a-f0-9]{64}$/);
+		assert.equal(item.State?.Status, 'running'); assert.equal(item.State.Running, true); assert.equal(item.State?.Health?.Status, 'healthy');
+		assert.ok(Number.isSafeInteger(item.RestartCount) && item.RestartCount >= 0); assert.equal(typeof item.State.StartedAt, 'string'); assert.ok(Number.isFinite(Date.parse(item.State.StartedAt)));
+		if (target) assert.match(item.Config.Labels['org.opencontainers.image.revision'] ?? '', /^[a-f0-9]{40}$/);
+		rows.push({ key, id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: orderedMountInventory(item.Mounts), status: item.State.Status, running: item.State.Running, health: item.State.Health.Status, startedAt: item.State.StartedAt, restartCount: item.RestartCount });
+	}
+	if (!neighborsOnly) same([...targetNames].sort(), [...SCOPED_SERVICES['operations-backup-runtime']].sort());
+	rows.sort((a, b) => a.key.localeCompare(b.key, 'en'));
+	return sha256(JSON.stringify(rows));
+}
+
+export function operationsBackupImageInventory(root = '/app', generatedSchema) {
+	const manifestPath = join(root, 'restore-manifests/database-restore-migrations.json');
+	const manifestBytes = readFileSync(manifestPath), manifest = JSON.parse(manifestBytes);
+	same(Object.keys(manifest.targets).sort(), ['campaigns', 'identity', 'notification-delivery', 'platform', 'reporting', 'support', 'widgets']);
+	const value = { schemaVersion: 1, schemaSha256: sha256(readFileSync(join(root, 'prisma/schema.prisma'))),
+		generatedSchemaSha256: sha256(readFileSync(generatedSchema)), migrations: migrationFiles(join(root, 'prisma/migrations')),
+		restoreManifestSha256: sha256(manifestBytes), keyringSha256: sha256(readFileSync(join(root, 'restore-manifests/database-backup-provenance-public-keys.json'))) };
+	assert.equal(value.schemaSha256, value.generatedSchemaSha256);
+	return value;
+}
+
+export function assertOperationsBackupImagePair(before, after) {
+	same(Object.keys(before).sort(), ['generatedSchemaSha256', 'keyringSha256', 'migrations', 'restoreManifestSha256', 'schemaSha256', 'schemaVersion']);
+	assert.equal(before.schemaVersion, 1); assert.ok(before.migrations.length > 0);
+	for (const key of ['generatedSchemaSha256', 'keyringSha256', 'restoreManifestSha256', 'schemaSha256']) assert.match(before[key], /^[a-f0-9]{64}$/);
+	assert.equal(before.schemaSha256, before.generatedSchemaSha256);
+	for (const row of before.migrations) { same(Object.keys(row).sort(), ['checksum', 'name']); assert.match(row.name, /^\d{14}_[a-z0-9_]+$/); assert.match(row.checksum, /^[a-f0-9]{64}$/); }
+	same(before.migrations.map(row => row.name), [...new Set(before.migrations.map(row => row.name))].sort());
+	same(before, after);
+}
+
+export function assertOperationsBackupPostflight({ live, desired, image, revision }) {
+	const targets = SCOPED_SERVICES['operations-backup-runtime'];
+	assert.equal(live.length, targets.length); same(Object.keys(desired.services).sort(), [...targets].sort());
+	assertCrmBackupEnvironment(desired.services);
+	for (const name of targets) {
+		const found = live.filter(item => item.Config.Labels['com.docker.compose.service'] === name); assert.equal(found.length, 1);
+		const item = found[0], service = desired.services[name];
+		assert.equal(item.Config.Labels['com.docker.compose.project'], 'winwidget'); assert.equal(item.Config.Labels['org.opencontainers.image.revision'], revision);
+		assert.equal(item.Image, image.Id); assert.equal(item.State.Status, 'running'); assert.equal(item.State.Running, true); assert.equal(item.State.Health?.Status, 'healthy');
+		assertServiceConfiguration(service, item, image, desired.secrets);
+		const effective = envObject(item.Config.Env);
+		assert.equal(Object.keys(effective).length, item.Config.Env.length);
+		same(effective, { ...envObject(image.Config.Env), ...service.environment });
+		for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) assert.equal(Object.hasOwn(effective, key), name === 'operations-worker');
+	}
+}
+
+export function assertOperationsBackupOriginal(live, baseline) {
+	const original = baseline.filter(item => item.Config.Labels['com.docker.compose.project'] === 'winwidget' && SCOPED_SERVICES['operations-backup-runtime'].includes(item.Config.Labels['com.docker.compose.service']));
+	assert.equal(live.length, 4);
+	const normalized = live.map(item => {
+		const before = original.find(row => row.Id === item.Id); assert.ok(before);
+		assert.equal(item.State.Running, false); assert.equal(item.State.Pid, 0); assert.ok(['exited', 'created'].includes(item.State.Status));
+		return { ...item, State: before.State };
+	});
+	assert.equal(operationsBackupFingerprint(normalized), operationsBackupFingerprint(original));
 }
 
 export function assertIdentityManifestCompanion(before, after, identityFiles) {
@@ -1008,9 +1126,262 @@ async function databaseAction(action, owner) {
 	finally { await client.$disconnect(); clearTimeout(deadline); }
 }
 
+// Backup-only readonly preflight. Credentials never become argv, output or a
+// process environment; callers transport just this bounded envelope via stdin.
+const backupProbeRecord = (value, keys) => {
+	assert.ok(value && Object.getPrototypeOf(value) === Object.prototype);
+	same(Object.keys(value).sort(), [...keys].sort());
+	return value;
+};
+function operationsBackupProbeUrl(value, role) {
+	assert.ok(['migration', 'runtime'].includes(role));
+	assert.ok(typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\s\0]/.test(value));
+	const url = new URL(value);
+	assert.equal(url.protocol, 'postgresql:'); assert.equal(url.hostname, '127.0.0.1');
+	assert.equal(url.port, '55441'); assert.equal(url.pathname, '/winwidget_operations'); assert.equal(url.hash, '');
+	assert.equal(decodeURIComponent(url.username), `winwidget_operations_${role}`);
+	assert.ok(decodeURIComponent(url.password) && !/[\0\r\n]/.test(decodeURIComponent(url.password)));
+	const keys = [...url.searchParams.keys()]; assert.equal(new Set(keys).size, keys.length);
+	assert.ok(keys.every(key => ['schema', 'sslmode', 'connection_limit', 'pool_timeout', 'connect_timeout'].includes(key)));
+	assert.equal(url.searchParams.get('schema'), 'operations'); assert.equal(url.searchParams.get('sslmode'), 'disable');
+	for (const key of ['connection_limit', 'pool_timeout', 'connect_timeout'])
+		if (url.searchParams.has(key)) assert.match(url.searchParams.get(key), /^[1-9]\d{0,3}$/);
+	return url;
+}
+
+export function validateOperationsBackupProbeInput(value) {
+	try {
+		backupProbeRecord(value, ['schemaVersion', 'operationsMigrationUrl', 'crmBackupUrls']);
+		assert.equal(value.schemaVersion, 1);
+		assert.ok(Buffer.byteLength(JSON.stringify(value)) <= 32768);
+		operationsBackupProbeUrl(value.operationsMigrationUrl, 'migration');
+		const targets = OPERATIONS_CRM_BACKUP_TARGETS.map(([, schema]) => schema.replaceAll('_', '-'));
+		backupProbeRecord(value.crmBackupUrls, targets);
+		for (const [, schema, port] of OPERATIONS_CRM_BACKUP_TARGETS) {
+			const raw = value.crmBackupUrls[schema.replaceAll('_', '-')];
+			assert.ok(typeof raw === 'string' && !/[\s\0]/.test(raw));
+			const url = parseOperationsCrmBackupUrl(raw, schema, port);
+			assert.ok(decodeURIComponent(url.password) && !/[\0\r\n]/.test(decodeURIComponent(url.password)));
+		}
+		return structuredClone(value);
+	} catch { throw new Error('Invalid Operations backup probe input; private details suppressed'); }
+}
+
+export function createOperationsBackupProbeInput(ownerEnvBytes, desired) {
+	try {
+		assert.ok(typeof ownerEnvBytes === 'string' || Buffer.isBuffer(ownerEnvBytes));
+		assert.ok(Buffer.byteLength(ownerEnvBytes) <= 1048576);
+		const text = ownerEnvBytes.toString(); assert.ok(!text.includes('\0'));
+		const keys = new Set(); let migrationUrl;
+		for (const line of text.split(/\r?\n/)) {
+			if (!line.trim() || line.trimStart().startsWith('#')) continue;
+			const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line);
+			assert.ok(match && !keys.has(match[1])); keys.add(match[1]);
+			if (match[1] !== 'OPERATIONS_MIGRATION_DATABASE_URL') continue;
+			let value = match[2];
+			if (value.startsWith('"')) value = JSON.parse(value);
+			else if (value.startsWith("'")) { assert.ok(value.endsWith("'")); value = value.slice(1, -1); }
+			migrationUrl = value;
+		}
+		assertCrmBackupEnvironment(desired.services);
+		const migration = operationsBackupProbeUrl(migrationUrl, 'migration');
+		const runtime = operationsBackupProbeUrl(desired.services['operations-api'].environment.OPERATIONS_DATABASE_URL, 'runtime');
+		for (const key of ['protocol', 'hostname', 'port', 'pathname']) assert.equal(migration[key], runtime[key]);
+		const input = validateOperationsBackupProbeInput({ schemaVersion: 1, operationsMigrationUrl: migrationUrl,
+			crmBackupUrls: Object.fromEntries(OPERATIONS_CRM_BACKUP_TARGETS.map(([key, schema]) =>
+				[schema.replaceAll('_', '-'), desired.services['operations-worker'].environment[key]])) });
+		return Buffer.from(JSON.stringify(input));
+	} catch { throw new Error('Cannot prepare Operations backup probe input; private details suppressed'); }
+}
+
+async function assertBackupProbeSession(client, schema, role) {
+	assert.match(schema, /^(?:operations|crm_access|crm_intake|crm_customers|crm_sales)$/);
+	assert.ok(['migration', 'backup'].includes(role));
+	assert.equal((await client.$queryRawUnsafe('SHOW transaction_read_only'))[0]?.transaction_read_only, 'on');
+	assert.match((await client.$queryRawUnsafe('SHOW server_version_num'))[0]?.server_version_num ?? '', /^18\d{4}$/);
+	const identity = await client.$queryRawUnsafe(`SELECT current_database()::text AS database, current_user::text AS username,
+		session_user::text AS session_user, current_schema()::text AS schema, pg_is_in_recovery() AS recovery`);
+	same(identity, [{ database: `winwidget_${schema}`, username: `winwidget_${schema}_${role}`, session_user: `winwidget_${schema}_${role}`, schema, recovery: false }]);
+	const principals = await client.$queryRawUnsafe(`SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+		AND ${schema === 'operations' ? 'TRUE' : 'NOT rolinherit'} AND NOT rolreplication AND NOT rolbypassrls AS restricted,
+		NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member = roles.oid OR roleid = roles.oid) AS no_memberships,
+		(SELECT pg_get_userbyid(datdba) = 'winwidget_${schema}_${schema === 'operations' ? 'admin' : 'owner_admin'}' FROM pg_database WHERE datname = current_database()) AS database_owner_matches,
+		(SELECT pg_get_userbyid(nspowner) = 'winwidget_${schema}_migration' FROM pg_namespace WHERE nspname = '${schema}') AS schema_owner_matches,
+		has_database_privilege(current_user, current_database(), 'CONNECT') AS connect,
+		NOT has_database_privilege(current_user, current_database(), '${schema === 'operations' ? 'CREATE' : 'CREATE,TEMPORARY'}') AS no_database_ddl,
+		has_schema_privilege(current_user, '${schema}', 'USAGE') AS schema_usage,
+		has_schema_privilege(current_user, '${schema}', 'CREATE') AS schema_create
+		FROM pg_roles roles WHERE rolname = current_user`);
+	assert.equal(principals.length, 1);
+	const { no_memberships, ...principal } = principals[0];
+	same(principal, { restricted: true, database_owner_matches: true,
+		schema_owner_matches: true, connect: true, no_database_ddl: true, schema_usage: true, schema_create: role === 'migration' });
+	if (schema !== 'operations') assert.equal(no_memberships, true);
+	const serviceIdentity = await client.$queryRawUnsafe(`SELECT id, service_name, database_id::text AS database_id FROM "${schema}".service_identity`);
+	assert.equal(serviceIdentity.length, 1); assert.equal(serviceIdentity[0].id, 'singleton');
+	assert.equal(serviceIdentity[0].service_name, `${schema.replaceAll('_', '-')}-service`);
+	assert.match(serviceIdentity[0].database_id ?? '', /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+	return serviceIdentity[0].database_id;
+}
+
+// Pure transaction-level checks are exported for fake-query negative tests;
+// only the orchestrator below constructs real, bounded READ ONLY sessions.
+export async function verifyOperationsBackupDatabaseState(client, files) {
+	const databaseId = await assertBackupProbeSession(client, 'operations', 'migration');
+	const ledger = await client.$queryRawUnsafe('SELECT migration_name, checksum, finished_at, rolled_back_at FROM operations._prisma_migrations ORDER BY migration_name');
+	assertMigrationLedger(files, ledger, NOTES_MIGRATION, true);
+	const ledgerSha256 = sha256(JSON.stringify(ledger.map(row => ({ name: row.migration_name, checksum: row.checksum }))));
+	// Metadata is hashed inside PostgreSQL; neither application rows nor ACL
+	// contents leave this probe. Pending Notes migration is observed, not applied.
+	const metadata = await client.$queryRawUnsafe(`SELECT encode(sha256(convert_to(jsonb_build_object(
+		'schema', (SELECT jsonb_build_array(n.nspname, pg_get_userbyid(n.nspowner), n.nspacl::text) FROM pg_namespace n WHERE n.nspname='operations'),
+		'relations', (SELECT jsonb_agg(jsonb_build_array(c.relname, c.relkind, pg_get_userbyid(c.relowner), c.relacl::text, c.relrowsecurity, c.relforcerowsecurity) ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='operations'),
+		'columns', (SELECT jsonb_agg(jsonb_build_array(c.relname,a.attname,a.atttypid::text,a.atttypmod,a.attnotnull,a.attacl::text,a.attidentity,a.attgenerated,pg_get_expr(d.adbin,d.adrelid)) ORDER BY c.relname,a.attnum) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname='operations' AND a.attnum>0 AND NOT a.attisdropped),
+		'constraints', (SELECT jsonb_agg(jsonb_build_array(c.conname,pg_get_constraintdef(c.oid)) ORDER BY c.conname,c.conrelid) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='operations'),
+		'indexes', (SELECT jsonb_agg(jsonb_build_array(c.relname,pg_get_indexdef(c.oid)) ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='operations' AND c.relkind='i'),
+		'routines', (SELECT jsonb_agg(jsonb_build_array(p.oid::regprocedure::text,pg_get_userbyid(p.proowner),p.proacl::text,pg_get_functiondef(p.oid)) ORDER BY p.oid::regprocedure::text) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='operations'),
+		'types', (SELECT jsonb_agg(jsonb_build_array(t.typname,pg_get_userbyid(t.typowner),t.typacl::text,e.enumsortorder,e.enumlabel) ORDER BY t.typname,e.enumsortorder) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace LEFT JOIN pg_enum e ON e.enumtypid=t.oid WHERE n.nspname='operations' AND t.typtype='e'),
+		'defaults', (SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(d.defaclrole),d.defaclobjtype,d.defaclacl::text) ORDER BY d.defaclrole,d.defaclobjtype) FROM pg_default_acl d JOIN pg_namespace n ON n.oid=d.defaclnamespace WHERE n.nspname='operations')
+	)::text,'UTF8')),'hex') AS schema_sha256`);
+	assert.equal(metadata.length, 1); assert.match(metadata[0].schema_sha256 ?? '', /^[a-f0-9]{64}$/);
+	const counts = [];
+	for (const model of ['scheduledJobRun', 'outboxEvent', 'auditEventReceipt', 'integrationDeliveryReceipt'])
+		counts.push(await client[model].count({ where: { status: 'PROCESSING' } }));
+	counts.push(await client.databaseRestoreJob.count({ where: { OR: [{ status: { in: ['QUEUED', 'PROCESSING'] } }, { status: 'RECOVERY_REQUIRED', recoveryResolvedAt: null }] } }));
+	counts.push(await client.databaseRestorePermit.count({ where: { status: { in: ['PENDING_APPROVAL', 'APPROVED', 'CONSUMED'] } } }));
+	counts.push(await client.databaseRestoreRecoveryAction.count({ where: { status: { notIn: ['RESOLVED', 'EXPIRED'] } } }));
+	counts.push(await client.outboxEvent.count({ where: { eventType: { in: ['operations.database-restore.requested.v1', 'operations.database-restore.recovery-action.requested.v1'] }, status: { in: ['PENDING', 'PROCESSING'] } } }));
+	assert.ok(counts.every(count => Number.isSafeInteger(count) && count >= 0));
+	const lease = await client.databaseRestoreExecutionLease.findUnique({ where: { id: 'singleton' }, select: { operationType: true, operationId: true, leaseOwner: true, leaseToken: true } });
+	return { databaseId, ledgerSha256, schemaSha256: metadata[0].schema_sha256,
+		quiet: counts.every(count => count === 0) && (!lease || Object.values(lease).every(value => value === null)) };
+}
+
+export async function verifyOperationsCrmBackupDatabaseState(client, target, manifest) {
+	assert.ok(OPERATIONS_CRM_BACKUP_TARGETS.some(([, schema]) => schema.replaceAll('_', '-') === target));
+	const schema = target.replaceAll('-', '_'), owner = `winwidget_${schema}_migration`;
+	assert.equal(manifest.target, target);
+	assert.equal(manifest.manifestSha256, sha256(JSON.stringify({ schemaVersion: 1, target, migrations: manifest.migrations })));
+	const databaseId = await assertBackupProbeSession(client, schema, 'backup');
+	const ledger = await client.$queryRawUnsafe(`SELECT migration_name, checksum, finished_at, rolled_back_at FROM "${schema}"._prisma_migrations ORDER BY migration_name`);
+	same(ledger.map(row => ({ name: row.migration_name, checksum: row.checksum })), manifest.migrations);
+	assert.ok(ledger.length > 0 && ledger.every(row => row.finished_at && !row.rolled_back_at));
+	const foreign = await client.$queryRawUnsafe(`SELECT NOT has_schema_privilege(current_user,'public','USAGE,CREATE') AS no_public,
+		NOT has_database_privilege(current_user,'postgres','CONNECT') AND NOT has_database_privilege(current_user,'template1','CONNECT') AS no_foreign_database,
+		NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname NOT IN ('${schema}','information_schema') AND nspname !~ '^pg_' AND has_schema_privilege(current_user,oid,'USAGE,CREATE')) AS no_foreign_schema`);
+	same(foreign, [{ no_public: true, no_foreign_database: true, no_foreign_schema: true }]);
+	const relations = await client.$queryRawUnsafe(`SELECT c.relname AS name, c.relkind::text AS kind, pg_get_userbyid(c.relowner)::text AS owner,
+		c.relrowsecurity AS rls, c.relforcerowsecurity AS forced_rls,
+		CASE WHEN c.relkind='r' THEN has_table_privilege(current_user,c.oid,'SELECT') ELSE false END AS readable,
+		CASE WHEN c.relkind='r' THEN has_table_privilege(current_user,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') OR has_any_column_privilege(current_user,c.oid,'INSERT,UPDATE,REFERENCES') ELSE false END AS writable,
+		CASE WHEN c.relkind='S' THEN has_sequence_privilege(current_user,c.oid,'SELECT') ELSE false END AS sequence_readable,
+		CASE WHEN c.relkind='S' THEN has_sequence_privilege(current_user,c.oid,'USAGE,UPDATE') ELSE false END AS sequence_writable
+		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='${schema}' ORDER BY c.relname`);
+	assert.ok(relations.length > 2 && relations.length <= 1000);
+	assert.equal(new Set(relations.map(row => row.name)).size, relations.length);
+	for (const row of relations) {
+		assert.ok(['r', 'S', 'i'].includes(row.kind)); assert.equal(row.owner, owner);
+		assert.equal(row.rls, false); assert.equal(row.forced_rls, false);
+		assert.equal(row.readable, row.kind === 'r'); assert.equal(row.writable, false);
+		assert.equal(row.sequence_readable, row.kind === 'S'); assert.equal(row.sequence_writable, false);
+	}
+	for (const name of ['service_identity', '_prisma_migrations']) assert.ok(relations.some(row => row.name === name && row.kind === 'r'));
+	const enums = await client.$queryRawUnsafe(`SELECT t.typname AS name, pg_get_userbyid(t.typowner)::text AS owner, has_type_privilege(current_user,t.oid,'USAGE') AS usable FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='${schema}' AND t.typtype='e' ORDER BY t.typname`);
+	assert.ok(enums.length <= 100);
+	for (const row of enums) { assert.equal(row.owner, owner); assert.equal(row.usable, true); }
+	const routines = await client.$queryRawUnsafe(`SELECT p.proname AS name, pg_get_userbyid(p.proowner)::text AS owner,
+		p.pronargs::int AS args, p.prorettype='trigger'::regtype AS trigger, p.prosecdef AS security_definer,
+		has_function_privilege(current_user,p.oid,'EXECUTE') AS executable FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='${schema}' ORDER BY p.proname`);
+	assert.ok(routines.length <= 100);
+	for (const row of routines) { assert.equal(row.owner, owner); assert.equal(row.args, 0); assert.equal(row.trigger, true); assert.equal(row.security_definer, false); assert.equal(row.executable, false); }
+	return { target, databaseId, manifestSha256: manifest.manifestSha256 };
+}
+
+export async function verifyOperationsBackupDatabases(value) {
+	const input = validateOperationsBackupProbeInput(value);
+	assert.equal(process.getuid(), 1001);
+	const require = createRequire('/app/package.json');
+	const { PrismaClient } = require('@prisma/operations-client');
+	const { parseDatabaseBackupMigrationManifests } = require('/app/dist/src/maintenance/database-backup-migration-manifest.service.js');
+	const manifestPath = '/app/backup-manifests/database-backup-migrations.json';
+	const stat = lstatSync(manifestPath); assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && stat.size <= 2097152);
+	const manifests = parseDatabaseBackupMigrationManifests(JSON.parse(readFileSync(manifestPath, 'utf8')));
+	const probe = async (rawUrl, check) => {
+		const url = new URL(rawUrl);
+		url.searchParams.set('connection_limit', '1'); url.searchParams.set('connect_timeout', '5'); url.searchParams.set('pool_timeout', '5');
+		const client = new PrismaClient({ datasources: { db: { url: url.toString() } }, log: [] });
+		try {
+			return await client.$transaction(async tx => {
+				await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY');
+				await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '8s'");
+				await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '1s'");
+				return check(tx);
+			}, { isolationLevel: 'RepeatableRead', timeout: 10000, maxWait: 5000 });
+		} finally { await client.$disconnect(); }
+	};
+	const operations = await probe(input.operationsMigrationUrl, tx => verifyOperationsBackupDatabaseState(tx, migrationFiles('/app/prisma/migrations')));
+	const crm = [];
+	for (const [, schema] of OPERATIONS_CRM_BACKUP_TARGETS) {
+		const target = schema.replaceAll('_', '-');
+		crm.push(await probe(input.crmBackupUrls[target], tx => verifyOperationsCrmBackupDatabaseState(tx, target, manifests[target])));
+	}
+	return { operations, crm };
+}
+
 async function main() {
 	const action = process.argv[2];
-	if (action === 'platform-image-inventory') platformImageInventory(process.argv[3]);
+	if (action === 'operations-backup-fingerprint') {
+		assert.ok(['baseline', 'neighbors'].includes(process.argv[3]));
+		process.stdout.write(operationsBackupFingerprint(JSON.parse(rootFileBytes('/run/scoped/backup-inventory.json', 8 * 1024 * 1024)), process.argv[3] === 'neighbors'));
+	} else if (action === 'operations-backup-image') {
+		assert.equal(process.getuid(), 1001); assert.equal(process.getgid(), 1001); assert.ok(['legacy', 'candidate'].includes(process.argv[3]));
+		const require = createRequire('/app/package.json');
+		const inventory = operationsBackupImageInventory('/app', require.resolve('@prisma/operations-client/schema.prisma'));
+		if (process.argv[3] === 'candidate') {
+			const backup = JSON.parse(readFileSync('/app/backup-manifests/database-backup-migrations.json'));
+			const { parseDatabaseBackupMigrationManifests } = require('/app/dist/src/maintenance/database-backup-migration-manifest.service.js');
+			parseDatabaseBackupMigrationManifests(backup);
+			same(Object.keys(backup.targets).sort(), ['campaigns', 'crm-access', 'crm-customers', 'crm-intake', 'crm-sales', 'identity', 'notification-delivery', 'platform', 'reporting', 'support', 'widgets']);
+			const restore = JSON.parse(readFileSync('/app/restore-manifests/database-restore-migrations.json'));
+			for (const [target, value] of Object.entries(restore.targets)) same(backup.targets[target], value);
+		}
+		process.stdout.write(JSON.stringify(inventory));
+	} else if (action === 'operations-backup-image-pair') {
+		assertOperationsBackupImagePair(JSON.parse(rootFileBytes('/run/scoped/backup-image-before.json')), JSON.parse(rootFileBytes('/run/scoped/backup-image-after.json')));
+	} else if (action === 'operations-backup-input') {
+		process.stdout.write(createOperationsBackupProbeInput(rootFileBytes('/run/scoped-owner.env'), JSON.parse(rootFileBytes('/run/scoped/desired.json', 4 * 1024 * 1024))));
+	} else if (action === 'operations-backup-database') {
+		assert.equal(process.getuid(), 1001); assert.equal(process.getgid(), 1001);
+		let size = 0; const chunks = [];
+		for await (const chunk of process.stdin) { size += chunk.length; assert.ok(size <= 32768); chunks.push(chunk); }
+		assert.ok(size > 0);
+		const input = validateOperationsBackupProbeInput(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+		process.stdout.write(JSON.stringify(await verifyOperationsBackupDatabases(input)));
+	} else if (action === 'operations-backup-database-pair') {
+		assert.ok(['initial', 'quiet', 'active'].includes(process.argv[3]));
+		const current = JSON.parse(rootFileBytes('/run/scoped/backup-database-current.json'));
+		assert.equal(typeof current.operations.quiet, 'boolean');
+		if (process.argv[3] !== 'active') assert.equal(current.operations.quiet, true);
+		if (process.argv[3] !== 'initial') {
+			const before = JSON.parse(rootFileBytes('/run/scoped/backup-database-before.json'));
+			same({ ...current, operations: { ...current.operations, quiet: true } }, { ...before, operations: { ...before.operations, quiet: true } });
+		}
+	} else if (action === 'operations-backup-admission') {
+		assert.match(process.env.SCOPED_REVISION ?? '', /^[a-f0-9]{40}$/); assert.match(process.env.SCOPED_INFRA_REVISION ?? '', /^[a-f0-9]{40}$/);
+		assert.equal(operationsBackupFingerprint(JSON.parse(rootFileBytes('/run/scoped/backup-baseline.json', 8 * 1024 * 1024))), process.env.SCOPED_OPERATIONS_BACKUP_BASELINE_SHA256);
+		const result = { schemaVersion: 1, kind: 'winwidget.operations.backup-runtime-admission.v1', revision: process.env.SCOPED_REVISION, infraRevision: process.env.SCOPED_INFRA_REVISION,
+			baselineSha256: process.env.SCOPED_OPERATIONS_BACKUP_BASELINE_SHA256, imageId: JSON.parse(rootFileBytes('/run/scoped/image.json'))[0].Id,
+			database: JSON.parse(rootFileBytes('/run/scoped/backup-database-current.json')), admittedAt: new Date().toISOString(), recovery: 'FORWARD_ONLY' };
+		writeFileSync('/run/scoped/backup-admission.json', JSON.stringify(result), { mode: 0o600, flag: 'wx' });
+	} else if (action === 'operations-backup-postflight') {
+		assertOperationsBackupPostflight({ live: JSON.parse(rootFileBytes('/run/scoped/backup-postflight.json', 4 * 1024 * 1024)), desired: JSON.parse(rootFileBytes('/run/scoped/desired.json', 4 * 1024 * 1024)), image: JSON.parse(rootFileBytes('/run/scoped/image.json'))[0], revision: process.env.SCOPED_REVISION });
+	} else if (action === 'operations-backup-original') {
+		assertOperationsBackupOriginal(JSON.parse(rootFileBytes('/run/scoped/backup-original.json', 4 * 1024 * 1024)), JSON.parse(rootFileBytes('/run/scoped/backup-baseline.json', 8 * 1024 * 1024)));
+	} else if (action === 'operations-backup-complete') {
+		const admission = JSON.parse(rootFileBytes('/run/scoped/backup-admission.json'));
+		assert.equal(admission.revision, process.env.SCOPED_REVISION);
+		writeFileSync('/run/scoped/backup-completed.json', JSON.stringify({ ...admission, kind: 'winwidget.operations.backup-runtime-completed.v1', completedAt: new Date().toISOString() }), { mode: 0o600, flag: 'wx' });
+	} else if (action === 'platform-image-inventory') platformImageInventory(process.argv[3]);
 	else if (action === 'platform-http') await verifyPlatformHttp(process.argv[3]);
 	else if (action === 'platform-database') await platformDatabaseAction();
 	else if (action === 'platform-neighbors') process.stdout.write(platformNeighborFingerprint(JSON.parse(rootFileBytes('/run/scoped/platform-neighbors.json'))));
@@ -1094,6 +1465,8 @@ async function main() {
 			previousRevision: process.env.SCOPED_PREVIOUS_REVISION,
 			operationsPreviousRevision: process.env.SCOPED_OPERATIONS_PREVIOUS_REVISION,
 			operationsApiPreviousRevision: process.env.SCOPED_OPERATIONS_API_PREVIOUS_REVISION,
+			backupBaseline: process.env.SCOPED_SCOPE === 'operations-backup-runtime' ? JSON.parse(rootFileBytes('/run/scoped/backup-baseline.json', 8 * 1024 * 1024)) : undefined,
+			backupBaselineSha256: process.env.SCOPED_OPERATIONS_BACKUP_BASELINE_SHA256,
 			compose: JSON.parse(readFileSync('/run/scoped/compose.json', 'utf8')),
 			live: JSON.parse(readFileSync('/run/scoped/live.json', 'utf8')),
 			image: JSON.parse(readFileSync('/run/scoped/image.json', 'utf8'))[0],

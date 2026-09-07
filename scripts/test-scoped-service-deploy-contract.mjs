@@ -11,6 +11,12 @@ import {
 	NOTES_MIGRATION,
 	OTP_MIGRATION,
 	SCOPED_SERVICES,
+	OPERATIONS_CRM_BACKUP_TARGETS,
+	operationsBackupFingerprint,
+	parseOperationsCrmBackupUrl,
+	assertOperationsBackupImagePair,
+	assertOperationsBackupOriginal,
+	assertOperationsBackupPostflight,
 	OPERATIONS_API_PHASE_A_SHA256,
 	OPERATIONS_API_SOURCE_PATHS,
 	PLATFORM_MARKETING_SOURCE,
@@ -54,6 +60,7 @@ const identityScope = 'identity-with-operations-manifest'
 const workerScope = 'workers-bootstrap-recovery'
 const apiScope = 'operations-api-runtime'
 const platformScope = 'platform-marketing-runtime'
+const backupRuntimeScope = 'operations-backup-runtime'
 
 function platformInventoryFixture() {
 	return {
@@ -459,6 +466,147 @@ test('Operations finalization rejects a missing restore proof or a stale phase-A
 	}
 })
 
+const crmBackupTargets = [
+	['CRM_ACCESS_BACKUP_URL', 'crm_access', '55442'],
+	['CRM_INTAKE_BACKUP_URL', 'crm_intake', '55443'],
+	['CRM_CUSTOMERS_BACKUP_URL', 'crm_customers', '55444'],
+	['CRM_SALES_BACKUP_URL', 'crm_sales', '55445']
+]
+
+function productionBackupComposeFixture() {
+	const restoreTargets = [
+		['notification-delivery', 'NOTIFICATION_DELIVERY', '55432'], ['campaigns', 'CAMPAIGNS', '55433'],
+		['reporting', 'REPORTING', '55435'], ['widgets', 'WIDGETS', '55436'], ['identity', 'IDENTITY', '55438'],
+		['platform', 'PLATFORM', '55439'], ['support', 'SUPPORT', '55440']
+	]
+	const staging = '/var/lib/winwidget-operations/restore-staging', sealed = '/var/lib/winwidget-operations/restore-sealed'
+	const receiptEnvironment = { DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64: Buffer.alloc(32, 7).toString('base64'), DATABASE_RESTORE_RECEIPT_HMAC_KEY_ID: 'synthetic-only' }
+	const secrets = Object.fromEntries([...restoreTargets.map(([slug]) => slug), 'billing', 'operations']
+		.map(slug => [`${slug}-postgres-admin-password`, { file: `/synthetic/${slug}-password` }]))
+	secrets['database-backup-provenance-private-key'] = { file: '/opt/winwidget/deploy/backend/.database-backup-provenance-private-key.pem' }
+	const services = Object.fromEntries(['operations-api', 'operations-outbox-publisher', 'operations-migrate', 'operations-restore-worker',
+		'operations-worker', 'notification-delivery-worker', 'identity-api', 'support-api', 'support-worker'].map(name => [name, { environment: {} }]))
+	for (const name of ['notification-delivery-worker', 'identity-api', 'support-api', 'support-worker', 'operations-worker']) {
+		services[name].environment.TELEGRAM_API_BASE_URL = 'https://tg.winwidget.ru/telegram-api'
+		services[name].extra_hosts = ['tg.winwidget.ru=185.184.122.62']
+	}
+	for (const name of ['support-api', 'support-worker']) services[name].environment.TELEGRAM_API_PROXY_IP = '185.184.122.62'
+	services['operations-api'] = {
+		environment: { ...receiptEnvironment, TELEGRAM_INFO_BOT_CONFIGURED: 'true', DATABASE_RESTORE_ENABLED: 'false', DATABASE_RESTORE_STAGING_DIR: staging },
+		volumes: [{ type: 'bind', source: staging, target: staging }]
+	}
+	const restore = services['operations-restore-worker']
+	restore.environment = {
+		...receiptEnvironment, APP_REVISION: revision, NODE_ENV: 'production', MODE: 'production',
+		OPERATIONS_DATABASE_URL: 'synthetic-only', OPERATIONS_LISTEN_HOST: '127.0.0.1', OPERATIONS_RESTORE_WORKER_PORT: '5203', OPERATIONS_PROCESS_ROLE: 'restore-worker',
+		RABBITMQ_URL: 'amqp://winwidget-operations-restore-worker:synthetic-only@127.0.0.1/winwidget', RABBITMQ_CONNECTION_NAME: 'winwidget-operations-restore-worker',
+		RABBITMQ_ASSERT_TOPOLOGY: 'true', RABBITMQ_MAX_MESSAGE_BYTES: '262144', DATABASE_RESTORE_STAGING_DIR: staging,
+		DATABASE_RESTORE_SEALED_DIR: sealed, DATABASE_RESTORE_ARTIFACT_RETENTION_HOURS: '168', DATABASE_RESTORE_ENABLED: 'false'
+	}
+	for (const [slug, prefix, port] of restoreTargets) Object.assign(restore.environment, {
+		[`${prefix}_POSTGRES_ADMIN_USER`]: 'synthetic-only', [`${prefix}_POSTGRES_PORT`]: port,
+		[`DATABASE_RESTORE_${prefix}_ADMIN_PASSWORD_FILE`]: `/run/secrets/database-restore-${slug}-admin-password`
+	})
+	Object.assign(restore, {
+		labels: { 'com.winwidget.singleton': 'true' }, deploy: { replicas: 1 }, read_only: true, init: true,
+		security_opt: ['no-new-privileges:true'], cap_drop: ['ALL'], tmpfs: ['/tmp:size=64m,mode=1777,noexec,nosuid,nodev'],
+		secrets: restoreTargets.map(([slug]) => ({ source: `${slug}-postgres-admin-password`, target: `database-restore-${slug}-admin-password` })),
+		volumes: [staging, sealed].map(path => ({ type: 'bind', source: path, target: path })),
+		depends_on: { rabbitmq: { condition: 'service_healthy' }, 'operations-outbox-publisher': { condition: 'service_started' } },
+		healthcheck: { test: ['CMD', 'node', 'OPERATIONS_RESTORE_WORKER_PORT||5203'] }, stop_grace_period: '1m30s', restart: 'unless-stopped'
+	})
+	const worker = services['operations-worker']
+	Object.assign(worker.environment, {
+		DATABASE_BACKUP_PROVENANCE_KEY_ID: 'operations-backup-ed25519-2026-08-31',
+		DATABASE_BACKUP_PROVENANCE_PRIVATE_KEY_FILE: '/run/winwidget-operations-secrets/database-backup-provenance-private-key.pem',
+		...Object.fromEntries(crmBackupTargets.map(([key, schema, port]) => [key,
+			`postgresql://winwidget_${schema}_backup:synthetic%40only%3Apassword@127.0.0.1:${port}/winwidget_${schema}?schema=${schema}&sslmode=disable`]))
+	})
+	Object.assign(worker, {
+		user: '0:0', read_only: true, security_opt: ['no-new-privileges:true'], cap_drop: ['ALL'], cap_add: ['CHOWN', 'SETGID', 'SETUID'],
+		tmpfs: ['/tmp:size=64m,mode=1777,noexec,nosuid,nodev', '/run/winwidget-operations-secrets:size=64k,mode=0700,uid=0,gid=0,noexec,nosuid,nodev'],
+		healthcheck: { test: ['CMD', 'gosu', 'operations:nodejs', 'node', '-e', 'synthetic-only'] },
+		secrets: [{ source: 'database-backup-provenance-private-key', target: 'database-backup-provenance-private-key-source' }]
+	})
+	return { services, secrets }
+}
+
+function validateProductionBackupCompose(config) {
+	const source = readFileSync(controllerPath, 'utf8')
+	const match = source.match(/<<'COMPOSE_CONTRACT' \|\| true\n([\s\S]*?)\nCOMPOSE_CONTRACT/)
+	assert.ok(match, 'execute the actual complete production Compose validator, not a replacement')
+	return spawnSync(process.execPath, ['-e', match[1]], {
+		input: JSON.stringify(config), encoding: 'utf8', timeout: 5000,
+		env: { EXPECTED_SERVICES_REVISION: revision }
+	})
+}
+
+test('production backup boundary admits four CRM-only worker URLs and preserves seven restore targets', () => {
+	const fixture = productionBackupComposeFixture(), before = structuredClone(fixture)
+	const result = validateProductionBackupCompose(fixture)
+	assert.equal(result.error, undefined)
+	assert.equal(result.status, 0, result.stderr)
+	assert.equal(result.stdout, 'false')
+	assert.deepEqual(fixture, before, 'validation cannot rewrite the configuration')
+	assert.equal(fixture.services['operations-restore-worker'].secrets.length, 7)
+	assert.equal(Object.keys(fixture.secrets).filter(key => key.startsWith('crm-')).length, 0)
+	for (const [key] of crmBackupTargets) {
+		const reordered = structuredClone(fixture), url = new URL(reordered.services['operations-worker'].environment[key])
+		url.search = `?sslmode=disable&schema=${url.searchParams.get('schema')}`
+		reordered.services['operations-worker'].environment[key] = url.toString()
+		assert.equal(validateProductionBackupCompose(reordered).status, 0)
+	}
+})
+
+test('production backup boundary rejects missing malformed changed or privileged CRM URLs without printing credentials', () => {
+	for (const [key, schema, port] of crmBackupTargets) {
+		const baseline = productionBackupComposeFixture(), valid = baseline.services['operations-worker'].environment[key]
+		const invalid = [undefined, null, '', 17, 'not-a-url', valid.replace('postgresql:', 'postgres:'), valid.replace('postgresql:', 'https:'),
+			valid.replace('127.0.0.1', 'localhost'), valid.replace('127.0.0.1', '192.0.2.1'), valid.replace(port, '5432'),
+			valid.replace(`/winwidget_${schema}?`, '/winwidget_other?'), valid.replace('_backup:', '_runtime:'), valid.replace('_backup:', '_migration:'),
+			valid.replace('_backup:', '_owner_admin:'), valid.replace('winwidget_', 'winwidget_%ZZ'), valid.replace(':synthetic%40only%3Apassword@', '@'),
+			valid.replace(`schema=${schema}`, 'schema=public'), valid.replace(`schema=${schema}&`, ''), valid.replace('&sslmode=disable', ''),
+			valid.replace('sslmode=disable', 'sslmode=require'), ...['#fragment', '&schema=' + schema, '&%73chema=' + schema, '&sslmode=disable',
+				'&user=owner', '&dbname=other', '&host=192.0.2.1', '&port=5432', '&password=other', '&options=-csearch_path=public', '&connection_limit=1']
+				.map(suffix => valid + suffix)]
+		for (const value of invalid) {
+			const fixture = structuredClone(baseline)
+			if (value === undefined) delete fixture.services['operations-worker'].environment[key]
+			else fixture.services['operations-worker'].environment[key] = value
+			const result = validateProductionBackupCompose(fixture)
+			assert.equal(result.status, 1, `invalid ${key} must fail closed`)
+			assert.equal(result.stdout, '')
+			assert.match(result.stderr, /CRM backup-only process boundary is invalid/)
+			assert.doesNotMatch(result.stderr, /synthetic|postgresql:\/\/|%40only|192\.0\.2\.1/)
+		}
+	}
+})
+
+test('production backup boundary forbids every CRM credential in all other processes including unknown neighbors', () => {
+	const baseline = productionBackupComposeFixture()
+	baseline.services['crm-access-worker'] = { environment: {} }
+	baseline.services['unrelated-neighbor'] = { environment: {} }
+	for (const name of Object.keys(baseline.services).filter(name => name !== 'operations-worker')) {
+		for (const [key] of crmBackupTargets) {
+			const fixture = structuredClone(baseline)
+			fixture.services[name].environment[key] = fixture.services['operations-worker'].environment[key]
+			assert.equal(validateProductionBackupCompose(fixture).status, 1, `${name} must not receive ${key}`)
+		}
+	}
+})
+
+test('production backup additions do not permit CRM restore roles mounts or changed restore flags', () => {
+	for (const mutate of [
+		value => { value.secrets['crm-access-postgres-admin-password'] = { file: '/synthetic/crm-admin' } },
+		value => { value.services['operations-restore-worker'].environment.DATABASE_RESTORE_CRM_ACCESS_ADMIN_PASSWORD_FILE = '/run/secrets/crm-admin' },
+		value => { value.services['operations-restore-worker'].secrets.push({ source: 'crm-access-postgres-admin-password', target: 'database-restore-crm-access-admin-password' }) },
+		value => { value.services['operations-restore-worker'].environment.DATABASE_RESTORE_ENABLED = 'true' }
+	]) {
+		const fixture = productionBackupComposeFixture(); mutate(fixture)
+		assert.equal(validateProductionBackupCompose(fixture).status, 1)
+	}
+})
+
 function composeFixture(scope = identityScope) {
 	const image = {
 		Id: `sha256:${'d'.repeat(64)}`,
@@ -519,6 +667,264 @@ function composeFixture(scope = identityScope) {
 	const supportImage = { ...structuredClone(image), Id: `sha256:${'1'.repeat(64)}` }
 	return { scope, revision, previousRevision: oldRevision, operationsPreviousRevision: oldRevision, compose: { services }, live, image, operationsImage, supportImage }
 }
+
+function backupRuntimeFixture() {
+	const input = composeFixture(backupRuntimeScope)
+	for (const item of input.live) {
+		item.State = { ...item.State, Running: true, Pid: 100, StartedAt: '2026-09-07T01:00:00.000Z' }
+		item.RestartCount = 0
+		const name = item.Config.Labels['com.docker.compose.service']
+		if (name !== 'operations-api') {
+			item.Config.Labels['org.opencontainers.image.revision'] = 'f'.repeat(40)
+			item.Config.Env = item.Config.Env.map(row => row.startsWith('APP_REVISION=') ? `APP_REVISION=${'f'.repeat(40)}` : row)
+		}
+		if (['operations-api', 'operations-restore-worker'].includes(name)) {
+			input.compose.services[name].environment.DATABASE_RESTORE_ENABLED = 'false'
+			item.Config.Env.push('DATABASE_RESTORE_ENABLED=false')
+		}
+	}
+	for (const [key, schema, port] of OPERATIONS_CRM_BACKUP_TARGETS) input.compose.services['operations-worker'].environment[key] = `postgresql://winwidget_${schema}_backup:synthetic@127.0.0.1:${port}/winwidget_${schema}?schema=${schema}&sslmode=disable`
+	const neighbor = structuredClone(input.live[0])
+	neighbor.Id = '9'.repeat(64)
+	neighbor.Config.Labels['com.docker.compose.project'] = 'winwidget-crm'
+	neighbor.Config.Labels['com.docker.compose.service'] = 'crm-sales-api'
+	input.backupBaseline = [...structuredClone(input.live), neighbor]
+	input.backupBaselineSha256 = operationsBackupFingerprint(input.backupBaseline)
+	return input
+}
+
+test('backup runtime admits only four Operations processes with mixed approved revisions and worker-only URLs', () => {
+	const input = backupRuntimeFixture(), { desired, rollback } = prepareScopedCompose(input)
+	assert.deepEqual(Object.keys(desired.services), SCOPED_SERVICES[backupRuntimeScope])
+	for (const name of SCOPED_SERVICES[backupRuntimeScope]) {
+		assert.equal(desired.services[name].image, input.image.Id)
+		for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) {
+			assert.equal(Object.hasOwn(desired.services[name].environment, key), name === 'operations-worker')
+			assert.equal(Object.hasOwn(rollback.services[name].environment, key), false)
+		}
+	}
+	assert.equal(rollback.services['operations-worker'].environment.APP_REVISION, 'f'.repeat(40))
+})
+
+test('backup runtime fails closed on baseline, role, inherited credentials, restore, URL or unrelated config changes', () => {
+	for (const mutate of [
+		input => { input.backupBaselineSha256 = '0'.repeat(64) },
+		input => { input.live[1].Id = '8'.repeat(64) },
+		input => { input.live[1].Config.Env.push('UNAPPROVED=1') },
+		input => { input.compose.services['operations-api'].environment.CRM_ACCESS_BACKUP_URL = input.compose.services['operations-worker'].environment.CRM_ACCESS_BACKUP_URL },
+		input => { input.image.Config.Env.push(`CRM_ACCESS_BACKUP_URL=${input.compose.services['operations-worker'].environment.CRM_ACCESS_BACKUP_URL}`) },
+		input => { input.image.Config.Env.push('UNAPPROVED=1') },
+		input => { input.compose.services['operations-api'].environment.DATABASE_RESTORE_ENABLED = 'true' },
+		input => { input.compose.services['operations-worker'].environment.EXTRA = '1' },
+		input => { input.compose.services['operations-worker'].cap_add = ['SYS_ADMIN'] },
+		input => { input.compose.services['operations-worker'].environment.CRM_ACCESS_BACKUP_URL += '&user=postgres' },
+		input => { delete input.compose.services['operations-worker'].environment.CRM_SALES_BACKUP_URL }
+	]) assert.throws(() => { const input = backupRuntimeFixture(); mutate(input); prepareScopedCompose(input) })
+	for (const [, schema, port] of OPERATIONS_CRM_BACKUP_TARGETS) {
+		const valid = `postgresql://winwidget_${schema}_backup:synthetic@127.0.0.1:${port}/winwidget_${schema}?schema=${schema}&sslmode=disable`
+		assert.doesNotThrow(() => parseOperationsCrmBackupUrl(valid, schema, port))
+		for (const invalid of [valid.replace('_backup:', '_runtime:'), valid.replace('127.0.0.1', 'localhost'), valid.replace(port, '5432'), `${valid}&sslmode=disable`, `${valid}&schema=public`, `${valid}#fragment`, valid.replace(':synthetic@', '@')]) assert.throws(() => parseOperationsCrmBackupUrl(invalid, schema, port))
+	}
+})
+
+test('backup baseline ignores only health-probe noise and mount ordering, never neighbor restarts or configuration', () => {
+	const { backupBaseline: live } = backupRuntimeFixture(), fingerprint = operationsBackupFingerprint(live)
+	const noise = structuredClone(live)
+	noise.reverse(); noise[0].State.Health.Log = [{ Output: 'volatile', End: new Date().toISOString() }]
+	assert.equal(operationsBackupFingerprint(noise), fingerprint)
+	for (const mutate of [item => { item.Id = '8'.repeat(64) }, item => { item.Image = `sha256:${'0'.repeat(64)}` }, item => { item.RestartCount += 1 }, item => { item.State.StartedAt = '2026-09-07T02:00:00.000Z' }, item => { item.Config.Env.push('EXTRA=1') }, item => { item.HostConfig.ReadonlyRootfs = true }]) {
+		const changed = structuredClone(live); mutate(changed.at(-1))
+		assert.notEqual(operationsBackupFingerprint(changed), fingerprint)
+		assert.notEqual(operationsBackupFingerprint(changed, true), operationsBackupFingerprint(live, true))
+	}
+	const stopped = structuredClone(live); stopped.at(-1).State.Running = false
+	assert.throws(() => operationsBackupFingerprint(stopped))
+})
+
+test('backup rollout preserves schema, migration inventory, existing seven-target trust and original rollback identities', () => {
+	const image = { schemaVersion: 1, schemaSha256: envHash, generatedSchemaSha256: envHash, restoreManifestSha256: envHash, keyringSha256: envHash, migrations: [{ name: NOTES_MIGRATION, checksum: envHash }] }
+	assert.doesNotThrow(() => assertOperationsBackupImagePair(image, structuredClone(image)))
+	for (const key of ['schemaSha256', 'generatedSchemaSha256', 'restoreManifestSha256', 'keyringSha256', 'migrations']) {
+		const changed = structuredClone(image); changed[key] = key === 'migrations' ? [] : '0'.repeat(64)
+		assert.throws(() => assertOperationsBackupImagePair(image, changed))
+	}
+	const input = backupRuntimeFixture(), stopped = structuredClone(input.live)
+	for (const item of stopped) item.State = { ...item.State, Running: false, Pid: 0, Status: 'exited' }
+	assert.doesNotThrow(() => assertOperationsBackupOriginal(stopped, input.backupBaseline))
+	stopped[0].Image = `sha256:${'0'.repeat(64)}`
+	assert.throws(() => assertOperationsBackupOriginal(stopped, input.backupBaseline))
+})
+
+test('backup postflight checks effective environment and exact new images on every role', () => {
+	const input = backupRuntimeFixture(), { desired } = prepareScopedCompose(input)
+	const live = structuredClone(input.live)
+	for (const item of live) {
+		const service = desired.services[item.Config.Labels['com.docker.compose.service']]
+		item.Image = input.image.Id; item.Config.Labels['org.opencontainers.image.revision'] = revision
+		item.Config.Env = [...input.image.Config.Env, ...Object.entries(service.environment).map(([key, value]) => `${key}=${value}`)]
+	}
+	assert.doesNotThrow(() => assertOperationsBackupPostflight({ ...input, live, desired }))
+	live[0].Config.Env.push(`CRM_ACCESS_BACKUP_URL=${desired.services['operations-worker'].environment.CRM_ACCESS_BACKUP_URL}`)
+	assert.throws(() => assertOperationsBackupPostflight({ ...input, live, desired }))
+})
+
+function runBackupRuntimeShell(scenario = 'success', probeOnly = false, resumeOnly = false) {
+	const directory = mkdtempSync(join(tmpdir(), 'winwidget-backup-scope-'))
+	try {
+		const script = String.raw`
+set -euo pipefail
+source "$TEST_SCOPED_SCRIPT"
+exec 3>&2
+scoped_diagnostic_fd=3
+app_root="$TEST_DIRECTORY"
+scoped_work_directory="$app_root/work"
+scoped_payload_directory="$app_root/payload"
+scoped_owner_env="$app_root/owner.env"
+release_root="$app_root/source"
+release_scope=operations-backup-runtime
+services_revision="$TEST_REVISION"
+infra_revision="$TEST_REVISION"
+expected_live_revision="$TEST_OLD_REVISION"
+expected_operations_backup_baseline_sha256="$TEST_HASH"
+scoped_image_id="sha256:$TEST_HASH"
+scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker)
+mkdir -p "$scoped_work_directory" "$app_root/deploy/backend"
+scoped_cutover_started=false
+scoped_fence_started=false
+event() { printf '%s\n' "$*" >>"$TEST_TRACE"; }
+die() { printf '%s\n' "$1" >&2; exit 1; }
+cleanup_scoped_payload() { event payload-cleanup; }
+assert_root_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+scoped_container_id() { local n; case "$1" in operations-api) n=1;; operations-worker) n=2;; operations-outbox-publisher) n=3;; operations-restore-worker) n=4;; esac; printf '%064d\n' "$n"; }
+docker() {
+  event "docker $*"
+  case "$1 $2" in
+    'ps --all')
+      if [[ "$TEST_SCENARIO" == resume-wrong-id && "$*" == *service=operations-api* ]]; then printf '%064d\n' 8; return; fi
+      case "$*" in *service=operations-api*) scoped_container_id operations-api;; *service=operations-worker*) scoped_container_id operations-worker;; *service=operations-outbox-publisher*) scoped_container_id operations-outbox-publisher;; *service=operations-restore-worker*) scoped_container_id operations-restore-worker;; esac;;
+    'image inspect') printf 'sha256:%s %s\n' "$TEST_HASH" "$TEST_REVISION";;
+    'inspect --format') printf 'sha256:%s\n' "$TEST_HASH";;
+    'inspect '*) printf '[]';;
+    'run '*)
+      case "$*" in
+        *'operations-backup-input') printf '{"fixture":"private-handoff"}'; [[ "$TEST_SCENARIO" != producer-failure ]];;
+        *'operations-backup-database') printf '{"operations":{"quiet":true}}';;
+      esac;;
+  esac
+}
+if [[ "$TEST_PROBE_ONLY" == true ]]; then
+  operations_runtime_revision=''
+  scoped_backup_runtime_database initial
+  exit
+fi
+trap scoped_cleanup EXIT
+trap 'exit 143' TERM
+scoped_backup_runtime_inventory() { printf '{}' >"$scoped_work_directory/backup-inventory.json"; printf '%s' "$TEST_HASH"; }
+scoped_backup_runtime_neighbors() { event neighbors; [[ "$TEST_SCENARIO" != resume-neighbor-drift ]]; }
+scoped_backup_runtime_image() { event "image $1"; printf '{}' >"$scoped_work_directory/$2"; }
+scoped_source_compose() { event "source $*"; printf '{}'; }
+scoped_verifier() {
+  event "verifier $*"
+  case "$1" in
+    operations-backup-original) [[ "$TEST_SCENARIO" != resume-config-drift ]];;
+    operations-backup-fingerprint) printf '%s' "$TEST_HASH";;
+    operations-backup-admission) printf '{}' >"$scoped_work_directory/backup-admission.json";;
+    operations-backup-complete) printf '{}' >"$scoped_work_directory/backup-completed.json";;
+    prepare) printf '{}' >"$scoped_work_directory/desired.json";;
+  esac
+}
+scoped_backup_runtime_database() {
+  event "database $*"
+  [[ "$TEST_SCENARIO" != preflight-failure && "$TEST_SCENARIO" != resume-database-drift ]] || return 1
+  printf '{}' >"$scoped_work_directory/backup-database-current.json"
+}
+scoped_workers_graceful_stop() { event "stop $*"; [[ "$TEST_SCENARIO" != stop-failure ]]; }
+if [[ "$TEST_RESUME_ONLY" != true ]]; then
+  scoped_backup_runtime_resume_original() { event original-resume; [[ "$scoped_backup_admitted" == false ]]; }
+fi
+scoped_wait_healthy() { event "healthy ${'$'}{scoped_targets[*]}"; [[ "$TEST_SCENARIO" != reader-health-failure ]]; }
+scoped_verify_target_images() { event 'verify-images'; }
+scoped_compose() {
+  [[ -f "$scoped_backup_state_directory/admission.json" ]] || return 1
+  event "compose $* marker-present"
+  [[ "$TEST_SCENARIO" != reader-start-failure ]] || return 1
+  if [[ "$TEST_SCENARIO" == worker-start-failure && "$*" == *'force-recreate operations-worker' ]]; then return 1; fi
+}
+sync() { event 'sync'; [[ "$TEST_SCENARIO" != sync-failure ]] || return 1; if [[ "$TEST_SCENARIO" == sync-signal ]]; then kill -TERM "$$"; fi; }
+if [[ "$TEST_RESUME_ONLY" == true ]]; then
+  scoped_backup_previous_ids=("$(scoped_container_id operations-api)" "$(scoped_container_id operations-worker)" "$(scoped_container_id operations-outbox-publisher)" "$(scoped_container_id operations-restore-worker)")
+  scoped_backup_admitted=false
+  if [[ "$TEST_SCENARIO" == resume-after-admission ]]; then scoped_backup_admitted=true; fi
+  scoped_backup_runtime_resume_original
+  exit
+fi
+scoped_deploy_operations_backups
+`
+		const trace = join(directory, 'trace')
+		const result = spawnSync('/bin/bash', ['-c', script], { encoding: 'utf8', timeout: 10_000, env: { ...process.env, TEST_SCOPED_SCRIPT: scopedControllerPath, TEST_DIRECTORY: directory, TEST_TRACE: trace, TEST_SCENARIO: scenario, TEST_REVISION: revision, TEST_OLD_REVISION: oldRevision, TEST_HASH: envHash, TEST_PROBE_ONLY: String(probeOnly), TEST_RESUME_ONLY: String(resumeOnly) } })
+		assert.equal(result.error, undefined, result.stderr)
+		return { ...result, calls: existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n') : [], admission: existsSync(join(directory, 'deploy/backend/scoped-releases/operations-backup-runtime', revision, 'admission.json')), completed: existsSync(join(directory, 'deploy/backend/scoped-releases/operations-backup-runtime', revision, 'completed.json')), preserved: existsSync(join(directory, 'work')) }
+	} finally { rmSync(directory, { recursive: true, force: true }) }
+}
+
+test('backup runtime shell admits before first API then starts healthy readers before the maintenance worker', () => {
+	const result = runBackupRuntimeShell()
+	assert.equal(result.status, 0, result.stderr)
+	const readers = result.calls.findIndex(row => row.startsWith('compose desired up') && row.includes('operations-api'))
+	const worker = result.calls.findIndex(row => row.startsWith('compose desired up') && row.includes('force-recreate operations-worker'))
+	const healthy = result.calls.findIndex(row => row === 'healthy operations-api operations-outbox-publisher operations-restore-worker')
+	assert.ok(readers > result.calls.indexOf('verifier operations-backup-admission'))
+	assert.ok(worker > healthy && healthy > readers)
+	assert.equal(result.calls.filter(row => row.startsWith('docker build')).length, 1)
+	assert.equal(result.calls.filter(row => row.startsWith('compose')).length, 2)
+	assert.equal(result.admission, true); assert.equal(result.completed, true); assert.equal(result.preserved, false)
+	assert.ok(!result.calls.some(row => /migrate|bootstrap|fence|backlog|restore.*enabled|original-resume/.test(row)))
+})
+
+test('backup runtime failures preserve forward recovery after API admission and never restore old code', () => {
+	for (const scenario of ['reader-start-failure', 'reader-health-failure', 'worker-start-failure', 'sync-failure', 'sync-signal']) {
+		const result = runBackupRuntimeShell(scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.match(result.stderr, /Forward recovery only/)
+		assert.equal(result.admission, true); assert.equal(result.completed, false); assert.equal(result.preserved, true)
+		assert.ok(!result.calls.some(row => row === 'original-resume' || row.includes('rollback') || row.includes('--force ')))
+		if (scenario !== 'worker-start-failure') assert.ok(!result.calls.some(row => row.startsWith('compose') && row.includes('force-recreate operations-worker')))
+		if (scenario.startsWith('sync-')) assert.ok(!result.calls.some(row => row.startsWith('compose')))
+	}
+	const preflight = runBackupRuntimeShell('preflight-failure')
+	assert.notEqual(preflight.status, 0); assert.equal(preflight.admission, false)
+	assert.ok(!preflight.calls.some(row => row.startsWith('stop ') || row.startsWith('compose')))
+	const stopped = runBackupRuntimeShell('stop-failure')
+	assert.notEqual(stopped.status, 0); assert.equal(stopped.admission, false)
+	assert.ok(stopped.calls.includes('original-resume')); assert.ok(!stopped.calls.some(row => row.startsWith('compose')))
+})
+
+test('backup DB probe uses two isolated processes and fails closed before target launch when input producer fails', () => {
+	const result = runBackupRuntimeShell('success', true)
+	assert.equal(result.status, 0, result.stderr)
+	const input = result.calls.find(row => row.endsWith('operations-backup-input'))
+	const target = result.calls.find(row => row.includes('node /run/scoped-verifier.mjs operations-backup-database'))
+	assert.ok(input.includes('--network none') && input.includes('--user 0:0') && input.includes('owner.env:/run/scoped-owner.env:ro'))
+	assert.ok(target.includes('--network host') && target.includes('--user 1001:1001') && target.includes('--cap-drop ALL') && target.includes('--read-only') && target.includes('no-new-privileges'))
+	assert.ok(!target.includes('--env') && !target.includes('/run/scoped-owner.env') && !target.includes(':/run/scoped ') && !target.includes('private-handoff'))
+	const failed = runBackupRuntimeShell('producer-failure', true)
+	assert.notEqual(failed.status, 0)
+	assert.ok(!failed.calls.some(row => row.includes('node /run/scoped-verifier.mjs operations-backup-database')))
+})
+
+test('backup original-resume shell starts only four preserved IDs after config, database and neighbor proof', () => {
+	const result = runBackupRuntimeShell('success', false, true)
+	assert.equal(result.status, 0, result.stderr)
+	const starts = result.calls.filter(row => row.startsWith('docker start '))
+	assert.deepEqual(starts, [`docker start ${[1, 2, 3, 4].map(value => String(value).padStart(64, '0')).join(' ')}`])
+	assert.ok(result.calls.indexOf('verifier operations-backup-original') < result.calls.indexOf(starts[0]))
+	assert.ok(!result.calls.some(row => row.startsWith('compose') || row.includes('--force')))
+	for (const scenario of ['resume-wrong-id', 'resume-config-drift', 'resume-database-drift', 'resume-neighbor-drift', 'resume-after-admission']) {
+		const denied = runBackupRuntimeShell(scenario, false, true)
+		assert.notEqual(denied.status, 0, scenario)
+		assert.ok(!denied.calls.some(row => row.startsWith('docker start ') || row.startsWith('compose')), scenario)
+	}
+})
 
 test('Platform Compose replaces only its API and preserves process role, environment and runtime configuration', () => {
 	const input = composeFixture(platformScope), { desired, rollback } = prepareScopedCompose(input)
@@ -2152,6 +2558,7 @@ if (name === 'git') {
 				TEST_NODE_PAYLOAD: nodePayload, TEST_SHELL_PAYLOAD: shellPayload,
 				EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash,
 				...(scope === 'crm-upgrade' ? { EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash } : {}),
+				...(scope === backupRuntimeScope && scenario !== 'missing-backup-baseline' || scenario === 'foreign-backup-baseline' ? { EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256: envHash } : {}),
 				...(scope === identityScope ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}),
 				PRODUCTION_SSH_HOST: 'synthetic.invalid', PRODUCTION_SSH_PORT: '2222', PRODUCTION_SSH_USER: 'root',
 				PRODUCTION_SSH_IDENTITY_FILE: identity, PRODUCTION_SSH_KNOWN_HOSTS_FILE: knownHosts,
@@ -2186,10 +2593,10 @@ test('actual transport sends both exact tracked payloads through one pinned SSH 
 	// All admitted parameters are hex/base64, scope names, or empty shell tokens.
 	// Decode only this constrained argument list; never evaluate the SSH command.
 	const parameters = encodedArguments[1].split(' ').map(value => value === "''" ? '' : value)
-	assert.equal(parameters.length, 19)
+	assert.equal(parameters.length, 20)
 	assert.deepEqual(parameters.slice(0, 3), [revision, revision, envHash])
 	assert.deepEqual(parameters.slice(5, 10), [identityScope, oldRevision, envHash, '', ''])
-	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, '', '', ''])
+	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, '', '', '', ''])
 	for (const [hashIndex, encodedIndex, filename] of [
 		[10, 11, 'deploy-identity-operations-scoped.sh'], [12, 13, 'scoped-service-release.mjs']
 	]) {
@@ -2214,6 +2621,19 @@ test('actual transport rejects missing/untracked/malformed payload and optional 
 	}
 })
 
+test('backup runtime uses the same pinned transport with separate non-reusable baseline authority', () => {
+	const result = runTransport('success', backupRuntimeScope)
+	assert.equal(result.status, 0, result.stderr); assert.equal(result.calls.length, 1)
+	const encoded = result.calls[0].args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
+	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
+	assert.equal(parameters.length, 20); assert.equal(parameters[5], backupRuntimeScope)
+	assert.deepEqual(parameters.slice(14), ['', '', '', '', '', envHash])
+	for (const [scenario, scope] of [['missing-backup-baseline', backupRuntimeScope], ['foreign-backup-baseline', apiScope]]) {
+		const denied = runTransport(scenario, scope)
+		assert.notEqual(denied.status, 0); assert.deepEqual(denied.calls, [])
+	}
+})
+
 for (const scope of crmScopes) test(scope + ' uses only its two bounded hash-pinned payloads through the existing root transport', () => {
 	const result = runTransport('success', scope)
 	assert.equal(result.status, 0, result.stderr)
@@ -2222,9 +2642,9 @@ for (const scope of crmScopes) test(scope + ' uses only its two bounded hash-pin
 	const encoded = args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
 	assert.ok(encoded)
 	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
-	assert.equal(parameters.length, 19)
+	assert.equal(parameters.length, 20)
 	assert.equal(parameters[5], scope)
-	assert.deepEqual(parameters.slice(14), ['', '', '', '', scope === 'crm-upgrade' ? envHash : ''])
+	assert.deepEqual(parameters.slice(14), ['', '', '', '', scope === 'crm-upgrade' ? envHash : '', ''])
 	for (const [hashIndex, encodedIndex, filename] of [
 		[10, 11, 'deploy-crm-scoped.sh'], [12, 13, 'crm-release.mjs']
 	]) {

@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, identity-with-operations-manifest, operations-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, or billing-crm-commerce-acl
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, or billing-crm-commerce-acl
         default: all
         type: string
       expected_live_revision:
@@ -21,6 +21,10 @@ on:
         type: string
       expected_crm_upgrade_baseline_sha256:
         description: Fresh approved exact runtime and owner-env baseline hash (crm-upgrade only)
+        default: ''
+        type: string
+      expected_operations_backup_baseline_sha256:
+        description: Fresh approved exact Operations and unchanged neighbors runtime baseline hash (operations-backup-runtime only)
         default: ''
         type: string
       expected_operations_revision:
@@ -120,6 +124,7 @@ jobs:
           EXPECTED_LIVE_REVISION: ${{ inputs.expected_live_revision }}
           EXPECTED_SERVICE_ENV_SHA256: ${{ inputs.expected_service_env_sha256 }}
           EXPECTED_CRM_UPGRADE_BASELINE_SHA256: ${{ inputs.expected_crm_upgrade_baseline_sha256 }}
+          EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256: ${{ inputs.expected_operations_backup_baseline_sha256 }}
           EXPECTED_OPERATIONS_REVISION: ${{ inputs.expected_operations_revision }}
           EXPECTED_OPERATIONS_API_REVISION: ${{ inputs.expected_operations_api_revision }}
           EXPECTED_OPERATIONS_ENV_SHA256: ${{ inputs.expected_operations_env_sha256 }}

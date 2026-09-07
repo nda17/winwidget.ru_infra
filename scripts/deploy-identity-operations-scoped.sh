@@ -102,6 +102,9 @@ scoped_compose() {
 scoped_verifier() {
 	local verification_revision="${operations_runtime_revision:-$services_revision}"
 	local -a verifier_mounts=(--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro")
+	if [[ "$release_scope" == operations-backup-runtime && "${1:-}" == operations-backup-input ]]; then
+		verifier_mounts+=(--volume "$scoped_owner_env:/run/scoped-owner.env:ro")
+	fi
 	if [[ "$release_scope" == operations-api-runtime ]]; then
 		verification_revision="$services_revision"
 		verifier_mounts+=(--env "SCOPED_PHASE_A_REVISION=$expected_live_revision"
@@ -113,6 +116,7 @@ scoped_verifier() {
 		--security-opt no-new-privileges --user 0:0 \
 		--env "SCOPED_SCOPE=$release_scope" --env "SCOPED_REVISION=$verification_revision" \
 		--env "SCOPED_PREVIOUS_REVISION=$expected_live_revision" \
+		--env "SCOPED_OPERATIONS_BACKUP_BASELINE_SHA256=${expected_operations_backup_baseline_sha256:-}" \
 		--env "SCOPED_OPERATIONS_PREVIOUS_REVISION=${expected_operations_revision:-}" \
 		--env "SCOPED_OPERATIONS_API_PREVIOUS_REVISION=${expected_operations_api_revision:-}" \
 		--env "SCOPED_DATABASE_ID=${scoped_database_id:-}" \
@@ -712,6 +716,153 @@ scoped_workers_rollback_ready() {
 	done
 }
 
+scoped_backup_runtime_inventory() {
+	local project ids id
+	local -a selected=()
+	for project in winwidget winwidget-crm; do
+		ids="$(docker ps --no-trunc --filter "label=com.docker.compose.project=$project" --format '{{.ID}}')" || return 1
+		[[ -n "$ids" ]] || return 1
+		while IFS= read -r id; do [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1; selected+=("$id"); done <<<"$ids"
+	done
+	docker inspect "${selected[@]}" >"$scoped_work_directory/backup-inventory.json" || return 1
+	chmod 600 "$scoped_work_directory/backup-inventory.json" || return 1
+	scoped_verifier operations-backup-fingerprint "${1:-baseline}"
+}
+
+scoped_backup_runtime_neighbors() {
+	local fingerprint
+	fingerprint="$(scoped_backup_runtime_inventory neighbors)" || return 1
+	[[ "$fingerprint" == "$scoped_backup_neighbors_before" ]] || return 1
+	(scoped_assert_unchanged_neighbors) || return 1
+}
+
+scoped_backup_runtime_image() {
+	local image="$1" output="$2" mode=legacy
+	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$output" =~ ^backup-image-(before|after|role).json$ ]] || return 1
+	if [[ "$output" == backup-image-after.json ]]; then mode=candidate; fi
+	docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+		--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 --ulimit core=0:0 \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint timeout "$image" --signal=TERM --kill-after=5s 30s \
+		node /run/scoped-verifier.mjs operations-backup-image "$mode" >"$scoped_work_directory/$output" || return 1
+	chmod 600 "$scoped_work_directory/$output"
+}
+
+scoped_backup_runtime_database() {
+	local handoff
+	# Fail closed on producer failure, even if it already wrote a valid-looking
+	# prefix. No full owner env, runtime password or signing key reaches this probe.
+	handoff="$(scoped_verifier operations-backup-input)" || return 1
+	[[ -n "$handoff" && ${#handoff} -le 32768 ]] || return 1
+	printf '%s' "$handoff" | docker run --rm --interactive --network host --read-only --cap-drop ALL \
+		--security-opt no-new-privileges --user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 64 --ulimit core=0:0 \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint timeout "$scoped_image_id" --signal=TERM --kill-after=5s 90s \
+		node /run/scoped-verifier.mjs operations-backup-database >"$scoped_work_directory/backup-database-current.json" 2>/dev/null || return 1
+	unset handoff
+	chmod 600 "$scoped_work_directory/backup-database-current.json" || return 1
+	scoped_verifier operations-backup-database-pair "${1:-quiet}"
+}
+
+scoped_backup_runtime_resume_original() {
+	local id name
+	[[ "${scoped_backup_admitted:-false}" == false && "${scoped_cutover_started:-false}" == false ]] || return 1
+	for name in "${scoped_targets[@]}"; do
+		id="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --filter "label=com.docker.compose.service=$name" --format '{{.ID}}')" || return 1
+		[[ " ${scoped_backup_previous_ids[*]} " == *" $id "* && "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+	done
+	# Only resume original containers; never compose-up an old runtime after any
+	# new API/worker could have admitted a CRM durable job.
+	scoped_workers_graceful_stop "${scoped_backup_previous_ids[@]}" || return 1
+	docker inspect "${scoped_backup_previous_ids[@]}" >"$scoped_work_directory/backup-original.json" || return 1
+	chmod 600 "$scoped_work_directory/backup-original.json" || return 1
+	scoped_verifier operations-backup-original || return 1
+	(scoped_backup_runtime_database quiet && scoped_backup_runtime_neighbors) || return 1
+	docker start "${scoped_backup_previous_ids[@]}" >/dev/null 2>&1 || return 1
+	scoped_wait_healthy || return 1
+	# Starting preserved IDs changes their StartedAt only. Neighbors must still
+	# have their exact original start/restart history; target identity is checked.
+	scoped_backup_runtime_neighbors
+}
+
+scoped_backup_runtime_readers_ready() {
+	# Bash dynamic scope supplies the existing health/image helpers with only
+	# the readers. The caller's four-process target list remains unchanged.
+	local -a scoped_targets=(operations-api operations-outbox-publisher operations-restore-worker)
+	scoped_wait_healthy && scoped_verify_target_images
+}
+
+scoped_deploy_operations_backups() {
+	local name id image image_revision image_tag fingerprint directory
+	scoped_backup_admitted=false
+	[[ "$expected_operations_backup_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Missing exact Operations backup runtime baseline.'
+	fingerprint="$(scoped_backup_runtime_inventory baseline)" || die 'Cannot verify Operations and CRM baseline.'
+	[[ "$fingerprint" == "$expected_operations_backup_baseline_sha256" ]] || die 'Operations backup baseline changed before preparation.'
+	install -m 600 "$scoped_work_directory/backup-inventory.json" "$scoped_work_directory/backup-baseline.json"
+	scoped_backup_neighbors_before="$(scoped_verifier operations-backup-fingerprint neighbors)" || die 'Cannot fingerprint backup rollout neighbors.'
+	scoped_backup_previous_ids=()
+	for name in "${scoped_targets[@]}"; do
+		id="$(scoped_container_id "$name")" || die 'Operations target is not uniquely running.'
+		scoped_backup_previous_ids+=("$id")
+		image="$(docker inspect --format '{{.Image}}' "$id")" || die 'Cannot read original Operations image.'
+		scoped_backup_runtime_image "$image" backup-image-role.json || die 'Cannot read original Operations schema/manifest as its owner.'
+		if [[ "$name" == operations-api ]]; then install -m 600 "$scoped_work_directory/backup-image-role.json" "$scoped_work_directory/backup-image-before.json";
+		else cmp -s "$scoped_work_directory/backup-image-before.json" "$scoped_work_directory/backup-image-role.json" || die 'Original Operations roles disagree on schema/restore manifests.'; fi
+	done
+	image_tag="winwidget-operations:git-$services_revision"
+	docker build --build-arg "APP_REVISION=$services_revision" --tag "$image_tag" "$release_root/apps/operations" >/dev/null 2>&1 || die 'Operations backup image build failed.'
+	read -r scoped_image_id image_revision < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_tag")
+	[[ "$scoped_image_id" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" ]] || die 'Operations backup image differs from exact green source.'
+	scoped_backup_runtime_image "$scoped_image_id" backup-image-after.json || die 'Candidate Operations schema/restore inventory failed.'
+	scoped_verifier operations-backup-image-pair || die 'Backup release changes Operations schema/migrations or existing restore trust.'
+	export OPERATIONS_IMAGE="$scoped_image_id" OPERATIONS_REVISION="$services_revision"
+	scoped_source_compose config --format json >"$scoped_work_directory/compose.json" 2>/dev/null || die 'Cannot render protected Operations backup configuration.'
+	docker inspect "${scoped_backup_previous_ids[@]}" >"$scoped_work_directory/live.json"
+	docker image inspect "$scoped_image_id" >"$scoped_work_directory/image.json"
+	chmod 600 "$scoped_work_directory/compose.json" "$scoped_work_directory/live.json" "$scoped_work_directory/image.json"
+	scoped_verifier prepare || die 'Operations backup candidate changes unapproved configuration.'
+	scoped_backup_runtime_database initial || die 'Operations/CRM read-only database preflight failed.'
+	install -m 600 "$scoped_work_directory/backup-database-current.json" "$scoped_work_directory/backup-database-before.json"
+	[[ "$(scoped_backup_runtime_inventory baseline)" == "$expected_operations_backup_baseline_sha256" ]] || die 'Runtime changed before Operations stop.'
+	scoped_backup_runtime_neighbors || die 'Backup rollout neighbors or env changed.'
+	for directory in "$app_root/deploy/backend/scoped-releases" "$app_root/deploy/backend/scoped-releases/operations-backup-runtime"; do
+		if [[ ! -e "$directory" && ! -L "$directory" ]]; then install -d -m 700 "$directory"; fi
+		assert_root_owned_directory "$directory"
+	done
+	scoped_backup_state_directory="$app_root/deploy/backend/scoped-releases/operations-backup-runtime/$services_revision"
+	[[ ! -e "$scoped_backup_state_directory" && ! -L "$scoped_backup_state_directory" ]] || die 'Existing Operations backup admission requires explicit forward recovery.'
+	scoped_workers_stop_started=true
+	scoped_workers_graceful_stop "${scoped_backup_previous_ids[@]}" || die 'Operations graceful stop is incomplete; no forced replacement.'
+	(scoped_backup_runtime_database quiet && scoped_backup_runtime_neighbors) || die 'Post-stop Operations/CRM proof changed.'
+	# API can admit new manual CRM backup jobs too: persist the forward-only
+	# boundary BEFORE the first new process, not merely before the scheduler.
+	install -d -m 700 "$scoped_backup_state_directory"
+	scoped_verifier operations-backup-admission || die 'Cannot create forward-only admission evidence.'
+	# Even a failed/unknown install or fsync must not restore the old runtime
+	# once admission persistence has begun. No new process starts before sync.
+	scoped_backup_admitted=true
+	install -m 600 "$scoped_work_directory/backup-admission.json" "$scoped_backup_state_directory/admission.json"
+	sync -f "$scoped_backup_state_directory/admission.json"
+	sync -f "$scoped_backup_state_directory"
+	scoped_cutover_started=true
+	scoped_compose desired up -d --no-build --no-deps --force-recreate operations-api operations-outbox-publisher operations-restore-worker >/dev/null 2>&1 || die 'Operations compatible reader rollout failed; forward recovery required.'
+	scoped_backup_runtime_readers_ready || die 'New Operations readers are not healthy; worker remains stopped.'
+	scoped_backup_runtime_neighbors || die 'Neighbor drift before maintenance-worker admission.'
+	scoped_compose desired up -d --no-build --no-deps --force-recreate operations-worker >/dev/null 2>&1 || die 'Operations maintenance-worker start is unknown; forward recovery required.'
+	(scoped_wait_healthy && scoped_verify_target_images) || die 'Operations backup runtime is not healthy.'
+	scoped_target_ids=()
+	for name in "${scoped_targets[@]}"; do id="$(scoped_container_id "$name")" || die 'New Operations target is unavailable.'; scoped_target_ids+=("$id"); done
+	docker inspect "${scoped_target_ids[@]}" >"$scoped_work_directory/backup-postflight.json"
+	chmod 600 "$scoped_work_directory/backup-postflight.json"
+	scoped_verifier operations-backup-postflight || die 'Effective Operations configuration differs from approved backup rollout.'
+	(scoped_backup_runtime_database active && scoped_backup_runtime_neighbors) || die 'Operations backup postflight proof failed.'
+	scoped_verifier operations-backup-complete || die 'Cannot create completed Operations backup receipt.'
+	install -m 600 "$scoped_work_directory/backup-completed.json" "$scoped_backup_state_directory/completed.json"
+	sync -f "$scoped_backup_state_directory/completed.json"
+	sync -f "$scoped_backup_state_directory"
+	printf 'Operations backup runtime released without migrations or restore activation: infra=%s services=%s\n' "$infra_revision" "$services_revision"
+}
+
 scoped_cleanup() {
 	local exit_code="$?" name id fence_confirmed=true
 	# Bash 5 can enter EXIT while a signalled function still redirects fd 2.
@@ -735,7 +886,14 @@ scoped_cleanup() {
 			rmdir "$scoped_work_directory/backup-output"
 		fi
 	fi
-	if [[ "$exit_code" != 0 && "${scoped_identity_ddl_started:-false}" == true ]]; then
+	if [[ "$exit_code" != 0 && "$release_scope" == operations-backup-runtime ]]; then
+		if [[ "${scoped_backup_admitted:-false}" == true || "${scoped_cutover_started:-false}" == true ]]; then
+			printf '%s\n' 'RECOVERY_REQUIRED: new Operations backup admission may exist. Forward recovery only; original runtime was not restored and protected evidence is retained.' >&2
+		elif [[ "${scoped_workers_stop_started:-false}" == true ]]; then
+			if scoped_backup_runtime_resume_original; then printf '%s\n' 'Pre-admission Operations failure: exact original containers resumed without code/config changes.' >&2
+			else printf '%s\n' 'RECOVERY_REQUIRED: original Operations restart could not be safely proven. No forced stop or replacement.' >&2; fi
+		fi
+	elif [[ "$exit_code" != 0 && "${scoped_identity_ddl_started:-false}" == true ]]; then
 		# A failed migration process does not prove PostgreSQL rolled back. Never
 		# let an old manifest sign a backup after a successful/unknown Identity DDL.
 		for name in operations-api operations-worker operations-outbox-publisher operations-restore-worker; do
@@ -812,7 +970,7 @@ scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
-	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
+	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'
 	[[ "$(stat -Lc '%d:%i' "/proc/self/fd/$deploy_lock_fd")" == "$(stat -c '%d:%i' "$deploy_lock")" ]] ||
@@ -823,7 +981,7 @@ scoped_deploy_main() {
 		operations-federation-config | operations-api-runtime) scoped_owner=operations; scoped_targets=(operations-api) ;;
 		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-api billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
 		identity-with-operations-manifest) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
-		operations-runtime) scoped_owner=operations; scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
+		operations-runtime | operations-backup-runtime) scoped_owner=operations; scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-backlog-backup | operations-backlog-finalize) scoped_owner=operations; scoped_targets=() ;;
 		gateway-remove-notes) scoped_owner=api-gateway; scoped_targets=(api-gateway) ;;
 	esac
@@ -879,6 +1037,10 @@ scoped_deploy_main() {
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
+	if [[ "$release_scope" == operations-backup-runtime ]]; then
+		scoped_deploy_operations_backups
+		return
+	fi
 	if [[ "$release_scope" == platform-marketing-runtime ]]; then
 		scoped_deploy_platform "$old_image" "$id"
 		return
