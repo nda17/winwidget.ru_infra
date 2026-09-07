@@ -149,6 +149,64 @@ const contractSha256 = createHash('sha256')
 	.digest('hex')
 export const crmBrokerContract = () => structuredClone(contract)
 
+// Same exact trie representation used by the steady-state provisioner. Adding
+// the invitation reader must preserve the eleven existing delivery kinds.
+export function crmNotificationAcl(topology) {
+	const pattern = values => {
+		assert.ok(Array.isArray(values) && values.length > 0)
+		const root = {terminal: false, children: new Map()}
+		for (const value of [...values].sort()) {
+			assert.match(value, /^[a-z0-9.-]+$/)
+			let node = root
+			for (const character of value) {
+				if (!node.children.has(character)) node.children.set(character, {terminal: false, children: new Map()})
+				node = node.children.get(character)
+			}
+			node.terminal = true
+		}
+		const emit = node => {
+			const branches = [...node.children].map(([character, child]) => (character === '.' ? '\\.' : character) + emit(child))
+			if (node.terminal) branches.push('')
+			return branches.length === 1 ? branches[0] : '(?:' + branches.join('|') + ')'
+		}
+		const result = '^' + emit(root) + '$'
+		assert.ok(Buffer.byteLength(result) <= 1024)
+		return result
+	}
+	assert.equal(topology.retryCount, 3)
+	assert.equal(topology.eventsExchange, 'winwidget.events')
+	assert.equal(topology.retryExchange, 'winwidget.retry')
+	assert.equal(topology.deadLetterExchange, 'winwidget.dead-letter')
+	assert.equal(topology.manualRetryExchange, 'winwidget.manual-retry')
+	const resource = pattern([
+		topology.eventsExchange, topology.retryExchange, topology.deadLetterExchange, topology.manualRetryExchange,
+		...topology.queueNames.flatMap(queue => [queue, queue + '.dead-letter', ...[1,2,3].map(index => queue + '.retry-v2.' + index)])
+	])
+	return {configure:resource,read:resource,write:resource,topics:[
+		{exchange:'winwidget.events',read:pattern(topology.readRoutingKeys),write:pattern(topology.writeRoutingKeys)},
+		{exchange:'winwidget.dead-letter',read:pattern(topology.deadLetterRoutingKeys),write:pattern(topology.deadLetterRoutingKeys)}
+	]}
+}
+
+export function crmCompanionPublisherAcl(username, before) {
+	const definitions = {
+		'winwidget-widgets': ['^(widgets\\.(widget|lead)\\.changed\\.v1|lead\\.(integration\\.(email|telegram|webhook|bitrix24|amo-crm)|limit\\.reached\\.(email|telegram))\\.v2|admin\\.audit\\.widgets\\.v1)$', ['widgets.wincrm.lead-transfer.requested.v1']],
+		'winwidget-identity-publisher': ['^(identity\\.user\\.changed\\.v1|billing\\.(identity\\.changed|referral\\.requested|lifecycle-repair\\.requested)\\.v1|admin\\.audit\\.identity\\.v1)$', ['identity.wincrm.invitation-accepted.v1','notification.wincrm.invitation.email.requested.v1']],
+		'winwidget-billing-publisher': ['^(payment\\.succeeded\\.v1|payment\\.notification\\.telegram\\.requested\\.v1|payment\\.auto-renewal\\.charge\\.requested\\.v1|notification\\.subscription-expiry\\.(email|telegram)\\.requested\\.v1|billing\\.(payment|subscription)(\\.details)?\\.changed\\.v1|billing\\.(affiliate|settings)\\.changed\\.v1|admin\\.audit\\.billing\\.v1)$', ['billing.wincrm.provider-operation.requested.v1']]
+	}
+	assert.ok(Object.hasOwn(definitions,username))
+	const [legacy,additional] = definitions[username], after = structuredClone(before)
+	const events = after.topics.filter(topic => topic.exchange === 'winwidget.events')
+	assert.equal(events.length,1)
+	assert.equal(events[0].write,legacy)
+	events[0].write = legacy.slice(0,-2) + '|' + additional.map(value => value.replaceAll('.', '\\.')).join('|') + ')$'
+	if (username === 'winwidget-billing-publisher') {
+		assert.equal(after.write,'^winwidget\\.(events|billing\\.(retry|dead-letter))$')
+		after.write = '^winwidget\\.(events|billing\\.(retry|dead-letter)|billing\\.wincrm-provider\\.dead-letter)$'
+	}
+	return after
+}
+
 // Run only inside the CRM controller's locked bootstrap stage. Existing
 // credentials are never reset; an interrupted bootstrap resumes missing grants.
 export async function provisionCrmBrokerPrincipals({

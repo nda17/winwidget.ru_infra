@@ -4,6 +4,8 @@ import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
 import {
 	crmBrokerContract,
+	crmNotificationAcl,
+	crmCompanionPublisherAcl,
 	readCrmBrokerSnapshot,
 	assertCrmBrokerSnapshot,
 	provisionCrmBrokerTopology,
@@ -11,6 +13,45 @@ import {
 } from './crm-broker-topology.mjs'
 
 const contract = crmBrokerContract()
+
+test('companion publisher ACL delta exactly matches the steady-state provisioner', () => {
+	const source = readFileSync(new URL('./deploy-services-production.sh', import.meta.url), 'utf8')
+	const snippet = source.slice(source.indexOf('const widgetsWriteTopicPattern ='), source.indexOf('const users = ['))
+	const patterns = crmContract => runInNewContext(snippet + '\n({widgetsWriteTopicPattern,identityWriteTopicPattern,billingWriteTopicPattern,billingWriteResourcePattern})', {crmContract})
+	const before = patterns('disabled'), after = patterns('mvp-v1')
+	for (const [user,key,event] of [
+		['winwidget-widgets','widgetsWriteTopicPattern','widgets.wincrm.lead-transfer.requested.v1'],
+		['winwidget-identity-publisher','identityWriteTopicPattern','identity.wincrm.invitation-accepted.v1'],
+		['winwidget-billing-publisher','billingWriteTopicPattern','billing.wincrm.provider-operation.requested.v1']
+	]) {
+		const original = {configure:'^$',read:'^$',write:user==='winwidget-billing-publisher'?before.billingWriteResourcePattern:'unchanged-resource',topics:[{exchange:'winwidget.events',read:'unchanged-read',write:before[key]}]}
+		const changed = crmCompanionPublisherAcl(user,original)
+		assert.equal(changed.topics[0].write,after[key])
+		assert.equal(changed.write,user==='winwidget-billing-publisher'?after.billingWriteResourcePattern:original.write)
+		assert.equal(changed.topics[0].read,original.topics[0].read)
+		assert.equal(changed.configure,original.configure)
+		for (const forbidden of [event+'.extra','prefix.'+event,event.replaceAll('.','x')])assert.equal(new RegExp(changed.topics[0].write).test(forbidden),false)
+		assert.throws(()=>crmCompanionPublisherAcl(user,changed))
+		assert.throws(()=>crmCompanionPublisherAcl(user,{...original,topics:[{exchange:'winwidget.events',write:'.*'}]}))
+	}
+	assert.throws(()=>crmCompanionPublisherAcl('unknown',{}))
+})
+
+test('notification opt-in retains existing exact resources and admits only the new reader resources',()=>{
+	const topology = {eventsExchange:'winwidget.events',retryExchange:'winwidget.retry',deadLetterExchange:'winwidget.dead-letter',manualRetryExchange:'winwidget.manual-retry',retryCount:3,queueNames:['winwidget.notification.email'],readRoutingKeys:['notification.email.requested.v1'],writeRoutingKeys:['notification.outcome.v1'],deadLetterRoutingKeys:['email.dead-letter']}
+	const before=crmNotificationAcl(topology), next=structuredClone(topology)
+	next.queueNames.push('winwidget.notification.wincrm.invitation.email')
+	next.readRoutingKeys.push('notification.wincrm.invitation.email.requested.v1','manual.wincrm-invitation-email','wincrm-invitation-email.dead-letter')
+	next.writeRoutingKeys.push('manual.wincrm-invitation-email')
+	next.deadLetterRoutingKeys.push('wincrm-invitation-email.dead-letter')
+	const after=crmNotificationAcl(next)
+	for(const name of [...topology.queueNames,...next.queueNames])for(const suffix of ['','.dead-letter','.retry-v2.1','.retry-v2.2','.retry-v2.3'])assert.equal(new RegExp(after.read).test(name+suffix),true)
+	assert.equal(new RegExp(before.read).test(next.queueNames[1]),false)
+	for(const name of ['winwidget.crm-intake.acceptance.v1',next.queueNames[1]+'.extra',next.queueNames[1]+'.retry-v2.4'])assert.equal(new RegExp(after.read).test(name),false)
+	assert.equal(after.configure,after.read)
+	assert.equal(after.write,after.read)
+	assert.throws(()=>crmNotificationAcl({...next,retryCount:4}))
+})
 const resource = item => ({
 	name: item.name,
 	durable: true,
