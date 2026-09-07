@@ -22,6 +22,16 @@ export const CRM_COMPANION_TARGETS = Object.freeze(
 	Object.values(CRM_COMPANIONS).flat()
 )
 const digest = bytes => createHash('sha256').update(bytes).digest('hex')
+// Parse the whole script before a child process can read stdin. A successful
+// SSH exit alone is not evidence that the final verification was executed.
+export function companionShellInput(script) {
+	assert.equal(typeof script, 'string')
+	return "bash -c '" + script.replaceAll("'", "'\\''") + "' </dev/null\n"
+}
+
+export function assertCompanionCutoverComplete(state) {
+	assert.equal(state, 'finished:0:complete')
+}
 const envObject = values =>
 	Object.fromEntries(
 		values.map(value => {

@@ -1,12 +1,38 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { spawnSync } from 'node:child_process'
 import {
 	CRM_COMPANIONS,
 	prepareCrmCompanionRelease,
 	companionMigrationLedger,
 	companionComposeBytes,
-	assertCrmCompanionRuntime
+	assertCrmCompanionRuntime,
+	companionShellInput,
+	assertCompanionCutoverComplete
 } from './crm-companion-release.mjs'
+
+test('child stdin cannot consume the remaining deployment script', () => {
+	const result = spawnSync('/bin/bash', ['-s'], {
+		input: companionShellInput(
+			"set -eu\nhead -c 1 >/dev/null\nprintf '%s\\n' 'final-verification'"
+		),
+		encoding: 'utf8',
+		timeout: 1000
+	})
+	assert.equal(result.status, 0)
+	assert.equal(result.stdout, 'final-verification\n')
+})
+
+test('an early successful exit is not a completed cutover', () => {
+	assertCompanionCutoverComplete('finished:0:complete')
+	for (const state of [
+		'finished:0:identity-migrate',
+		'finished:1:verify',
+		'running:42',
+		'not-started'
+	])
+		assert.throws(() => assertCompanionCutoverComplete(state))
+})
 
 const revision = 'a'.repeat(40),
 	previous = 'b'.repeat(40)

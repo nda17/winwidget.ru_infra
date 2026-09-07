@@ -87,8 +87,7 @@ reconciliation, но начинает работать только при по�
 локальные/серверные байты совпадают, CI hash обновлён. Повторная read-only
 подготовка не возвращает изменений. `validateCrmCompanionCompose` прошёл
 на нормализованном Compose с этими private inputs; это проверка конфигурации,
-не запущенных процессов. APP_REVISION owner env пока остаётся прежним:
-миграции и runtime cutover выполняются отдельным шагом.
+не запущенных процессов. Последующий runtime cutover описан ниже.
 
 Для этого cutover на VPS также подготовлены образы Identity, Billing, Widgets
 и Notification Delivery из того же зелёного services SHA `774db649`.
@@ -99,13 +98,31 @@ Dockerfile Widgets/Notification Delivery содержат revision, но не ti
 диска. Сборка выполнялась последовательно под общим deploy lock, без dump
 и изменений существующих БД.
 
+07.09.2026 companion cutover завершён: Identity, Billing, Widgets и
+Notification Delivery работают на `774db6490808cbaff4ff96033c589205cb3935f7`
+(девять процессов). Применены две миграции Identity, пять Billing и по одной
+Widgets/Notification Delivery; проверены полные успешные ledgers и checksums.
+Все девять runtime image IDs, env и конфигурации совпали с выбранным Compose,
+health — healthy, restarts — 0, OOM — false. Четыре owner env повторно скачаны
+и побайтово совпадают с локальными. Остальные 26 контейнеров не изменены.
+Продажи, native connector, invitation producer/reader и публичный CRM ещё закрыты.
+
+При первой попытке дочерняя Compose-команда прочитала остаток SSH-сценария
+из stdin после миграций Identity. Три Identity-процесса были восстановлены
+на новой совместимой версии, без отката БД/старого writer; затем завершено
+переключение остальных владельцев. Для операторского shell использовать
+`companionShellInput`: весь сценарий разбирается до запуска дочерних команд,
+stdin закрыт. Миграции запускаются с `--interactive=false -T`; успех требует
+не только exit 0, но и `finished:0:complete` после финальной проверки runtime.
+Оба случая покрыты regression-тестами.
+
 Состав профилей:
 
-| Профиль | Состав | Назначение |
-| --- | --- | --- |
-| `crm-runtime` | Access 3, Intake 7, Customers 1, Sales 1 | 12 раздельных API/worker/publisher процессов |
-| `crm-databases` | 4 PostgreSQL 18 | Собственные БД, сети, volumes и admin password files |
-| `crm-migrations` | 4 однократных процесса | Тот же immutable image, отдельная migration credential |
+| Профиль          | Состав                                   | Назначение                                             |
+| ---------------- | ---------------------------------------- | ------------------------------------------------------ |
+| `crm-runtime`    | Access 3, Intake 7, Customers 1, Sales 1 | 12 раздельных API/worker/publisher процессов           |
+| `crm-databases`  | 4 PostgreSQL 18                          | Собственные БД, сети, volumes и admin password files   |
+| `crm-migrations` | 4 однократных процесса                   | Тот же immutable image, отдельная migration credential |
 
 Без явно выбранного профиля ни один сервис не активен. Не задавать
 `COMPOSE_PROFILES` глобально и не запускать все миграции параллельно:
@@ -1127,6 +1144,7 @@ env, не включает restore и не использует production Postg
 
    SSH-переменные берутся из обычного защищённого local deploy boundary; script
    не читает и не передаёт `.env.production`.
+
 4. Controller удерживает canonical production deploy lock и отдельный
    rehearsal lock. Operations image ID обязан иметь exact revision label, а
    pinned PostgreSQL 18 image — exact digest, `PGDATA` и volume contract.
