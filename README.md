@@ -69,6 +69,16 @@ service-owned миграции. Ни один из них не активиру�
 контейнеры, данные и пароли. Ограничения и prerequisites — в
 [CRM runbook](docs/runbook.md#отдельный-этап-crm-databases).
 
+После первичного запуска CRM scope `billing-crm-commerce-acl` применяет только
+миграцию `20260909110000_restrict_wincrm_commerce_runtime_acl` через уже
+работающий immutable Billing image и его отдельную migration-role. Контроллер
+сверяет все предыдущие Prisma-файлы, полный ledger, database identity и ACL;
+запрещает изменения runtime-кода, зависимостей, schema и других миграций Billing.
+Все production-контейнеры, env и права остальных таблиц остаются неизменными.
+Этот scope не включает оплату и не запускает повторное создание CRM/БД.
+После неоднозначной ошибки сначала проверяется ledger; автоматического
+`migrate resolve`, отката прав или повторного списания нет.
+
 ## Production-окружение GitHub
 
 В репозитории `winwidget.ru_services` настройте следующие repository-level

@@ -156,6 +156,18 @@ CI canonical hash обновлён. `BILLING_WINCRM_PAYMENTS_ENABLED` и
 устарели. Перед новым code rollout требуется проверенный steady-state scope;
 не обходить этот отказ через `all`, сброс env или удаление работающих приложений/БД.
 
+Для следующего узкого выпуска подготовлен scope `billing-crm-commerce-acl`:
+одна immutable migration `20260909110000_restrict_wincrm_commerce_runtime_acl`,
+без новых images, restart, env/broker изменений и включения платежей. Inputs —
+фактическая ревизия Billing и SHA его полного owner env. Preflight сверяет
+старые Prisma-файлы с текущим image, service identity, ledger и текущий ACL;
+postflight требует тот же database UUID и hash всех нетронутых ACL. Все
+контейнеры (включая 12 CRM-процессов и их БД) входят в общий fingerprint.
+Migration выполняется отдельным процессом с Billing migration-role; секретный
+временный файл удаляется при завершении. Это не общий rollout остальных сервисов.
+После ошибки не повторять автоматически: проверить ledger и фактический ACL,
+не выполнять `migrate resolve` или расширение прав ради зелёного деплоя.
+
 При первой попытке дочерняя Compose-команда прочитала остаток SSH-сценария
 из stdin после миграций Identity. Три Identity-процесса были восстановлены
 на новой совместимой версии, без отката БД/старого writer; затем завершено

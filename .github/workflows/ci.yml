@@ -74,6 +74,9 @@ jobs:
           bash -n scripts/deploy-crm-scoped.sh
           shellcheck -x scripts/deploy-crm-scoped.sh
           node --check scripts/crm-release.mjs
+          bash -n scripts/deploy-billing-crm-acl-scoped.sh
+          shellcheck -x scripts/deploy-billing-crm-acl-scoped.sh
+          node --check scripts/billing-crm-acl-release.mjs
           node --check scripts/verify-operations-backlog-backup.mjs
           bash -n scripts/run-isolated-restore-rehearsal.sh
           shellcheck -x scripts/run-isolated-restore-rehearsal.sh
@@ -127,7 +130,7 @@ jobs:
         run: node --test scripts/test-crm-broker-topology.mjs scripts/test-crm-broker-bootstrap.mjs
 
       - name: Verify closed CRM companion environment preparation
-        run: node --test scripts/test-crm-companion-env.mjs scripts/test-crm-companion-release.mjs scripts/test-crm-public-release.mjs
+        run: node --test scripts/test-crm-companion-env.mjs scripts/test-crm-companion-release.mjs scripts/test-crm-public-release.mjs scripts/test-billing-crm-acl-release.mjs
 
       - name: Verify CRM preparation and database-only release without application activation
         shell: bash
