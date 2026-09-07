@@ -196,7 +196,10 @@ function fixture() {
 			Env: ['SYNTHETIC_SECRET=do-not-print']
 		},
 		HostConfig: {},
-		Mounts: [],
+		Mounts: [
+			{ Destination: '/run/a', Source: '/synthetic/a', RW: false },
+			{ Destination: '/run/b', Source: '/synthetic/b', RW: false }
+		],
 		NetworkSettings: {},
 		RestartCount: 0,
 		State: {
@@ -217,6 +220,11 @@ test('every live container including all CRM processes stays in the unchanged-ru
 		before = runtimeFingerprint(live, revision)
 	assert.match(before, /^[a-f0-9]{64}$/)
 	assert.equal(runtimeFingerprint([...live].reverse(), revision), before)
+	const reordered = structuredClone(live)
+	for (const row of reordered) row.Mounts.reverse()
+	assert.equal(runtimeFingerprint(reordered, revision), before)
+	reordered[46].Mounts[0].Source = '/changed-source'
+	assert.notEqual(runtimeFingerprint(reordered, revision), before)
 	for (const mutate of [
 		row => {
 			row[46].Config.Env.push('DRIFT=true')

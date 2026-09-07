@@ -13,7 +13,7 @@ billing_acl_probe() {
 		--env "BILLING_LIVE_REVISION=$expected_live_revision" \
 		--volume "$scoped_payload_directory/verifier.mjs:/run/billing-acl.mjs:ro" \
 		--volume "$billing_acl_work/owner.env:/run/billing.env:ro" \
-		--volume "$release_root/apps/billing/prisma:/run/candidate/prisma:ro" \
+		--volume "$billing_acl_work/prisma:/run/candidate/prisma:ro" \
 		--entrypoint node "$billing_acl_image" /run/billing-acl.mjs "$mode"
 }
 
@@ -53,13 +53,18 @@ billing_acl_cleanup() {
 	trap - EXIT
 	# Exact file only: no database dumps, copied project trees or runtime volumes.
 	rm -f -- "$billing_acl_work/owner.env"
+	if [[ -d "$billing_acl_work/prisma" && ! -L "$billing_acl_work/prisma" ]]; then
+		# Only the bounded, public Prisma handoff created below. No release source
+		# permissions are relaxed and no credentials are stored inside this tree.
+		find "$billing_acl_work/prisma" -xdev -depth -delete
+	fi
 	rmdir -- "$billing_acl_work"
 	cleanup_scoped_payload
 	exit "$result"
 }
 
 scoped_deploy_main() {
-	local owner_env id revision title changed file before after
+	local owner_env id revision title changed file before after relative target source_count=0
 	[[ "$release_scope" == billing-crm-commerce-acl ]] || die 'Unsupported Billing ACL scope.'
 	[[ -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}" && "$(docker context inspect --format '{{.Endpoints.docker.Host}}')" == unix:///var/run/docker.sock ]] || die 'Billing ACL release requires the production local daemon.'
 	owner_env="$services_repository/apps/billing/.env.production"
@@ -85,6 +90,21 @@ scoped_deploy_main() {
 	trap 'exit 143' TERM HUP
 	# Temporary credential handoff only, removed on both success and failure.
 	install -o 1001 -g 1001 -m 400 "$owner_env" "$billing_acl_work/owner.env"
+	# Git worktrees created under the controller's umask 077 are root-only.
+	# Hand off only the exact public Prisma inputs to the non-root executor;
+	# source-pair/hash validation still runs before every database operation.
+	install -d -o 1001 -g 1001 -m 500 "$billing_acl_work/prisma" "$billing_acl_work/prisma/migrations"
+	while IFS= read -r file; do
+		relative="${file#apps/billing/prisma/}"
+		[[ "$relative" =~ ^(schema\.prisma|migration_lock\.toml|migrations/[0-9]{14}_[a-z0-9_]+/migration\.sql)$ ]] || die 'Unexpected Billing Prisma handoff path.'
+		[[ -f "$release_root/$file" && ! -L "$release_root/$file" ]] || die 'Unsafe Billing Prisma source.'
+		target="$billing_acl_work/prisma/$relative"
+		install -d -o 1001 -g 1001 -m 500 "$(dirname "$target")"
+		install -o 1001 -g 1001 -m 400 "$release_root/$file" "$target"
+		cmp -s "$release_root/$file" "$target" || die 'Billing public source handoff changed bytes.'
+		source_count=$((source_count + 1))
+	done < <(git -C "$release_root" ls-files apps/billing/prisma)
+	[[ "$source_count" == 13 ]] || die 'Unexpected Billing Prisma source count.'
 	billing_acl_envs="$(billing_acl_env_inventory)"
 	billing_acl_runtime="$(billing_acl_inventory)"
 	[[ "$billing_acl_runtime" =~ ^[a-f0-9]{64}$ ]] || die 'Cannot seal the live runtime fingerprint.'

@@ -102,7 +102,9 @@ export function runtimeFingerprint(live, revision) {
 						image: row.Image,
 						config: row.Config,
 						host: row.HostConfig,
-						mounts: row.Mounts,
+						mounts: [...row.Mounts].sort((a, b) =>
+							a.Destination.localeCompare(b.Destination)
+						),
 						network: row.NetworkSettings,
 						started: row.State.StartedAt
 					}
