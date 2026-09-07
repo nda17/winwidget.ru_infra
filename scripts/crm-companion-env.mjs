@@ -20,6 +20,63 @@ const closed = [
 	'WINCRM_INVITATION_EMAIL_ENABLED'
 ]
 
+export const CRM_ACTIVATION_TARGETS = Object.freeze({
+	winwidget: ['notification-delivery-worker', 'billing-api', 'widgets-service', 'identity-api'],
+	'winwidget-crm': ['crm-intake-api', 'crm-intake-worker', 'crm-intake-publisher']
+})
+
+export function activateCrmCompanionEnv({canonicalBytes, crmBytes, ownerBytes}) {
+	try {
+		const canonical = parseEnv(patchCrmEnv(canonicalBytes, {}))
+		const crm = parseEnv(patchCrmEnv(crmBytes, {}))
+		assert.equal(canonical.CRM_RABBITMQ_CONTRACT, 'mvp-v1')
+		assert.equal(canonical.BILLING_WINCRM_PAYMENTS_ENABLED, 'false')
+		assert.equal(canonical.BILLING_WINCRM_RECONCILIATION_ENABLED, 'true')
+		assert.equal(crm.CRM_ACCESS_BILLING_ENABLED, 'false')
+		const keys = ['WINCRM_INVITATION_EMAIL_ENABLED', 'WIDGETS_WINCRM_CONNECTOR_ENABLED', 'BILLING_WINCRM_WIDGETS_ELIGIBILITY_ENABLED']
+		for (const key of keys) assert.equal(canonical[key], 'false')
+		for (const key of ['CRM_INTAKE_WIDGETS_ENABLED', 'CRM_INTAKE_WIDGET_TRANSFERS_ENABLED']) assert.equal(crm[key], 'false')
+		const kinds = canonical.NOTIFICATION_DELIVERY_KINDS.split(',')
+		assert.equal(kinds.length,11)
+		assert.equal(new Set(kinds).size,11)
+		assert.ok(!kinds.includes('wincrm-invitation-email'))
+		const deliveryKinds = canonical.NOTIFICATION_DELIVERY_KINDS + ',wincrm-invitation-email'
+		const changes = {
+			identity: {WINCRM_INVITATION_EMAIL_ENABLED:'true'},
+			billing: {BILLING_WINCRM_WIDGETS_ELIGIBILITY_ENABLED:'true'},
+			widgets: {WIDGETS_WINCRM_CONNECTOR_ENABLED:'true'},
+			'notification-delivery': {NOTIFICATION_DELIVERY_KINDS:deliveryKinds}
+		}
+		const owners = {}
+		for (const [owner, values] of Object.entries(changes)) {
+			const before = parseEnv(patchCrmEnv(ownerBytes[owner], {}))
+			for (const key of Object.keys(values)) assert.equal(before[key],canonical[key])
+			owners[owner] = patchCrmEnv(ownerBytes[owner], values)
+		}
+		return {
+			canonical:patchCrmEnv(canonicalBytes,{...Object.fromEntries(keys.map(key=>[key,'true'])),NOTIFICATION_DELIVERY_KINDS:deliveryKinds}),
+			crm:patchCrmEnv(crmBytes,{CRM_INTAKE_WIDGETS_ENABLED:'true',CRM_INTAKE_WIDGET_TRANSFERS_ENABLED:'true'}),owners
+		}
+	} catch { throw new Error('CRM companion activation env rejected; private details suppressed') }
+}
+
+export function crmActivationProcessEnv(project, name, before, canonicalAfter) {
+	assert.ok(CRM_ACTIVATION_TARGETS[project]?.includes(name))
+	const after = {...before}
+	if (project === 'winwidget-crm') {
+		for (const key of ['CRM_INTAKE_WIDGETS_ENABLED','CRM_INTAKE_WIDGET_TRANSFERS_ENABLED']) {
+			assert.equal(before[key],'false')
+			after[key]='true'
+		}
+	} else {
+		const key = {'notification-delivery-worker':'NOTIFICATION_DELIVERY_KINDS','billing-api':'BILLING_WINCRM_WIDGETS_ELIGIBILITY_ENABLED','widgets-service':'WIDGETS_WINCRM_CONNECTOR_ENABLED','identity-api':'WINCRM_INVITATION_EMAIL_ENABLED'}[name]
+		if (name === 'notification-delivery-worker') assert.equal(canonicalAfter[key],before[key]+',wincrm-invitation-email')
+		else { assert.equal(before[key],'false'); assert.equal(canonicalAfter[key],'true') }
+		after[key]=canonicalAfter[key]
+	}
+	return after
+}
+
 // Patch only explicitly selected keys, retaining comments, order and all other
 // bytes. No example values, automatic credential rotation or product activation.
 export function patchCrmEnv(bytes, changes) {

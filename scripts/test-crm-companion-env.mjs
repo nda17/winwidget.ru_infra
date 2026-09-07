@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { parseEnv } from 'node:util'
 import { test } from 'node:test'
-import { CRM_COMPANION_NEW_TOKENS, patchCrmEnv, prepareCrmCompanionEnv } from './crm-companion-env.mjs'
+import { CRM_COMPANION_NEW_TOKENS, CRM_ACTIVATION_TARGETS, activateCrmCompanionEnv, crmActivationProcessEnv, patchCrmEnv, prepareCrmCompanionEnv } from './crm-companion-env.mjs'
 
 const env = values => Object.entries(values).map(([key, value]) => key + '=' + value).join('\n') + '\n'
 const fixture = () => ({
@@ -24,6 +24,29 @@ const fixture = () => ({
 	providerPassword: 'e'.repeat(64),
 	newTokens: Object.fromEntries(CRM_COMPANION_NEW_TOKENS.map((key, index) => [key, String(index + 1).repeat(64)])),
 	ownerBytes: Object.fromEntries(['identity', 'billing', 'widgets', 'notification-delivery'].map(owner => [owner, '# owner\nAPP_REVISION=' + 'f'.repeat(40) + '\nRABBITMQ_URL=unchanged\n']))
+})
+
+test('native and invitation activation changes only product flags and preserves paid gate, tokens and eleven delivery kinds',()=>{
+	const input=fixture()
+	input.canonicalBytes=patchCrmEnv(input.canonicalBytes,{NOTIFICATION_DELIVERY_KINDS:'email,telegram,payment-email,payment-telegram,limit-email,limit-telegram,campaign-email,campaign-telegram,daily-summary-delivery-telegram,subscription-expiry-email,subscription-expiry-telegram'})
+	const prepared=prepareCrmCompanionEnv(input)
+	prepared.owners['notification-delivery']=patchCrmEnv(prepared.owners['notification-delivery'],{NOTIFICATION_DELIVERY_KINDS:parseEnv(prepared.canonical).NOTIFICATION_DELIVERY_KINDS})
+	const values={canonicalBytes:prepared.canonical,crmBytes:input.crmBytes,ownerBytes:prepared.owners}
+	const next=activateCrmCompanionEnv(values),canonical=parseEnv(next.canonical)
+	assert.equal(canonical.BILLING_WINCRM_PAYMENTS_ENABLED,'false')
+	assert.equal(parseEnv(next.crm).CRM_ACCESS_BILLING_ENABLED,'false')
+	assert.equal(canonical.NOTIFICATION_DELIVERY_KINDS,parseEnv(prepared.canonical).NOTIFICATION_DELIVERY_KINDS+',wincrm-invitation-email')
+	for(const [project,names] of Object.entries(CRM_ACTIVATION_TARGETS))for(const name of names){
+		const source={...parseEnv(prepared.canonical),...parseEnv(input.crmBytes),SECRET:'synthetic',APP_REVISION:'a'.repeat(40)}
+		const result=crmActivationProcessEnv(project,name,source,canonical)
+		assert.equal(result.SECRET,source.SECRET)
+		assert.equal(result.APP_REVISION,source.APP_REVISION)
+		assert.equal(result.BILLING_WINCRM_PAYMENTS_ENABLED,'false')
+		assert.equal(result.CRM_ACCESS_BILLING_ENABLED,'false')
+	}
+	assert.throws(()=>activateCrmCompanionEnv({...values,canonicalBytes:patchCrmEnv(values.canonicalBytes,{BILLING_WINCRM_PAYMENTS_ENABLED:'true'})}))
+	assert.throws(()=>activateCrmCompanionEnv({...values,canonicalBytes:next.canonical,crmBytes:next.crm,ownerBytes:next.owners}))
+	assert.throws(()=>crmActivationProcessEnv('winwidget','billing-worker',{},canonical))
 })
 
 test('companion preparation pairs credentials without enabling products or changing existing revisions', () => {
