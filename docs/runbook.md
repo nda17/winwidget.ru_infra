@@ -106,7 +106,8 @@ Widgets/Notification Delivery; проверены полные успешные 
 Все девять runtime image IDs, env и конфигурации совпали с выбранным Compose,
 health — healthy, restarts — 0, OOM — false. Четыре owner env повторно скачаны
 и побайтово совпадают с локальными. Остальные 26 контейнеров не изменены.
-Продажи, native connector, invitation producer/reader и публичный CRM ещё закрыты.
+На этом этапе продажи, native connector, invitation producer/reader и публичный
+CRM оставались закрыты; последующее открытие маршрутов и producers описано ниже.
 
 Полный закрытый CRM runtime запущен 07.09.2026 через зелёный production CI
 `34074371923`: все 12 application containers используют
@@ -123,12 +124,37 @@ Manifest теперь включает обработку отдельно дл�
 попытки пересозданы; базы, volumes, очереди и данные не удалялись.
 Image CI проверяет фактический compiled role parser, не только shape Compose.
 
-Следующий этап использует `crm-public-release.mjs`: ровно восемь новых
+Публичный API cutover 07.09.2026 выполнен через `crm-public-release.mjs`: ровно восемь новых
 Gateway prefixes, `crm-source` только для ingest; старые routes не изменяются.
 Origin CRM добавляется Gateway/Identity/Billing/Widgets API, а origin общей
 админки — четырём CRM API. Это не включает платежи, invitation email или
-native widget producer. Перед переключением сверяются полные owner env,
-исходные process configs, точные image IDs и неизменность соседних контейнеров.
+native widget producer. Восемь целевых API healthy, Gateway обновлён до
+`837113b9f9f303bd6c043c2a2e37b0791369d7a3`, остальные 39 контейнеров не изменены.
+Сверены полные owner env, process configs и image IDs. Семь защищённых prefixes
+возвращают 401 без JWT, разрешают только согласованные browser origins;
+ingest без source key возвращает 401. Это не заменяет авторизованный UI smoke.
+
+Затем по зелёному infra `e1e3c2e2c90cc3414cd6c05e4b21e67044d3503a`
+выполнена отдельная активация native Widgets и приглашений. Сначала расширены
+точные resource/topic ACL трёх publishers и Notification Delivery; остальные
+21 principal сохранены. Затем последовательно переключены семь процессов:
+Notification Delivery reader, Billing eligibility API, обычные Intake
+worker/publisher/API, Widgets producer и Identity invitation producer.
+Каждый этап проверялся под общим lock; все семь healthy, остальные 40 контейнеров
+не изменены. Новый invitation main/DLQ reader подключён, CRM main/DLQ очереди
+не имеют накопленных сообщений. Доставка бизнес-сообщений проверяется отдельно.
+
+Шесть полных env-файлов повторно скачаны и побайтово совпадают с локальными;
+canonical SHA-256 — `7686a0459809851044ed96d69c44006c226c31354502b925771144640701e325`,
+CRM env — `667977d5260de85dcfbc17ccac618446168773f67af5735ab7003bdbe36b4be1`.
+CI canonical hash обновлён. `BILLING_WINCRM_PAYMENTS_ENABLED` и
+`CRM_ACCESS_BILLING_ENABLED` остаются false. Активация не подключает виджеты
+клиентов автоматически и не импортирует историю.
+
+Первичная цепочка `crm-prepare -> crm-databases -> crm-runtime` уже не подходит
+для следующего production push: её закрытые baseline/env и Gateway revision
+устарели. Перед новым code rollout требуется проверенный steady-state scope;
+не обходить этот отказ через `all`, сброс env или удаление работающих приложений/БД.
 
 При первой попытке дочерняя Compose-команда прочитала остаток SSH-сценария
 из stdin после миграций Identity. Три Identity-процесса были восстановлены
