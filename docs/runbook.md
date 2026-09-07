@@ -182,6 +182,14 @@ ledgers. Соседние сервисы и четыре CRM PostgreSQL вход
 fingerprint на протяжении запуска. Создание БД, миграции, broker ACL, env,
 Gateway и feature flags этот scope не изменяет.
 
+Закрытость продукта проверяется по API/producer gates, а не выключением
+специализированных consumers. `widget-control-*` получают
+`CRM_INTAKE_WIDGETS_ENABLED=true`; `widget-transfer-*` дополнительно получают
+`CRM_INTAKE_WIDGET_TRANSFERS_ENABLED=true`. Эти process-local overrides
+позволяют подготовить обработчики до включения API и producer Widgets.
+Сам Intake API сохраняет оба false из CRM env. Старый manifest с одинаковыми
+false во всех ролях несовместим с защитой bootstrap специализированных workers.
+
 12 приложений запускаются последовательно с явным `--no-deps --no-build
 --pull never --no-recreate`; каждый фактический контейнер проходит проверку
 image/env, прав, mounts, health и ресурсных ограничений. Повторный запуск

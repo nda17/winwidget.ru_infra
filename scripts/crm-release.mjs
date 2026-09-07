@@ -270,10 +270,7 @@ export function crmDatabaseResources(
 ) {
 	const shape = validateCompose(config)
 	assert.equal(shape.releaseApproved, false)
-	for (const process of Object.values(config.services))
-		for (const [key, value] of Object.entries(process.environment ?? {}))
-			if (/^CRM_.*(?:ENABLED|CONNECTOR_ENABLED)$/.test(key))
-				assert.equal(value, 'false')
+	assertCrmPublicGatesClosed(config)
 	const databaseImages = owners.map(
 		owner => config.services[owner + '-postgres'].image
 	)
@@ -295,6 +292,23 @@ export function crmDatabaseResources(
 		Number.isSafeInteger(availableMemory) && availableMemory >= required
 	)
 	return { image: databaseImages[0], requiredMemoryBytes: required }
+}
+
+// Specialized readers must be running before producers can be opened. These
+// process-local flags do not expose the public Intake API or enable Widgets.
+export function assertCrmPublicGatesClosed(config) {
+	for (const [name, service] of Object.entries(config.services))
+		for (const [key, value] of Object.entries(service.environment ?? {})) {
+			if (!/^CRM_.*ENABLED$/.test(key)) continue
+			const background =
+				(/^crm-intake-widget-(control|transfer)-(worker|publisher)$/.test(
+					name
+				) &&
+					key === 'CRM_INTAKE_WIDGETS_ENABLED') ||
+				(/^crm-intake-widget-transfer-(worker|publisher)$/.test(name) &&
+					key === 'CRM_INTAKE_WIDGET_TRANSFERS_ENABLED')
+			assert.equal(value, background ? 'true' : 'false')
+		}
 }
 
 export function crmDatabaseContainer(
@@ -586,11 +600,7 @@ if (
 					),
 					receipt
 				)
-				for (const service of Object.values(config.services))
-					for (const [key, value] of Object.entries(
-						service.environment ?? {}
-					))
-						if (/^CRM_.*ENABLED$/.test(key)) assert.equal(value, 'false')
+				assertCrmPublicGatesClosed(config)
 				const names = Object.keys(config.services).filter(name =>
 					config.services[name].profiles?.includes('crm-runtime')
 				)

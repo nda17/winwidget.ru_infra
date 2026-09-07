@@ -26,7 +26,8 @@ import {
 	CRM_RUNTIME_NAMES,
 	crmRuntimeNeighbors,
 	crmRuntimeContainer,
-	crmRuntimeLedger
+	crmRuntimeLedger,
+	assertCrmPublicGatesClosed
 } from './crm-release.mjs'
 
 const root = dirname(fileURLToPath(import.meta.url))
@@ -37,6 +38,43 @@ const hash = 'c'.repeat(64)
 const owners = ['crm-access', 'crm-intake', 'crm-customers', 'crm-sales']
 const id = number => number.toString(16).padStart(64, '0')
 const image = number => 'sha256:' + id(number)
+test('closed public API permits prepared specialized readers but not public feature activation', () => {
+	const services = {
+		'crm-access-api': {
+			environment: { CRM_ACCESS_BILLING_ENABLED: 'false' }
+		},
+		'crm-intake-api': {
+			environment: {
+				CRM_INTAKE_WIDGETS_ENABLED: 'false',
+				CRM_INTAKE_WIDGET_TRANSFERS_ENABLED: 'false'
+			}
+		}
+	}
+	for (const role of [
+		'widget-control-worker',
+		'widget-control-publisher',
+		'widget-transfer-worker',
+		'widget-transfer-publisher'
+	])
+		services['crm-intake-' + role] = {
+			environment: {
+				CRM_INTAKE_WIDGETS_ENABLED: 'true',
+				CRM_INTAKE_WIDGET_TRANSFERS_ENABLED: role.startsWith(
+					'widget-transfer-'
+				)
+					? 'true'
+					: 'false'
+			}
+		}
+	assertCrmPublicGatesClosed({ services })
+	for (const name of Object.keys(services)) {
+		const altered = structuredClone(services)
+		const key = Object.keys(altered[name].environment)[0]
+		altered[name].environment[key] =
+			altered[name].environment[key] === 'true' ? 'false' : 'true'
+		assert.throws(() => assertCrmPublicGatesClosed({ services: altered }))
+	}
+})
 const fixture = () => {
 	const config = {
 		services: Object.fromEntries(
