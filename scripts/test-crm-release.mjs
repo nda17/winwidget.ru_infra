@@ -22,7 +22,11 @@ import {
 	crmDatabaseNeighbors,
 	crmDatabaseResources,
 	crmDatabaseContainer,
-	crmDatabaseCredentials
+	crmDatabaseCredentials,
+	CRM_RUNTIME_NAMES,
+	crmRuntimeNeighbors,
+	crmRuntimeContainer,
+	crmRuntimeLedger
 } from './crm-release.mjs'
 
 const root = dirname(fileURLToPath(import.meta.url))
@@ -656,7 +660,7 @@ function runController(
 			JSON.stringify(crmPreparationReceipt(input, shape)) + '\n',
 			{ mode: 0o600 }
 		)
-		if (scope === 'crm-databases') {
+		if (scope === 'crm-databases' || scope === 'crm-runtime') {
 			mkdirSync(join(directory, 'deploy/backend/secrets'), {
 				recursive: true,
 				mode: 0o700
@@ -695,6 +699,9 @@ function runController(
 						'synthetic-private\n',
 						{ mode: 0o600 }
 					)
+			if (scope === 'crm-runtime' && scenario !== 'missing-database')
+				for (const owner of owners)
+					writeFileSync(join(directory, 'running-' + owner), '')
 		}
 		const trace = join(directory, 'calls')
 		const script = `
@@ -724,7 +731,7 @@ stat() {
 sha256sum() { "$TEST_NODE" -e 'const f=require("node:fs"),c=require("node:crypto");console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$1"; }
 git() { if [[ "$*" == *rev-parse* ]]; then printf '%s\\n' "$TEST_REVISION"; fi; }
 flock() { [[ "$TEST_SCENARIO" != lock-lost ]] || return 1; }
-awk() { if [[ "$*" == *'/proc/meminfo'* ]]; then printf '17179869184'; else command awk "$@"; fi; }
+awk() { if [[ "$*" == *'/proc/meminfo'* ]]; then if [[ "$TEST_SCENARIO" == low-runtime-memory ]]; then printf '1073741824'; else printf '17179869184'; fi; else command awk "$@"; fi; }
 docker() {
   printf 'DOCKER %s\\n' "$*" >>"$TEST_TRACE"
   local last=''
@@ -738,10 +745,18 @@ docker() {
           if [[ -f "$TEST_DIRECTORY/running-$app" && ( "$*" != *'label=com.docker.compose.service='* || "$*" == *"service=$app-postgres"* ) ]]; then printf '%064d\\n' "$number"; fi
           number=$((number+1))
         done
+        number=10
+        for app in $TEST_RUNTIME_NAMES; do
+          if [[ -f "$TEST_DIRECTORY/runtime-$app" && ( "$*" != *'label=com.docker.compose.service='* || "$*" == *"service=$app" ) ]]; then printf '%064d\\n' "$number"; fi
+          number=$((number+1))
+        done
         if [[ "$TEST_SCENARIO" == unknown-container && "$*" != *'label=com.docker.compose.service='* ]]; then printf '%064d\\n' 99; fi
       else printf '%s\\n' "$TEST_CONTAINER"; fi ;;
     inspect)
-      if [[ "$*" == *'.State.Health.Status'* ]]; then printf 'healthy\\n'
+      if [[ "$*" == *'.State.Status'* ]]; then
+        if [[ "$TEST_SCENARIO" == unhealthy-runtime ]]; then printf 'running unhealthy 0 false\\n'; else printf 'running healthy 0 false\\n'; fi
+      elif [[ "$*" == *'.State.Health.Status'* ]]; then printf 'healthy\\n'
+      elif [[ "$*" == *'.Config.Image'* ]]; then printf 'postgres:18-bookworm@sha256:%064d\\n' 90
       elif [[ "$*" == *'org.opencontainers.image.revision'* ]]; then printf '%s %s\\n' "$TEST_PROBE_IMAGE" "$TEST_PREVIOUS"
       else printf '[]\\n'; fi ;;
     image)
@@ -765,10 +780,22 @@ docker() {
     run)
       local mode='' previous_arg='' arg
       for arg in "$@"; do if [[ "$previous_arg" == /run/crm-release.mjs ]]; then mode="$arg"; fi; previous_arg="$arg"; done
-      if [[ "$mode" == inventory || "$mode" == database-neighbors ]]; then
-        [[ "$mode" == database-neighbors ]] || return 101
+      if [[ "$mode" == inventory || "$mode" == database-neighbors || "$mode" == runtime-neighbors ]]; then
+        [[ "$mode" == database-neighbors || "$mode" == runtime-neighbors ]] || return 101
         command cat >/dev/null
         if [[ "$TEST_SCENARIO" == neighbor-drift && -f "$TEST_DIRECTORY/built-winwidget-crm-access:git-$TEST_REVISION" ]]; then printf 'drift\\n'; else printf '%s\\n' "$TEST_HASH"; fi
+      elif [[ "$mode" == runtime-seal ]]; then
+        [[ "$TEST_SCENARIO" != invalid-runtime-seal ]] || return 102
+        for arg in $TEST_RUNTIME_NAMES; do printf '%s\\n' "$arg"; done
+      elif [[ "$mode" == runtime-compose ]]; then printf '{}\\n'
+      elif [[ "$mode" == runtime-ledger ]]; then
+        command cat >/dev/null
+        [[ "$TEST_SCENARIO" != invalid-runtime-ledger ]] || return 103
+        printf '1\\n'
+      elif [[ "$mode" == runtime-container ]]; then
+        command cat >/dev/null
+        [[ "$TEST_SCENARIO" != runtime-drift ]] || return 104
+        printf '%064d\\n' 10
       elif [[ "$mode" == database-resources ]]; then
         [[ "$TEST_SCENARIO" != capacity-failed ]] || return 92
         printf 'postgres:18-bookworm@sha256:%064d\\n' 90
@@ -786,7 +813,10 @@ docker() {
         command cat "$TEST_DIRECTORY/input-receipt.json"
       fi ;;
     compose)
-      if [[ "$TEST_SCOPE" != crm-databases ]]; then command cat "$TEST_DIRECTORY/input-compose.json"
+      if [[ "$TEST_SCOPE" == crm-runtime ]]; then
+        [[ "$*" == *' up '* && "$*" == *'--no-recreate'* && " $TEST_RUNTIME_NAMES " == *" $last "* ]] || return 105
+        : >"$TEST_DIRECTORY/runtime-$last"
+      elif [[ "$TEST_SCOPE" != crm-databases ]]; then command cat "$TEST_DIRECTORY/input-compose.json"
       elif [[ "$*" == *' up '* ]]; then
         [[ "$last" == crm-*-postgres && "$*" == *'--no-recreate'* ]] || return 96
         : >"$TEST_DIRECTORY/running-\${last%-postgres}"
@@ -816,7 +846,7 @@ env() {
   shift 2
   local count=0
   while [[ "$1" != docker ]]; do [[ "$1" == CRM_*_IMAGE=* || "$1" == CRM_*_REVISION=* ]] || return 89; count=$((count+1)); shift; done
-  if [[ "$TEST_SCOPE" == crm-databases ]]; then [[ "$count" == 0 ]] || return 90; else [[ "$count" == 8 ]] || return 90; fi
+  if [[ "$TEST_SCOPE" == crm-databases || "$TEST_SCOPE" == crm-runtime ]]; then [[ "$count" == 0 ]] || return 90; else [[ "$count" == 8 ]] || return 90; fi
   shift
   docker "$@"
 }
@@ -825,7 +855,7 @@ scoped_deploy_main
 		const execute = () =>
 			spawnSync('/bin/bash', ['-c', script], {
 				encoding: 'utf8',
-				timeout: scope === 'crm-databases' ? 60000 : 20000,
+				timeout: scope === 'crm-prepare' ? 20000 : 60000,
 				env: {
 					PATH: process.env.PATH,
 					TEST_NODE: process.execPath,
@@ -834,6 +864,7 @@ scoped_deploy_main
 					TEST_LIBRARY: join(root, 'deploy-crm-scoped.sh'),
 					TEST_SCENARIO: scenario,
 					TEST_SCOPE: scope,
+					TEST_RUNTIME_NAMES: CRM_RUNTIME_NAMES.join(' '),
 					TEST_REVISION: revision,
 					TEST_PREVIOUS: previous,
 					TEST_HASH: hash,
@@ -878,13 +909,285 @@ scoped_deploy_main
 				? JSON.parse(readFileSync(receiptPath, 'utf8'))
 				: null,
 			temporary: readdirSync(join(directory, 'deploy/backend')).filter(
-				name => name.startsWith('.crm-prepare.')
+				name =>
+					name.startsWith('.crm-prepare.') ||
+					name.startsWith('.crm-runtime.')
 			)
 		}
 	} finally {
 		rmSync(directory, { recursive: true, force: true })
 	}
 }
+
+test('runtime fence excludes only known applications and preserves database and other-service identities', () => {
+	const base = neighbors()
+	const runtime = {
+		...structuredClone(base[1]),
+		Id: id(30),
+		Config: {
+			Labels: {
+				'com.docker.compose.project': 'winwidget-crm',
+				'com.docker.compose.service': CRM_RUNTIME_NAMES[0]
+			}
+		}
+	}
+	assert.equal(
+		crmRuntimeNeighbors([...base, runtime], previous),
+		crmNeighborFingerprint(base, previous)
+	)
+	assert.throws(() =>
+		crmRuntimeNeighbors([...base, runtime, runtime], previous)
+	)
+	runtime.Config.Labels['com.docker.compose.service'] = 'crm-unexpected'
+	assert.throws(() => crmRuntimeNeighbors([...base, runtime], previous))
+	const db = structuredClone(base[1])
+	db.Id = id(40)
+	db.Config.Labels['com.docker.compose.project'] = 'winwidget-crm'
+	db.Config.Labels['com.docker.compose.service'] = 'crm-access-postgres'
+	assert.notEqual(
+		crmRuntimeNeighbors([...base, db], previous),
+		crmNeighborFingerprint(base, previous)
+	)
+})
+
+test('runtime ledger requires exact successful migrations, without missing, failed or modified entries', () => {
+	const migrations = [{ name: 'a', checksum: hash }]
+	const row = {
+		migration_name: 'a',
+		checksum: hash,
+		finished_at: '2026-09-07',
+		rolled_back_at: null
+	}
+	assert.equal(crmRuntimeLedger(migrations, [row]), 1)
+	for (const rows of [
+		[],
+		[row, row],
+		[{ ...row, checksum: 'f'.repeat(64) }],
+		[{ ...row, finished_at: null }],
+		[{ ...row, rolled_back_at: '2026-09-07' }]
+	])
+		assert.throws(() => crmRuntimeLedger(migrations, rows))
+})
+
+test('each runtime process requires its exact immutable image, env, isolation and healthy state', () => {
+	for (const name of CRM_RUNTIME_NAMES) {
+		const owner = owners.find(value => name.startsWith(value + '-'))
+		const candidate = {
+			Id: image(1),
+			Config: {
+				Labels: { 'org.opencontainers.image.revision': revision },
+				Env: ['PATH=/usr/bin'],
+				Cmd: ['node', 'dist/main.js'],
+				Entrypoint: ['docker-entrypoint.sh']
+			}
+		}
+		const service = {
+			image: candidate.Id,
+			user: '1001:1001',
+			labels: { 'com.winwidget.owner': owner },
+			environment: {
+				APP_REVISION: revision,
+				SYNTHETIC_SECRET: 'synthetic-only'
+			},
+			mem_limit: 384 * 1048576,
+			memswap_limit: 384 * 1048576,
+			cpus: 1,
+			pids_limit: 128,
+			security_opt: ['no-new-privileges:true'],
+			logging: {
+				driver: 'json-file',
+				options: { 'max-size': '10m', 'max-file': '3' }
+			},
+			tmpfs: ['/tmp:rw,nosuid,nodev,noexec,size=64m'],
+			healthcheck: {
+				test: ['CMD', 'node', 'healthcheck.js'],
+				interval: '10s',
+				timeout: '5s',
+				start_period: '30s',
+				retries: 3
+			}
+		}
+		const config = { services: { [name]: service } }
+		const live = {
+			Id: id(1),
+			Image: candidate.Id,
+			Name: '/winwidget-crm-' + name + '-1',
+			RestartCount: 0,
+			State: {
+				Running: true,
+				Paused: false,
+				Restarting: false,
+				OOMKilled: false,
+				Dead: false,
+				Health: { Status: 'healthy' }
+			},
+			Mounts: [],
+			Config: {
+				Image: candidate.Id,
+				Labels: {
+					...service.labels,
+					'com.docker.compose.project': 'winwidget-crm',
+					'com.docker.compose.service': name,
+					'com.docker.compose.oneoff': 'False',
+					'com.docker.compose.container-number': '1'
+				},
+				Env: [
+					...candidate.Config.Env,
+					...Object.entries(service.environment).map(
+						([key, value]) => key + '=' + value
+					)
+				],
+				User: service.user,
+				Cmd: candidate.Config.Cmd,
+				Entrypoint: candidate.Config.Entrypoint,
+				StopTimeout: 45,
+				Healthcheck: {
+					Test: service.healthcheck.test,
+					Interval: 10e9,
+					Timeout: 5e9,
+					StartPeriod: 30e9,
+					Retries: 3
+				}
+			},
+			HostConfig: {
+				NetworkMode: 'host',
+				Privileged: false,
+				ReadonlyRootfs: true,
+				Init: true,
+				Memory: service.mem_limit,
+				MemorySwap: service.memswap_limit,
+				NanoCpus: 1e9,
+				PidsLimit: 128,
+				CapDrop: ['ALL'],
+				SecurityOpt: service.security_opt,
+				PidMode: '',
+				IpcMode: 'private',
+				RestartPolicy: { Name: 'unless-stopped', MaximumRetryCount: 0 },
+				LogConfig: { Type: 'json-file', Config: service.logging.options },
+				Tmpfs: { '/tmp': 'rw,nosuid,nodev,noexec,size=64m' }
+			}
+		}
+		assert.equal(
+			crmRuntimeContainer(live, config, [candidate], name),
+			live.Id
+		)
+		for (const mutate of [
+			x => {
+				x.Image = image(2)
+			},
+			x => {
+				x.Config.Env.push('FOREIGN_SECRET=wrong')
+			},
+			x => {
+				x.State.OOMKilled = true
+			},
+			x => {
+				x.RestartCount = 1
+			},
+			x => {
+				x.State.Health.Status = 'unhealthy'
+			},
+			x => {
+				x.HostConfig.Memory = 1
+			},
+			x => {
+				x.HostConfig.Privileged = true
+			},
+			x => {
+				x.HostConfig.ReadonlyRootfs = false
+			},
+			x => {
+				x.HostConfig.Init = false
+			},
+			x => {
+				x.HostConfig.PortBindings = { '80/tcp': [] }
+			},
+			x => {
+				x.Mounts = [{ Type: 'bind', Destination: '/run/foreign' }]
+			},
+			x => {
+				x.Config.Labels['com.docker.compose.project'] = 'winwidget'
+			},
+			x => {
+				x.Config.User = '0:0'
+			}
+		]) {
+			const changed = structuredClone(live)
+			mutate(changed)
+			assert.throws(() =>
+				crmRuntimeContainer(changed, config, [candidate], name)
+			)
+		}
+	}
+})
+
+test('actual CRM runtime controller starts exactly twelve applications and accepts an exact replay', () => {
+	const result = runController('success', true, 'crm-runtime')
+	assert.equal(result.first.status, 0, result.first.stderr)
+	assert.equal(result.second.status, 0, result.second.stderr)
+	assert.match(
+		result.first.stdout,
+		/Twelve isolated CRM processes verified/
+	)
+	assert.deepEqual(result.temporary, [])
+	assert.doesNotMatch(
+		result.calls,
+		/DOCKER (build|pull|stop|rm|volume|network) /
+	)
+	assert.doesNotMatch(
+		result.calls,
+		/database-bootstrap|database-grants| compose .* run /
+	)
+	assert.doesNotMatch(
+		result.first.stdout + result.first.stderr,
+		/PRIVATE_PIPE_SENTINEL/
+	)
+	const starts = result.calls
+		.split('\n')
+		.filter(
+			line => line.startsWith('DOCKER compose ') && line.includes(' up ')
+		)
+	assert.equal(starts.length, 24)
+	assert.deepEqual(
+		starts.slice(0, 12).map(line => line.split(' ').at(-1)),
+		CRM_RUNTIME_NAMES
+	)
+})
+
+test('actual CRM runtime blocks unsafe inputs before any application starts', () => {
+	for (const scenario of [
+		'invalid-runtime-seal',
+		'invalid-runtime-ledger',
+		'missing-database',
+		'unknown-container',
+		'low-runtime-memory',
+		'env-drift',
+		'lock-lost'
+	]) {
+		const result = runController(scenario, false, 'crm-runtime')
+		assert.notEqual(result.first.status, 0, scenario)
+		assert.doesNotMatch(result.calls, /DOCKER compose .* up /, scenario)
+		assert.doesNotMatch(
+			result.calls,
+			/DOCKER (stop|rm|volume|network) /,
+			scenario
+		)
+	}
+})
+
+test('actual CRM runtime fails at an unhealthy first process without starting further processes', () => {
+	const result = runController('unhealthy-runtime', false, 'crm-runtime')
+	assert.notEqual(result.first.status, 0)
+	assert.equal(
+		result.calls
+			.split('\n')
+			.filter(
+				line => line.startsWith('DOCKER compose ') && line.includes(' up ')
+			).length,
+		1
+	)
+	assert.doesNotMatch(result.calls, /DOCKER (stop|rm|volume|network) /)
+})
 
 test('actual CRM controller prepares four images, preserves immutable artifacts on replay and never starts runtime or migrates', () => {
 	const result = runController('success', true)

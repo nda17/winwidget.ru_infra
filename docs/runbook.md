@@ -44,7 +44,8 @@ Telegram bridge VPS
 
 В `winwidget.ru_services/deploy/docker-compose.crm.yml` описан отдельный
 Compose project `winwidget-crm`. Он не объединяется через `-f` с действующим
-`docker-compose.prod.yml` и не подключён к routine release controller.
+`docker-compose.prod.yml`. Первичный закрытый запуск выполняет отдельный scope
+`crm-runtime` существующего pinned release controller, не routine scope `all`.
 Само наличие конфигурации, зелёный shape test или запущенный CRM frontend
 не разрешают запуск backend, открытие Gateway routes, Trial или продаж.
 
@@ -174,9 +175,26 @@ node --test .github/scripts/validate-crm-compose.test.mjs
 Sales 5; migration pool 1. Memory/CPU caps обязательны, но не имеют
 idle-derived значений по умолчанию. Сумма caps не доказывает реальный пик.
 
+`crm-runtime` запускается только после подготовки четырёх owner БД и broker
+principals. Он проверяет исходный sealed receipt, неизменённый CRM env, четыре
+image IDs/OCI revisions, аутентификацию runtime DB roles и полные migration
+ledgers. Соседние сервисы и четыре CRM PostgreSQL входят в неизменяемый
+fingerprint на протяжении запуска. Создание БД, миграции, broker ACL, env,
+Gateway и feature flags этот scope не изменяет.
+
+12 приложений запускаются последовательно с явным `--no-deps --no-build
+--pull never --no-recreate`; каждый фактический контейнер проходит проверку
+image/env, прав, mounts, health и ресурсных ограничений. Повторный запуск
+принимает только точно совпадающие здоровые процессы: это не контроллер
+обновления на другую ревизию. Остановленные, чужие или несовпадающие процессы
+требуют отдельного восстановления; автоматический rollback БД запрещён.
+Перед каждым стартом требуется запас 2.5 GiB, после — минимум 2 GiB, рост
+потребления памяти во время запуска не должен превышать 3 GiB. Эти проверки
+не заменяют нагрузочную проверку CPU/pools/очередей и не открывают продажи.
+
 До открытия рабочего CRM нужны capacity/business/browser gates из service backlog,
 актуальная сверка owner DB/image/migration evidence, broker ACL/bindings,
-согласованный Identity/Billing cutover и CRM-only controller запуска приложений.
+проверенные межсервисные вызовы и фактический запуск приложений.
 
 Подготовительный scope `crm-prepare` проходит через тот же pinned reusable
 workflow и `deploy-services-production.sh`, общий root-owned deploy lock и

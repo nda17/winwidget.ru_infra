@@ -2,8 +2,8 @@
 # Sourced by the immutable root controller under its shared production lock.
 # crm-prepare seals immutable inputs without starting containers. The separate
 # crm-databases scope initializes only owned databases and runs migrations.
-# Neither scope starts CRM applications, provisions the broker, changes
-# production env, replaces existing runtime or opens public routes.
+# crm-runtime starts only the twelve already prepared CRM processes, with all
+# business gates closed. No scope changes env, broker ACL or public routes.
 # shellcheck disable=SC2154
 [[ "${BASH_SOURCE[0]}" != "$0" ]] || {
 	printf '%s\n' 'Use the pinned reusable production workflow.' >&2
@@ -72,7 +72,7 @@ crm_cleanup_prepare() {
 	local status=$?
 	trap - EXIT
 	if [[ -n "${crm_work_directory:-}" ]]; then
-		rm -f -- "$crm_work_directory/desired.json" "$crm_work_directory/images.json" "$crm_work_directory/receipt.json" "$crm_work_directory/postgres-image.json"
+		rm -f -- "$crm_work_directory/desired.json" "$crm_work_directory/images.json" "$crm_work_directory/receipt.json" "$crm_work_directory/postgres-image.json" "$crm_work_directory/runtime.json"
 		rmdir "$crm_work_directory"
 	fi
 	cleanup_scoped_payload
@@ -112,9 +112,11 @@ scoped_deploy_main() {
 		# database-neighbors still rejects every CRM application/unknown job;
 		# database-main verifies the four database configurations separately.
 		crm-prepare | crm-databases) crm_inventory_mode=database-neighbors ;;
+		crm-runtime) crm_inventory_mode=runtime-neighbors ;;
 		*) die 'Unsupported CRM scope.' ;;
 	esac
 	crm_initialize
+	if [[ "$release_scope" == crm-runtime ]]; then crm_runtime_main; return; fi
 	if [[ "$release_scope" == crm-databases ]]; then crm_database_main; return; fi
 	crm_work_directory="$(mktemp -d "$app_root/deploy/backend/.crm-prepare.XXXXXX")"
 	chmod 700 "$crm_work_directory"
@@ -186,7 +188,7 @@ crm_database_compose() {
 crm_database_verifier() {
 	local mode="$1" owner="${2:-}" selected="${crm_images[0]}" index
 	local -a mounts=() arguments=("$mode")
-	if [[ -n "$owner" ]]; then
+	if [[ -n "$owner" && "$mode" != runtime-container ]]; then
 		for index in "${!crm_owners[@]}"; do
 			if [[ "${crm_owners[$index]}" == "$owner" ]]; then selected="${crm_images[$index]}"; break; fi
 		done
@@ -194,6 +196,8 @@ crm_database_verifier() {
 		arguments+=("$owner")
 		mounts+=(--volume "$app_root/deploy/backend/secrets/$owner-postgres-admin-password:/run/crm-admin-password:ro"
 			--volume "$app_root/deploy/backend/secrets/$owner-postgres-backup-password:/run/crm-backup-password:ro")
+	elif [[ "$mode" == runtime-container ]]; then
+		arguments+=("$owner")
 	fi
 	docker run --rm --interactive --log-driver none --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
 		--user 0:0 --memory 128m --memory-swap 128m --cpus 0.5 --pids-limit 32 \
@@ -202,6 +206,7 @@ crm_database_verifier() {
 		--volume "$release_root/deploy/crm/database-access.mjs:/run/crm-database-access.mjs:ro" \
 		--volume "$crm_work_directory:/run/crm:ro" ${mounts[@]+"${mounts[@]}"} \
 		--env "CRM_AVAILABLE_MEMORY_BYTES=${crm_available_memory:-0}" \
+		--env "CRM_SERVICES_REVISION=$services_revision" --env "CRM_ENV_SHA256=$expected_service_env_sha256" \
 		--entrypoint node "$selected" /run/crm-release.mjs "${arguments[@]}"
 }
 
@@ -363,7 +368,7 @@ crm_database_main() {
 			crm_database_auth "$owner" "$id" "$role" || die 'CRM role authentication failed after bootstrap.'
 		done
 		crm_fence
-		crm_database_compose run --rm --no-deps --pull never --name "winwidget-crm-$owner-migration-$services_revision" "$owner-migrate" >/dev/null 2>&1 ||
+		crm_database_compose run --rm --no-deps --pull never --interactive=false -T --name "winwidget-crm-$owner-migration-$services_revision" "$owner-migrate" </dev/null >/dev/null 2>&1 ||
 			die 'CRM migration job failed; no automatic reset, down migration or data deletion is allowed.'
 		crm_fence
 		crm_database_verifier database-grants "$owner" | crm_database_psql "$owner" "$id" >/dev/null || die 'CRM migration ledger or exact runtime grants failed verification.'
@@ -375,4 +380,108 @@ crm_database_main() {
 		crm_verify_database "$owner" "$id" || die 'CRM database configuration changed after migration.'
 	done
 	printf '%s\n' 'Four CRM databases initialized and migrated; no applications, broker, payments or public routes activated. Full runtime capacity remains unproven.'
+}
+
+# Initial closed-product runtime, or an exact idempotent replay. Upgrades to a
+# different image/env require a new reviewed release; never roll data backwards.
+crm_runtime_main() {
+	local owner role file tag id image_revision title expected actual name state attempt names schema
+	crm_owners=(crm-access crm-intake crm-customers crm-sales)
+	crm_images=()
+	crm_secret_files=()
+	crm_secret_hashes=()
+	crm_release_directory="$app_root/deploy/backend/crm/releases/$services_revision"
+	assert_root_owned_directory "$crm_release_directory"
+	for file in desired.json receipt.json; do
+		assert_root_owned_file "$crm_release_directory/$file"
+		[[ "$(stat -c '%a' "$crm_release_directory/$file")" == 600 ]] || die 'Unsafe prepared CRM artifact.'
+	done
+	crm_desired_hash="$(sha256sum "$crm_release_directory/desired.json" | awk '{print $1}')"
+	crm_receipt_hash="$(sha256sum "$crm_release_directory/receipt.json" | awk '{print $1}')"
+	for owner in "${crm_owners[@]}"; do
+		tag="winwidget-$owner:git-$services_revision"
+		read -r id image_revision title < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}} {{index .Config.Labels "org.opencontainers.image.title"}}' "$tag")
+		[[ "$id" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" && "$title" == "winwidget-$owner" ]] || die 'CRM runtime image differs from the prepared release.'
+		crm_images+=("$id")
+		for role in admin backup; do
+			file="$app_root/deploy/backend/secrets/$owner-postgres-$role-password"
+			assert_root_owned_file "$file"
+			[[ "$(stat -c '%a' "$file")" == 600 ]] || die 'Unsafe CRM database credential file.'
+			crm_secret_files+=("$file")
+			crm_secret_hashes+=("$(sha256sum "$file" | awk '{print $1}')")
+		done
+	done
+	crm_database_phase=true
+	crm_fence
+	crm_work_directory="$(mktemp -d "$app_root/deploy/backend/.crm-runtime.XXXXXX")"
+	chmod 700 "$crm_work_directory"
+	trap crm_cleanup_prepare EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM HUP
+	cp -- "$crm_release_directory/desired.json" "$crm_work_directory/desired.json"
+	cp -- "$crm_release_directory/receipt.json" "$crm_work_directory/receipt.json"
+	docker image inspect "${crm_images[@]}" >"$crm_work_directory/images.json"
+	names="$(crm_database_verifier runtime-seal </dev/null)" || die 'Prepared CRM runtime seal does not match images, source or CRM env.'
+	[[ "$(printf '%s\n' "$names" | wc -l)" -eq 12 ]] || die 'Exactly twelve CRM application processes are required.'
+	crm_database_verifier runtime-compose </dev/null >"$crm_work_directory/runtime.json" || die 'Cannot select the isolated CRM runtime.'
+	crm_runtime_hash="$(sha256sum "$crm_work_directory/runtime.json" | awk '{print $1}')"
+	# No image pulls, DB creation, migration replay, ACL changes or new dumps.
+	expected=''
+	for owner in "${crm_owners[@]}"; do
+		id="$(crm_database_id "$owner")" || die 'CRM database is not unique.'
+		[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Prepared CRM database is missing.'
+		tag="$(docker inspect --format '{{.Config.Image}}' "$id")"
+		docker image inspect "$tag" >"$crm_work_directory/postgres-image.json"
+		crm_verify_database "$owner" "$id" || die 'CRM database configuration differs from the sealed release.'
+		crm_database_auth "$owner" "$id" runtime || die 'CRM runtime database credential failed authentication.'
+		schema="${owner//-/_}"
+		printf 'SELECT coalesce(json_agg(t), '\''[]'\''::json) FROM (SELECT migration_name,checksum,finished_at,rolled_back_at FROM %s._prisma_migrations ORDER BY started_at) t;\n' "$schema" | crm_database_psql "$owner" "$id" | crm_database_verifier runtime-ledger "$owner" >/dev/null || die 'CRM migration ledger differs from its exact image.'
+		expected+="$id"$'\n'
+	done
+	# An existing process is accepted only when its exact image/env and all
+	# runtime settings already match. Stopped/unknown/one-off jobs are rejected.
+	while IFS= read -r name; do
+		id="$(docker ps -aq --no-trunc --filter label=com.docker.compose.project=winwidget-crm --filter "label=com.docker.compose.service=$name")"
+		if [[ -n "$id" ]]; then
+			[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Duplicate CRM runtime process.'
+			docker inspect "$id" | crm_database_verifier runtime-container "$name" >/dev/null || die 'Existing CRM runtime differs from the selected release.'
+			expected+="$id"$'\n'
+		fi
+	done <<<"$names"
+	actual="$(docker ps -aq --no-trunc --filter label=com.docker.compose.project=winwidget-crm | sort)"
+	[[ "$actual" == "$(printf '%s' "$expected" | sed '/^$/d' | sort)" ]] || die 'Unknown CRM container blocks runtime startup.'
+	crm_runtime_memory_before="$(awk '/^MemAvailable:/ {printf "%.0f", $2*1024}' /proc/meminfo)"
+	while IFS= read -r name; do
+		crm_fence
+		[[ "$(sha256sum "$crm_work_directory/runtime.json" | awk '{print $1}')" == "$crm_runtime_hash" ]] || die 'CRM runtime configuration changed.'
+		crm_runtime_memory_check before-start
+		env -i PATH="$PATH" docker compose --project-name winwidget-crm --env-file /dev/null --profile crm-runtime \
+			-f "$crm_work_directory/runtime.json" up --detach --no-deps --no-build --pull never --no-recreate "$name" </dev/null >/dev/null 2>&1 || die 'CRM process failed to start; owned data remains intact.'
+		id="$(docker ps -aq --no-trunc --filter label=com.docker.compose.project=winwidget-crm --filter "label=com.docker.compose.service=$name")"
+		[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'CRM process identity is not unique.'
+		for ((attempt=0; attempt<90; attempt++)); do
+			state="$(docker inspect --format '{{.State.Status}} {{.State.Health.Status}} {{.RestartCount}} {{.State.OOMKilled}}' "$id")"
+			[[ "$state" != 'running healthy 0 false' ]] || break
+			[[ "$state" == 'running starting 0 false' ]] || die 'CRM startup failed; inspect this process without resetting data.'
+			sleep 2
+		done
+		docker inspect "$id" | crm_database_verifier runtime-container "$name" >/dev/null || die 'CRM runtime failed exact health/configuration verification.'
+		crm_runtime_memory_check
+		printf '%s\n' "CRM runtime verified: $name."
+	done <<<"$names"
+	crm_fence
+	while IFS= read -r name; do
+		id="$(docker ps -q --no-trunc --filter label=com.docker.compose.project=winwidget-crm --filter "label=com.docker.compose.service=$name")"
+		docker inspect "$id" | crm_database_verifier runtime-container "$name" >/dev/null || die 'Final CRM runtime verification failed.'
+	done <<<"$names"
+	crm_runtime_memory_check
+	printf '%s\n' 'Twelve isolated CRM processes verified; public routes, Trial and paid sales remain closed. Load/browser verification is still required.'
+}
+
+crm_runtime_memory_check() {
+	local available reserve=2147483648
+	[[ "${1:-}" != before-start ]] || reserve=2684354560
+	available="$(awk '/^MemAvailable:/ {printf "%.0f", $2*1024}' /proc/meminfo)"
+	[[ "$available" =~ ^[0-9]+$ && "$crm_runtime_memory_before" =~ ^[0-9]+$ ]] || die 'Cannot measure CRM memory headroom.'
+	(( available >= reserve && crm_runtime_memory_before - available <= 3221225472 )) || die 'CRM startup exceeded its memory envelope; keep public access closed.'
 }

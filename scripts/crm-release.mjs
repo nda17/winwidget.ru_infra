@@ -4,6 +4,20 @@ import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 const owners = ['crm-access', 'crm-intake', 'crm-customers', 'crm-sales']
+export const CRM_RUNTIME_NAMES = Object.freeze([
+	'crm-access-api',
+	'crm-customers-api',
+	'crm-sales-api',
+	'crm-intake-api',
+	'crm-access-worker',
+	'crm-access-outbox-publisher',
+	'crm-intake-worker',
+	'crm-intake-publisher',
+	'crm-intake-widget-control-worker',
+	'crm-intake-widget-control-publisher',
+	'crm-intake-widget-transfer-worker',
+	'crm-intake-widget-transfer-publisher'
+])
 const digest = value => createHash('sha256').update(value).digest('hex')
 const revision = value =>
 	typeof value === 'string' && /^[a-f0-9]{40}$/.test(value)
@@ -97,6 +111,156 @@ export function crmDatabaseNeighbors(containers, gatewayRevision) {
 		return false
 	})
 	return crmNeighborFingerprint(neighbors, gatewayRevision)
+}
+
+export function crmRuntimeNeighbors(containers, gatewayRevision) {
+	const seen = new Set()
+	return crmNeighborFingerprint(
+		containers.filter(item => {
+			if (
+				item.Config?.Labels?.['com.docker.compose.project'] !==
+				'winwidget-crm'
+			)
+				return true
+			const name = item.Config.Labels['com.docker.compose.service']
+			assert.ok(
+				CRM_RUNTIME_NAMES.includes(name) ||
+					owners.some(owner => name === owner + '-postgres')
+			)
+			assert.ok(!seen.has(name))
+			seen.add(name)
+			return !CRM_RUNTIME_NAMES.includes(name)
+		}),
+		gatewayRevision
+	)
+}
+
+export function crmRuntimeContainer(container, config, images, name) {
+	assert.ok(CRM_RUNTIME_NAMES.includes(name))
+	const expected = config.services[name]
+	const image = images.find(item => item.Id === expected.image)
+	assert.ok(image && sha(container.Id))
+	assert.equal(container.Image, image.Id)
+	assert.equal(container.Config.Image, image.Id)
+	assert.equal(container.Name, '/winwidget-crm-' + name + '-1')
+	const labels = container.Config.Labels
+	assert.equal(labels['com.docker.compose.project'], 'winwidget-crm')
+	assert.equal(labels['com.docker.compose.service'], name)
+	assert.equal(labels['com.docker.compose.oneoff'], 'False')
+	assert.equal(labels['com.docker.compose.container-number'], '1')
+	for (const [key, value] of Object.entries(expected.labels))
+		assert.equal(labels[key], value)
+	assert.equal(
+		image.Config.Labels['org.opencontainers.image.revision'],
+		expected.environment.APP_REVISION
+	)
+	const state = container.State
+	assert.equal(state.Running, true)
+	for (const key of ['Paused', 'Restarting', 'OOMKilled', 'Dead'])
+		assert.equal(state[key], false)
+	assert.equal(state.Health.Status, 'healthy')
+	assert.equal(container.RestartCount, 0)
+	const env = entries =>
+		Object.fromEntries(
+			entries.map(line => {
+				const split = line.indexOf('=')
+				assert.ok(split > 0)
+				return [line.slice(0, split), line.slice(split + 1)]
+			})
+		)
+	assert.deepEqual(env(container.Config.Env), {
+		...env(image.Config.Env ?? []),
+		...expected.environment
+	})
+	assert.equal(container.Config.User, expected.user)
+	assert.deepEqual(
+		container.Config.Cmd,
+		expected.command ?? image.Config.Cmd
+	)
+	assert.deepEqual(
+		container.Config.Entrypoint,
+		expected.entrypoint ?? image.Config.Entrypoint
+	)
+	assert.equal(container.Config.StopTimeout, 45)
+	const host = container.HostConfig
+	assert.equal(host.NetworkMode, 'host')
+	assert.equal(host.Privileged, false)
+	assert.equal(host.ReadonlyRootfs, true)
+	assert.equal(host.Init, true)
+	assert.equal(host.Memory, Number(expected.mem_limit))
+	assert.equal(host.MemorySwap, Number(expected.memswap_limit))
+	assert.equal(host.NanoCpus, Math.round(Number(expected.cpus) * 1e9))
+	assert.equal(host.PidsLimit, expected.pids_limit)
+	assert.deepEqual(host.CapDrop, ['ALL'])
+	assert.ok(!host.CapAdd?.length)
+	assert.deepEqual(host.SecurityOpt, expected.security_opt)
+	assert.equal(host.PidMode, '')
+	assert.equal(host.IpcMode, 'private')
+	for (const key of ['Devices', 'VolumesFrom', 'Links', 'ExtraHosts'])
+		assert.ok(!host[key]?.length)
+	assert.equal(Object.keys(host.PortBindings ?? {}).length, 0)
+	assert.deepEqual(host.RestartPolicy, {
+		Name: 'unless-stopped',
+		MaximumRetryCount: 0
+	})
+	assert.deepEqual(host.LogConfig, {
+		Type: expected.logging.driver,
+		Config: expected.logging.options
+	})
+	assert.deepEqual(
+		host.Tmpfs,
+		Object.fromEntries(
+			expected.tmpfs.map(value => {
+				const split = value.indexOf(':')
+				return [value.slice(0, split), value.slice(split + 1)]
+			})
+		)
+	)
+	assert.ok(
+		container.Mounts.every(
+			mount => mount.Type === 'tmpfs' && mount.Destination === '/tmp'
+		)
+	)
+	assert.deepEqual(
+		container.Config.Healthcheck.Test,
+		expected.healthcheck.test
+	)
+	const duration = value => {
+		const match = /^(\d+)(ms|s|m)$/.exec(value)
+		assert.ok(match)
+		return Number(match[1]) * { ms: 1e6, s: 1e9, m: 60e9 }[match[2]]
+	}
+	for (const [key, target] of [
+		['interval', 'Interval'],
+		['timeout', 'Timeout'],
+		['start_period', 'StartPeriod']
+	])
+		assert.equal(
+			container.Config.Healthcheck[target],
+			duration(expected.healthcheck[key])
+		)
+	assert.equal(
+		container.Config.Healthcheck.Retries,
+		expected.healthcheck.retries
+	)
+	return container.Id
+}
+
+export function crmRuntimeLedger(migrations, rows) {
+	assert.equal(rows.length, migrations.length)
+	assert.ok(rows.every(row => row.finished_at && !row.rolled_back_at))
+	const sort = values =>
+		[...values].sort((a, b) => a.name.localeCompare(b.name))
+	assert.deepEqual(
+		sort(
+			rows.map(row => ({
+				name: row.migration_name,
+				checksum: row.checksum
+			}))
+		),
+		sort(migrations)
+	)
+	return migrations.length
 }
 
 export function crmDatabaseResources(
@@ -356,14 +520,20 @@ if (
 ) {
 	try {
 		const mode = process.argv[2]
-		if (mode === 'inventory' || mode === 'database-neighbors') {
+		if (
+			['inventory', 'database-neighbors', 'runtime-neighbors'].includes(
+				mode
+			)
+		) {
 			assert.equal(process.argv.length, 3)
 			const input = readFileSync(0, 'utf8')
 			assert.ok(Buffer.byteLength(input) <= 8 * 1048576)
 			process.stdout.write(
 				(mode === 'inventory'
 					? crmNeighborFingerprint
-					: crmDatabaseNeighbors)(
+					: mode === 'runtime-neighbors'
+						? crmRuntimeNeighbors
+						: crmDatabaseNeighbors)(
 					JSON.parse(input),
 					process.env.CRM_GATEWAY_REVISION
 				) + '\n'
@@ -386,6 +556,78 @@ if (
 				validateCrmCompose
 			)
 			process.stdout.write(JSON.stringify(report) + '\n')
+		} else if (mode.startsWith('runtime-')) {
+			const { validateCrmCompose } =
+				await import('/run/crm-compose-validator.mjs')
+			const composeBytes = readFileSync('/run/crm/desired.json', 'utf8')
+			const config = JSON.parse(composeBytes)
+			validateCrmCompose(config)
+			const images = JSON.parse(
+				readFileSync('/run/crm/images.json', 'utf8')
+			)
+			if (mode === 'runtime-seal') {
+				const receipt = JSON.parse(
+					readFileSync('/run/crm/receipt.json', 'utf8')
+				)
+				assert.equal(
+					receipt.servicesRevision,
+					process.env.CRM_SERVICES_REVISION
+				)
+				assert.equal(receipt.crmEnvSha256, process.env.CRM_ENV_SHA256)
+				assert.deepEqual(
+					crmPreparationReceipt(
+						{
+							...receipt,
+							composeBytes,
+							images,
+							architecture: process.arch === 'x64' ? 'amd64' : process.arch
+						},
+						validateCrmCompose
+					),
+					receipt
+				)
+				for (const service of Object.values(config.services))
+					for (const [key, value] of Object.entries(
+						service.environment ?? {}
+					))
+						if (/^CRM_.*ENABLED$/.test(key)) assert.equal(value, 'false')
+				const names = Object.keys(config.services).filter(name =>
+					config.services[name].profiles?.includes('crm-runtime')
+				)
+				assert.deepEqual(names.sort(), [...CRM_RUNTIME_NAMES].sort())
+				process.stdout.write(CRM_RUNTIME_NAMES.join('\n') + '\n')
+			} else if (mode === 'runtime-compose') {
+				const selected = {
+					name: 'winwidget-crm',
+					services: Object.fromEntries(
+						CRM_RUNTIME_NAMES.map(name => [name, config.services[name]])
+					)
+				}
+				process.stdout.write(
+					JSON.stringify(selected).replaceAll('$', () => '$$') + '\n'
+				)
+			} else if (mode === 'runtime-container') {
+				const input = JSON.parse(readFileSync(0, 'utf8'))
+				assert.equal(input.length, 1)
+				process.stdout.write(
+					crmRuntimeContainer(input[0], config, images, process.argv[3]) +
+						'\n'
+				)
+			} else if (mode === 'runtime-ledger') {
+				const owner = process.argv[3]
+				assert.ok(owners.includes(owner))
+				const { readDatabaseAccess } =
+					await import('/run/crm-database-access.mjs')
+				const { migrations } = readDatabaseAccess('/app/prisma', owner)
+				process.stdout.write(
+					String(
+						crmRuntimeLedger(
+							migrations,
+							JSON.parse(readFileSync(0, 'utf8'))
+						)
+					) + '\n'
+				)
+			} else throw new Error('Unsupported runtime mode')
 		} else if (mode.startsWith('database-')) {
 			assert.ok(process.argv.length === 3 || process.argv.length === 4)
 			const { validateCrmCompose } =
