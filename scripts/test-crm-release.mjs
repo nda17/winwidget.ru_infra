@@ -31,6 +31,7 @@ import {
 	crmRuntimeLedger,
 	CRM_UPGRADE_GROUPS,
 	CRM_UPGRADE_MIGRATIONS,
+	crmUpgradeNotificationDatabaseIdentity,
 	crmUpgradeBaseline,
 	crmUpgradeFence,
 	crmUpgradeSource,
@@ -187,15 +188,32 @@ function upgradeFixture() {
 		billing: hash,
 		canonical: hash,
 		crm: hash,
-		identity: hash
+		identity: hash,
+		'notification-delivery': hash
 	})
 	return { live, baseline }
 }
 
 test('upgrade baseline seals exact target identities and all neighbors without a magic global count or secrets', () => {
 	const { live, baseline } = upgradeFixture()
-	assert.equal(Object.keys(baseline.targets).length, 17)
-	assert.equal(JSON.stringify(baseline).includes('SYNTHETIC_SECRET'), false)
+	assert.equal(Object.keys(baseline.targets).length, 18)
+	assert.ok(
+		Object.hasOwn(
+			baseline.targets,
+			'winwidget/notification-delivery-worker'
+		)
+	)
+	assert.equal(
+		Object.hasOwn(baseline.targets, 'winwidget-crm/crm-sales-reminders'),
+		false
+	)
+	const missingOwnerEnv = { ...baseline.environmentHashes }
+	delete missingOwnerEnv['notification-delivery']
+	assert.throws(() => crmUpgradeBaseline(live, previous, missingOwnerEnv))
+	assert.equal(
+		JSON.stringify(baseline).includes('SYNTHETIC_SECRET'),
+		false
+	)
 	assert.equal(crmUpgradeFence(live, baseline), true)
 	for (const mutate of [
 		rows => rows.pop(),
@@ -334,12 +352,79 @@ function companyRequisitesSourceFixture() {
 	return { migration, checksum, before, after }
 }
 
+test('Customers contact preferences require their exact forward schema pair and preserve company requisites', () => {
+	const { before: initial, after: before } =
+		companyRequisitesSourceFixture()
+	const migration = '20260907223000_add_contact_call_preferences'
+	const after = {
+		...before,
+		'schema.prisma':
+			'4ceda3fabb6a6923f5a75c540ff01b89926ea0d8c27c1f40e6e57e8fa40c51d2',
+		[migration]:
+			'6ec838976adc8aa583b29a7732fe9cbddabb60d63ab7efd3b67c7d78968e0fec'
+	}
+	assert.equal(crmUpgradeSource('crm-customers', before, after), true)
+	assert.equal(crmUpgradeSource('crm-customers', initial, after), true)
+	assert.equal(crmUpgradeSource('crm-customers', after, after), true)
+	for (const alter of [
+		value => delete value[migration],
+		value => (value[migration] = hash),
+		value => (value['schema.prisma'] = before['schema.prisma']),
+		value => (value['schema.prisma'] = hash),
+		value => (value['database-access.json'] = 'd'.repeat(64)),
+		value => delete value['20260907210000_add_company_requisites']
+	]) {
+		const changed = structuredClone(after)
+		alter(changed)
+		assert.throws(() => crmUpgradeSource('crm-customers', before, changed))
+	}
+	assert.throws(() => crmUpgradeSource('crm-customers', after, before))
+})
+
+test('upgrade ND reader permits only CHECK expansion with unchanged Prisma, old SQL and ACL source', () => {
+	const migration = '20260907230000_add_wincrm_task_reminders'
+	const before = {
+		'schema.prisma': hash,
+		'migration_lock.toml': hash,
+		'20260727000000_init_notification_delivery': hash
+	}
+	const after = {
+		...before,
+		[migration]: CRM_UPGRADE_MIGRATIONS['notification-delivery'][migration]
+	}
+	assert.equal(
+		crmUpgradeSource('notification-delivery', before, after),
+		true
+	)
+	assert.equal(
+		crmUpgradeSource('notification-delivery', after, after),
+		true
+	)
+	for (const alter of [
+		value => (value['schema.prisma'] = 'd'.repeat(64)),
+		value => (value[migration] = hash),
+		value => (value['database-access.json'] = hash),
+		value => delete value['20260727000000_init_notification_delivery'],
+		value => (value['20260907230001_unreviewed'] = hash)
+	]) {
+		const changed = structuredClone(after)
+		alter(changed)
+		assert.throws(() =>
+			crmUpgradeSource('notification-delivery', before, changed)
+		)
+	}
+	assert.throws(() =>
+		crmUpgradeSource('notification-delivery', after, before)
+	)
+})
+
 test('Customers source accepts only the paired requisites schema and exact append-only migration', () => {
 	const { migration, checksum, before, after } =
 		companyRequisitesSourceFixture()
-	assert.deepEqual(CRM_UPGRADE_MIGRATIONS['crm-customers'], {
-		[migration]: checksum
-	})
+	assert.equal(
+		CRM_UPGRADE_MIGRATIONS['crm-customers'][migration],
+		checksum
+	)
 	assert.equal(crmUpgradeSource('crm-customers', before, after), true)
 	assert.equal(crmUpgradeSource('crm-customers', before, before), true)
 	assert.equal(crmUpgradeSource('crm-customers', after, after), true)
@@ -524,7 +609,11 @@ function databaseInputFixture(owner = 'identity') {
 	const schema = owner.replaceAll('-', '_')
 	const migrationUrl = `postgresql://winwidget_${schema}_migration:migration-test-secret@127.0.0.1:55442/winwidget_${schema}?schema=${schema}&sslmode=disable&connection_limit=1&pool_timeout=5`
 	const runtimeUrl = `postgresql://winwidget_${schema}_runtime:runtime-secret-must-not-cross@127.0.0.1:55442/winwidget_${schema}?schema=${schema}&sslmode=disable`
-	const ownerEnv = `${schema.toUpperCase()}_MIGRATION_DATABASE_URL=${JSON.stringify(migrationUrl)}\nUNRELATED_SECRET=not-in-handoff\n`
+	const migrationKey =
+		owner === 'notification-delivery'
+			? 'NOTIFICATION_DELIVERY_MIGRATION_URL_PRODUCTION'
+			: `${schema.toUpperCase()}_MIGRATION_DATABASE_URL`
+	const ownerEnv = `${migrationKey}=${JSON.stringify(migrationUrl)}\nUNRELATED_SECRET=not-in-handoff\n`
 	const live = [
 		{
 			Config: {
@@ -532,7 +621,10 @@ function databaseInputFixture(owner = 'identity') {
 					'com.docker.compose.project': owner.startsWith('crm-')
 						? 'winwidget-crm'
 						: 'winwidget',
-					'com.docker.compose.service': `${owner}-api`
+					'com.docker.compose.service':
+						owner === 'notification-delivery'
+							? 'notification-delivery-worker'
+							: `${owner}-api`
 				},
 				Env: [
 					`${schema.toUpperCase()}_DATABASE_URL=${runtimeUrl}`,
@@ -544,7 +636,7 @@ function databaseInputFixture(owner = 'identity') {
 	return { owner, schema, ownerEnv, live, migrationUrl, runtimeUrl }
 }
 
-test('database stdin handoff is owner-bound and contains only one migration secret for all six images', () => {
+test('database stdin handoff is owner-bound and contains only one migration secret for all seven images', () => {
 	for (const [owner] of CRM_UPGRADE_GROUPS) {
 		const fixture = databaseInputFixture(owner)
 		const value = crmUpgradeDatabaseInput(owner, fixture.ownerEnv, fixture.live)
@@ -608,6 +700,122 @@ test('database root reader rejects absent, duplicate and cross-owner runtime/env
 		changed[0].Config.Env[0] = replace(changed[0].Config.Env[0])
 		assert.throws(() => crmUpgradeDatabaseInput(owner, ownerEnv, changed))
 	}
+})
+
+test('upgrade ND database continuity binds real OID and immutable complete ledger without a fictitious service UUID', () => {
+	const fixture = databaseInputFixture('notification-delivery')
+	const input = crmUpgradeDatabaseInput(
+		fixture.owner,
+		fixture.ownerEnv,
+		fixture.live
+	)
+	const principal = {
+		db: 'winwidget_notification_delivery',
+		schema: 'notification_delivery',
+		databaseOid: '16596'
+	}
+	const row = {
+		id: '11111111-2222-4333-8444-555555555555',
+		migration_name: '20260727000000_init_notification_delivery',
+		checksum: hash,
+		finished_at: '2026-07-27 00:00:00+00',
+		rolled_back_at: null
+	}
+	const identity = crmUpgradeNotificationDatabaseIdentity(
+		input,
+		principal,
+		[row]
+	)
+	assert.equal(identity.kind, 'postgres-database-ledger-anchor.v1')
+	assert.equal(identity.databaseOid, '16596')
+	assert.equal(JSON.stringify(identity).includes('secret'), false)
+	const before = {
+		databaseId: null,
+		databaseIdentity: identity,
+		ledger: [row],
+		roles: [],
+		memberships: [],
+		acl: [],
+		pending: ['new']
+	}
+	const after = {
+		...structuredClone(before),
+		ledger: [
+			row,
+			{
+				...row,
+				id: '66666666-2222-4333-8444-555555555555',
+				migration_name: '20260907230000_add_wincrm_task_reminders'
+			}
+		],
+		pending: []
+	}
+	assert.equal(crmUpgradeDatabasePreserved(before, after), true)
+	for (const alter of [
+		value => (value.databaseIdentity.databaseOid = '16597'),
+		value => (value.databaseIdentity.host = 'localhost'),
+		value => (value.databaseIdentity.port = '55443'),
+		value =>
+			(value.databaseIdentity.anchor.id =
+				'66666666-2222-4333-8444-555555555555'),
+		value => (value.ledger[0].checksum = 'd'.repeat(64)),
+		value => (value.ledger[0].finished_at = null),
+		value => value.ledger.shift(),
+		value => delete value.databaseIdentity,
+		value => delete value.ledger,
+		value => value.memberships.push({ role: 'foreign' })
+	]) {
+		const changed = structuredClone(after)
+		alter(changed)
+		assert.throws(() => crmUpgradeDatabasePreserved(before, changed))
+	}
+	for (const databaseOid of ['0', '-1', '4294967296', '123x', null])
+		assert.throws(() =>
+			crmUpgradeNotificationDatabaseIdentity(
+				input,
+				{ ...principal, databaseOid },
+				[row]
+			)
+		)
+	for (const ledger of [
+		[],
+		[{ ...row, finished_at: null }],
+		[{ ...row, rolled_back_at: '2026-01-01' }],
+		[
+			{
+				...row,
+				migration_name: '20260907230000_add_wincrm_task_reminders'
+			}
+		]
+	])
+		assert.throws(() =>
+			crmUpgradeNotificationDatabaseIdentity(input, principal, ledger)
+		)
+	assert.deepEqual(
+		crmUpgradeDatabaseMemberships('notification-delivery', []),
+		[]
+	)
+	assert.throws(() =>
+		crmUpgradeDatabaseMemberships('notification-delivery', [
+			{ role: 'winwidget_notification_delivery_runtime' }
+		])
+	)
+	const wrong = structuredClone(fixture.live)
+	wrong[0].Config.Labels['com.docker.compose.service'] =
+		'notification-delivery-api'
+	assert.throws(() =>
+		crmUpgradeDatabaseInput(fixture.owner, fixture.ownerEnv, wrong)
+	)
+	assert.throws(() =>
+		crmUpgradeDatabaseInput(
+			fixture.owner,
+			fixture.ownerEnv.replace(
+				'MIGRATION_URL_PRODUCTION',
+				'MIGRATION_DATABASE_URL'
+			),
+			fixture.live
+		)
+	)
 })
 
 test('non-root database consumer revalidates exact envelope, migration identity and approved runtime binding', () => {
@@ -726,9 +934,14 @@ test('bounded database handoff parser rejects duplicate keys and malformed bytes
 	assert.deepEqual(parseCrmUpgradeDatabaseHandoff(Buffer.from(raw)), value)
 	for (const bytes of [
 		Buffer.from(
-			raw.replace('"owner":"identity"', '"owner":"billing","owner":"identity"')
+			raw.replace(
+				'"owner":"identity"',
+				'"owner":"billing","owner":"identity"'
+			)
 		),
-		Buffer.from(raw.replace('"port":"55442"', '"port":"55443","port":"55442"')),
+		Buffer.from(
+			raw.replace('"port":"55442"', '"port":"55443","port":"55442"')
+		),
 		Buffer.from('{'),
 		Buffer.alloc(0),
 		Buffer.alloc(16385, 32),
@@ -841,7 +1054,9 @@ test('real upgrade probe argv isolates source and piped database reads without a
 				])
 				assert.deepEqual(values('--user'), [
 					['upgrade-source', 'upgrade-database'].includes(actualMode)
-						? '1001:1001'
+						? owner === 'notification-delivery'
+							? '1000:1000'
+							: '1001:1001'
 						: '0:0'
 				])
 				assert.ok(values('--volume').every(value => value.endsWith(':ro')))
@@ -1194,13 +1409,15 @@ function upgradeDesiredFixture() {
 		Architecture: process.arch === 'x64' ? 'amd64' : process.arch,
 		Config: {
 			Labels: {
-				'org.opencontainers.image.title': `winwidget-${owner}`,
+				...(owner === 'notification-delivery'
+					? {}
+					: { 'org.opencontainers.image.title': `winwidget-${owner}` }),
 				'org.opencontainers.image.revision': revision
 			},
 			Env: ['PATH=/usr/bin'],
 			Cmd: ['node', 'dist/main.js'],
 			Entrypoint: ['docker-entrypoint.sh'],
-			User: '1001:1001',
+			User: owner === 'notification-delivery' ? 'node' : '1001:1001',
 			WorkingDir: '/app'
 		}
 	}))
@@ -1216,7 +1433,7 @@ function upgradeDesiredFixture() {
 						: 45
 			const service = {
 				image: candidate.Id,
-				user: '1001:1001',
+				user: candidate.Config.User,
 				labels: { 'com.winwidget.owner': owner },
 				environment: {
 					APP_REVISION: revision,
@@ -1315,7 +1532,8 @@ function upgradeDesiredFixture() {
 		billing: hash,
 		canonical: hash,
 		crm: hash,
-		identity: hash
+		identity: hash,
+		'notification-delivery': hash
 	})
 	return { live, baseline, crm, companions, images, servicesRevision: revision }
 }
@@ -1323,9 +1541,34 @@ function upgradeDesiredFixture() {
 test('upgrade desired contract selects only approved groups and isolated migration jobs without changing product env', () => {
 	const input = upgradeDesiredFixture()
 	const { desired, replacements } = crmUpgradeDesired(input, () => {})
-	assert.equal(Object.keys(replacements).length, 17)
+	assert.equal(Object.keys(replacements).length, 18)
 	assert.equal(Object.keys(desired.crm.services).length, 16)
-	assert.equal(Object.keys(desired.companions.services).length, 6)
+	assert.equal(Object.keys(desired.companions.services).length, 8)
+	assert.equal(
+		desired.companions.services['notification-delivery-migrate'].user,
+		'1000:1000'
+	)
+	assert.ok(
+		CRM_UPGRADE_GROUPS.findIndex(
+			([owner]) => owner === 'notification-delivery'
+		) < CRM_UPGRADE_GROUPS.findIndex(([owner]) => owner === 'crm-sales')
+	)
+	for (const change of [
+		value => value.images.reverse(),
+		value =>
+			(value.images.find(
+				image => image.Config.User === 'node'
+			).Config.User = 'root'),
+		value =>
+			(value.images.find(
+				image => image.Config.User === 'node'
+			).Config.Labels['org.opencontainers.image.title'] =
+				'winwidget-foreign')
+	]) {
+		const changed = structuredClone(input)
+		change(changed)
+		assert.throws(() => crmUpgradeDesired(changed, () => {}))
+	}
 	assert.equal(
 		Object.hasOwn(desired.companions.services, 'identity-migrate'),
 		false
@@ -1538,6 +1781,7 @@ function runUpgradeController(scenario = 'success', replay = false) {
 			'deploy/backend/crm',
 			'services/apps/billing',
 			'services/apps/identity',
+			'services/apps/notification-delivery',
 			'release',
 			'payload'
 		])
@@ -1547,7 +1791,8 @@ function runUpgradeController(scenario = 'success', replay = false) {
 			'deploy/backend/crm/.env.production',
 			'deploy/backend/crm/upgrade-baseline.json',
 			'services/apps/billing/.env.production',
-			'services/apps/identity/.env.production'
+			'services/apps/identity/.env.production',
+			'services/apps/notification-delivery/.env.production'
 		])
 			writeFileSync(join(directory, path), '{}\n', { mode: 0o600 })
 		const script = `
@@ -1580,6 +1825,7 @@ owner_names() {
     billing) printf 'billing-worker billing-outbox-publisher billing-scheduler billing-api' ;;
     crm-access) printf 'crm-access-worker crm-access-outbox-publisher crm-access-api' ;;
     crm-customers) printf 'crm-customers-api' ;;
+    notification-delivery) printf 'notification-delivery-worker' ;;
     crm-sales) printf 'crm-sales-api' ;;
     crm-intake) printf 'crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher crm-intake-api' ;;
   esac
@@ -1601,7 +1847,7 @@ crm_upgrade_probe() {
     upgrade-database-check)
       [[ "$TEST_SCENARIO" != uuid-drift || "$owner" != crm-access || ! -f "$TEST_DIRECTORY/migrated-crm-access" ]] || return 12 ;;
     upgrade-pending)
-      if [[ "$owner" == billing || "$owner" == crm-access || "$owner" == crm-sales ]] && [[ ! -f "$TEST_DIRECTORY/migrated-$owner" ]]; then printf '1\\n'; else printf '0\\n'; fi ;;
+      if [[ "$owner" == billing || "$owner" == crm-access || "$owner" == crm-sales || "$owner" == notification-delivery ]] && [[ ! -f "$TEST_DIRECTORY/migrated-$owner" ]]; then printf '1\\n'; else printf '0\\n'; fi ;;
     upgrade-grants)
       [[ "$TEST_SCENARIO" != grants-failed || "$owner" != crm-access ]] || return 13
       printf 'PRIVATE_SQL_SENTINEL\\n' ;;
@@ -1647,7 +1893,7 @@ docker() {
       else printf '%s %s\\n' "$TEST_IMAGE" "$TEST_PREVIOUS"; fi ;;
     image)
       [[ "$2" == inspect ]] || return 92
-      if [[ "$3" == --format ]]; then owner="\${last#winwidget-}"; owner="\${owner%%:*}"; printf '%s %s winwidget-%s\\n' "$TEST_IMAGE" "$TEST_REVISION" "$owner"
+      if [[ "$3" == --format ]]; then owner="\${last#winwidget-}"; owner="\${owner%%:*}"; if [[ "$owner" == notification-delivery ]]; then printf '%s %s node\\n' "$TEST_IMAGE" "$TEST_REVISION"; else printf '%s %s winwidget-%s\\n' "$TEST_IMAGE" "$TEST_REVISION" "$owner"; fi
       else printf '[]\\n'; fi ;;
     exec)
       [[ "$*" == *'psql -X -q -v ON_ERROR_STOP=1'* ]] || return 20
@@ -1716,7 +1962,7 @@ test('upgrade coordinator validates both old Billing image sources before its fi
 	)
 })
 
-test('upgrade coordinator switches exactly 17 targets in dependency groups and replay never restarts completed groups', () => {
+test('upgrade coordinator switches exactly 18 targets in dependency groups and replay never restarts completed groups', () => {
 	const result = runUpgradeController('success', true)
 	assert.equal(result.first.status, 0, result.first.stderr)
 	assert.equal(result.second.status, 0, result.second.stderr)

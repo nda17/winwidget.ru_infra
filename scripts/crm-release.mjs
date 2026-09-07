@@ -46,6 +46,7 @@ export const CRM_UPGRADE_GROUPS = Object.freeze(
 			'crm-access-api'
 		],
 		['crm-customers', 'crm-customers-api'],
+		['notification-delivery', 'notification-delivery-worker'],
 		['crm-sales', 'crm-sales-api'],
 		[
 			'crm-intake',
@@ -75,7 +76,13 @@ export const CRM_UPGRADE_MIGRATIONS = Object.freeze({
 	},
 	'crm-customers': {
 		'20260907210000_add_company_requisites':
-			'2906853950f496d481dc831af21d824418ecd7281f105ad3b3356e98c90fbfc1'
+			'2906853950f496d481dc831af21d824418ecd7281f105ad3b3356e98c90fbfc1',
+		'20260907223000_add_contact_call_preferences':
+			'6ec838976adc8aa583b29a7732fe9cbddabb60d63ab7efd3b67c7d78968e0fec'
+	},
+	'notification-delivery': {
+		'20260907230000_add_wincrm_task_reminders':
+			'ecd2b1677dccc6c0515ef38baf28a4407c0ae4882c68bbcf4d60da11fd807b27'
 	},
 	'crm-sales': {
 		'20260907120000_add_task_in_progress':
@@ -83,7 +90,11 @@ export const CRM_UPGRADE_MIGRATIONS = Object.freeze({
 		'20260907120100_expand_workday_tasks':
 			'682d6f9684489a51e7f138588e5cceb38b6c05824cbc7dc6d186354aad54be53',
 		'20260907140000_add_workday_commands':
-			'3af100250b2046060f9ab3a368d37dd88065dac222247a5f16108390a003a87e'
+			'3af100250b2046060f9ab3a368d37dd88065dac222247a5f16108390a003a87e',
+		'20260907220000_add_reminder_rules':
+			'd207e844a7f74b858745d598ebfb9a76cb910f83847931dfb087ad86e9794ddf',
+		'20260907230000_add_reminder_delivery':
+			'd05634a4704c8947cb48a9bf379436e519417545d09ddec6833b1bb692491190'
 	},
 	'crm-intake': {}
 })
@@ -157,7 +168,8 @@ export function crmUpgradeBaseline(live, gatewayRevision, environmentHashes) {
 		'billing',
 		'canonical',
 		'crm',
-		'identity'
+		'identity',
+		'notification-delivery'
 	])
 	for (const value of Object.values(environmentHashes)) assert.ok(sha(value))
 	for (const key of upgradeTargets)
@@ -265,23 +277,34 @@ export function crmUpgradeOldImages(baseline, owner) {
 export function crmUpgradeSource(owner, before, after) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
 	if (owner === 'crm-customers') {
-		const migration = '20260907210000_add_company_requisites'
+		const migrations = Object.keys(CRM_UPGRADE_MIGRATIONS[owner])
+		const schemas = [
+			'be7b6d591352f4dbd77310df08f3d27971a49ede45cb653a8ff6ac6ea2823b12',
+			'7d17e1d8b4cdc31cea0e342427aa84d1b388d3f22515b2e5cfcacde1afe79b42',
+			'4ceda3fabb6a6923f5a75c540ff01b89926ea0d8c27c1f40e6e57e8fa40c51d2'
+		]
 		if (
 			before['schema.prisma'] !== after['schema.prisma'] ||
-			(!Object.hasOwn(before, migration) && Object.hasOwn(after, migration))
+			migrations.some(
+				name => !Object.hasOwn(before, name) && Object.hasOwn(after, name)
+			)
 		) {
-			// Only the reviewed five nullable Company columns. Customers keeps
-			// its existing table-level ACL manifest and every previous SQL byte.
-			assert.equal(
-				before['schema.prisma'],
-				'be7b6d591352f4dbd77310df08f3d27971a49ede45cb653a8ff6ac6ea2823b12'
+			// Exact forward-only schema/SQL pairs, preserving every old SQL byte
+			// and the unchanged table-level ACL manifest. No unpaired model edit.
+			const start = schemas.indexOf(before['schema.prisma'])
+			const end = schemas.indexOf(after['schema.prisma'])
+			assert.ok(start >= 0 && end > start)
+			for (const name of migrations.slice(start, end)) {
+				assert.equal(Object.hasOwn(before, name), false)
+				assert.equal(after[name], CRM_UPGRADE_MIGRATIONS[owner][name])
+			}
+			assert.deepEqual(
+				migrations.filter(
+					name =>
+						!Object.hasOwn(before, name) && Object.hasOwn(after, name)
+				),
+				migrations.slice(start, end)
 			)
-			assert.equal(
-				after['schema.prisma'],
-				'7d17e1d8b4cdc31cea0e342427aa84d1b388d3f22515b2e5cfcacde1afe79b42'
-			)
-			assert.equal(Object.hasOwn(before, migration), false)
-			assert.equal(after[migration], CRM_UPGRADE_MIGRATIONS[owner][migration])
 		}
 	}
 	for (const [name, checksum] of Object.entries(before)) {
@@ -539,25 +562,24 @@ export function crmUpgradeDesired(
 	assert.equal(crm.name, 'winwidget-crm')
 	assert.equal(companions.name, 'winwidget')
 	assert.equal(images.length, CRM_UPGRADE_GROUPS.length)
-	assert.equal(
-		new Set(
-			images.map(item => item.Config.Labels?.['org.opencontainers.image.title'])
-		).size,
-		images.length
-	)
+	assert.equal(new Set(images.map(item => item.Id)).size, images.length)
 	crmUpgradeFence(live, baseline)
 	const desired = {
 		crm: { name: 'winwidget-crm', services: {} },
 		companions: { name: 'winwidget', services: {} }
 	}
 	const replacements = {}
-	for (const [owner, ...names] of CRM_UPGRADE_GROUPS) {
-		const image = images.find(
-			item =>
-				item.Config.Labels?.['org.opencontainers.image.title'] ===
-				`winwidget-${owner}`
-		)
+	for (const [index, [owner, ...names]] of CRM_UPGRADE_GROUPS.entries()) {
+		// The sealed image inventory follows the explicit owner build order.
+		// Legacy ND has only a revision label; keep its exact node runtime.
+		const image = images[index]
 		assert.ok(imageId(image?.Id))
+		assert.equal(
+			image.Config.Labels?.['org.opencontainers.image.title'],
+			owner === 'notification-delivery' ? undefined : `winwidget-${owner}`
+		)
+		if (owner === 'notification-delivery')
+			assert.equal(image.Config.User, 'node')
 		assert.equal(
 			image.Config.Labels['org.opencontainers.image.revision'],
 			servicesRevision
@@ -647,7 +669,8 @@ export function crmUpgradeDesired(
 			delete migration.depends_on
 			migration.image = image.Id
 			Object.assign(migration, {
-				user: '1001:1001',
+				user:
+					owner === 'notification-delivery' ? '1000:1000' : '1001:1001',
 				read_only: true,
 				cap_drop: ['ALL'],
 				security_opt: ['no-new-privileges:true'],
@@ -687,7 +710,9 @@ export function crmUpgradeDatabaseInput(owner, ownerEnv, live) {
 		env[match[1]] = value
 	}
 	const approved = live.filter(
-		item => upgradeKey(item) === `${upgradeProject(owner)}/${owner}-api`
+		item =>
+			upgradeKey(item) ===
+			`${upgradeProject(owner)}/${owner === 'notification-delivery' ? 'notification-delivery-worker' : `${owner}-api`}`
 	)
 	assert.equal(approved.length, 1)
 	const runtimeUrl = new URL(
@@ -697,7 +722,12 @@ export function crmUpgradeDatabaseInput(owner, ownerEnv, live) {
 	assert.equal(runtimeUrl.searchParams.getAll('schema').length, 1)
 	const input = {
 		owner,
-		migrationUrl: env[`${schema.toUpperCase()}_MIGRATION_DATABASE_URL`],
+		migrationUrl:
+			env[
+				owner === 'notification-delivery'
+					? 'NOTIFICATION_DELIVERY_MIGRATION_URL_PRODUCTION'
+					: `${schema.toUpperCase()}_MIGRATION_DATABASE_URL`
+			],
 		runtimeBinding: {
 			host: runtimeUrl.hostname,
 			port: runtimeUrl.port,
@@ -804,6 +834,50 @@ export function crmUpgradeDatabaseMemberships(owner, rows, admin = null) {
 	return canonical
 }
 
+// ND predates service_identity. Its explicit continuity contract is the exact
+// endpoint/database OID plus the immutable earliest completed ledger receipt.
+// This is not a service UUID and does not authorize role/bootstrap mutations.
+export function crmUpgradeNotificationDatabaseIdentity(
+	input,
+	principal,
+	rows
+) {
+	const url = crmUpgradeDatabaseConnection('notification-delivery', input)
+	assert.equal(principal.db, 'winwidget_notification_delivery')
+	assert.equal(principal.schema, 'notification_delivery')
+	assert.match(principal.databaseOid, /^[1-9][0-9]{0,9}$/)
+	assert.ok(Number(principal.databaseOid) <= 4294967295)
+	assert.ok(Array.isArray(rows) && rows.length > 0)
+	const ordered = [...rows].sort((a, b) =>
+		a.migration_name.localeCompare(b.migration_name)
+	)
+	const first = ordered[0]
+	assert.match(
+		first.id,
+		/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
+	)
+	assert.equal(
+		first.migration_name,
+		'20260727000000_init_notification_delivery'
+	)
+	assert.ok(
+		sha(first.checksum) && first.finished_at && !first.rolled_back_at
+	)
+	return {
+		kind: 'postgres-database-ledger-anchor.v1',
+		database: principal.db,
+		schema: principal.schema,
+		databaseOid: principal.databaseOid,
+		host: url.hostname,
+		port: url.port,
+		anchor: {
+			id: first.id,
+			migrationName: first.migration_name,
+			checksum: first.checksum
+		}
+	}
+}
+
 async function crmUpgradeDatabase(owner, complete, input) {
 	const url = crmUpgradeDatabaseConnection(owner, input)
 	const schema = owner.replaceAll('-', '_')
@@ -819,11 +893,16 @@ async function crmUpgradeDatabase(owner, complete, input) {
 			async tx => {
 				await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
 				await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'")
-				const [identity] = await tx.$queryRawUnsafe(
-					`SELECT service_name, database_id::text FROM ${schema}.service_identity WHERE id='singleton'`
-				)
-				assert.equal(identity?.service_name, `${owner}-service`)
-				assert.match(identity.database_id, /^[a-f0-9-]{36}$/)
+				const [identity] =
+					owner === 'notification-delivery'
+						? []
+						: await tx.$queryRawUnsafe(
+								`SELECT service_name, database_id::text FROM ${schema}.service_identity WHERE id='singleton'`
+							)
+				if (owner !== 'notification-delivery') {
+					assert.equal(identity?.service_name, `${owner}-service`)
+					assert.match(identity.database_id, /^[a-f0-9-]{36}$/)
+				}
 				const [principal] = await tx.$queryRawUnsafe(
 					"SELECT current_database() AS db, current_user AS username, current_schema() AS schema, pg_is_in_recovery() AS recovery, current_setting('server_version_num')::int AS version"
 				)
@@ -834,6 +913,12 @@ async function crmUpgradeDatabase(owner, complete, input) {
 				assert.ok(
 					principal.version >= 180000 && principal.version < 190000
 				)
+				if (owner === 'notification-delivery') {
+					const [database] = await tx.$queryRawUnsafe(
+						'SELECT oid::text AS oid FROM pg_database WHERE datname=current_database()'
+					)
+					principal.databaseOid = database?.oid
+				}
 				const roles = await tx.$queryRawUnsafe(
 					`SELECT rolname,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls FROM pg_roles WHERE rolname IN ('winwidget_${schema}_migration','winwidget_${schema}_runtime') ORDER BY rolname`
 				)
@@ -850,7 +935,8 @@ async function crmUpgradeDatabase(owner, complete, input) {
 						assert.equal(role[key], false)
 					if (
 						owner.startsWith('crm-') ||
-						role.rolname === 'winwidget_billing_runtime'
+						role.rolname === 'winwidget_billing_runtime' ||
+						role.rolname === 'winwidget_notification_delivery_runtime'
 					)
 						assert.equal(role.rolinherit, false)
 				}
@@ -880,7 +966,7 @@ async function crmUpgradeDatabase(owner, complete, input) {
 					admins[0] ?? null
 				)
 				const rows = await tx.$queryRawUnsafe(
-					`SELECT id, migration_name, checksum, finished_at::text, rolled_back_at::text FROM ${schema}._prisma_migrations ORDER BY migration_name, started_at`
+					`SELECT id, migration_name, checksum, finished_at::text, rolled_back_at::text${owner === 'notification-delivery' ? ", started_at::text, applied_steps_count, md5(COALESCE(logs,'')) AS logs_fingerprint" : ''} FROM ${schema}._prisma_migrations ORDER BY migration_name, started_at`
 				)
 				const pending = crmUpgradeLedger(
 					owner,
@@ -921,7 +1007,17 @@ async function crmUpgradeDatabase(owner, complete, input) {
 						)
 				}
 				return {
-					databaseId: identity.database_id,
+					databaseId: identity?.database_id ?? null,
+					...(owner === 'notification-delivery'
+						? {
+								databaseIdentity: crmUpgradeNotificationDatabaseIdentity(
+									input,
+									principal,
+									rows
+								),
+								ledger: rows
+							}
+						: {}),
 					pending,
 					acl,
 					roles,
@@ -941,6 +1037,20 @@ export function crmUpgradeDatabasePreserved(
 	complete = true
 ) {
 	assert.equal(after.databaseId, before.databaseId)
+	if (before.databaseId === null || after.databaseId === null) {
+		assert.equal(
+			before.databaseIdentity?.kind,
+			'postgres-database-ledger-anchor.v1'
+		)
+		assert.deepEqual(after.databaseIdentity, before.databaseIdentity)
+		assert.ok(Array.isArray(before.ledger) && Array.isArray(after.ledger))
+		assert.ok(before.ledger.length > 0)
+		for (const row of before.ledger) {
+			const matching = after.ledger.filter(item => item.id === row.id)
+			assert.equal(matching.length, 1)
+			assert.deepEqual(matching[0], row)
+		}
+	}
 	assert.ok(Array.isArray(before.roles) && Array.isArray(after.roles))
 	assert.deepEqual(after.roles, before.roles)
 	assert.ok(
@@ -1088,12 +1198,17 @@ async function crmUpgradeCommand(mode) {
 		const { validateCrmCompose } =
 			await import('/run/crm-compose-validator.mjs')
 		const billing = json('billing'),
-			identity = json('identity')
+			identity = json('identity'),
+			notification = json('notification-delivery')
 		const companions = {
 			name: 'winwidget',
 			services: {
 				...billing.services,
-				'identity-api': identity.services['identity-api']
+				'identity-api': identity.services['identity-api'],
+				'notification-delivery-worker':
+					notification.services['notification-delivery-worker'],
+				'notification-delivery-migrate':
+					notification.services['notification-delivery-migrate']
 			}
 		}
 		const { desired, replacements } = crmUpgradeDesired(

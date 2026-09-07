@@ -915,6 +915,8 @@ const crmWidgets = crmFlag('WIDGETS_WINCRM_CONNECTOR_ENABLED');
 const crmEmail = crmFlag('WINCRM_INVITATION_EMAIL_ENABLED');
 const crmEmailReader = (canonical.get('NOTIFICATION_DELIVERY_KINDS') ?? '')
 	.split(',').includes('wincrm-invitation-email');
+const crmReminderReader = (canonical.get('NOTIFICATION_DELIVERY_KINDS') ?? '')
+	.split(',').some(kind => ['wincrm-task-reminder-email', 'wincrm-task-reminder-telegram'].includes(kind.trim()));
 for (const [ownerKey, fallback] of [
 	['billing:BILLING_WINCRM_PAYMENTS_ENABLED', 'false'],
 	['billing:BILLING_WINCRM_RECONCILIATION_ENABLED', 'false'],
@@ -934,7 +936,10 @@ for (const [ownerKey, optional] of [
 	['widgets:WIDGETS_CRM_INTAKE_TOKEN', !crmWidgets],
 	['widgets:BILLING_WINCRM_WIDGETS_TOKEN', !crmWidgets],
 	['identity:IDENTITY_NOTIFICATION_DELIVERY_TOKEN', !crmEmail && !crmEmailReader],
-	['notification-delivery:IDENTITY_NOTIFICATION_DELIVERY_TOKEN', !crmEmailReader]
+	['notification-delivery:IDENTITY_NOTIFICATION_DELIVERY_TOKEN', !crmEmailReader],
+	['notification-delivery:CRM_SALES_INTERNAL_BASE_URL', !crmReminderReader],
+	['notification-delivery:CRM_SALES_NOTIFICATION_DELIVERY_TOKEN', !crmReminderReader],
+	['notification-delivery:NOTIFICATION_DELIVERY_CRM_SALES_TOKEN', !crmReminderReader]
 ]) {
 	if (!optional) continue;
 	explicitlyOptionalEmptyValues.add(ownerKey);
@@ -2674,6 +2679,8 @@ docker_volume_exists() {
 notification_topology_contract="$(
 	docker run --rm \
 		--interactive \
+		--user 0:0 \
+		--mount "type=bind,src=$env_file,dst=/run/winwidget/canonical.env,readonly" \
 		--network none \
 		--read-only \
 		--tmpfs /tmp:rw,noexec,nosuid,nodev,size=8m \
@@ -2684,16 +2691,22 @@ notification_topology_contract="$(
 		--entrypoint node \
 		"winwidget-notification-delivery:git-$services_revision" - <<'NOTIFICATION_TOPOLOGY'
 const constants = require('./dist/src/messaging/messaging.constants.js');
+const canonical = require('node:util').parseEnv(require('node:fs').readFileSync('/run/winwidget/canonical.env', 'utf8'));
+const remindersContract = canonical.CRM_REMINDERS_RABBITMQ_CONTRACT ?? 'disabled';
+if (!['disabled', 'task-reminders-v1'].includes(remindersContract) ||
+	(remindersContract !== 'disabled' && canonical.CRM_RABBITMQ_CONTRACT !== 'mvp-v1')) process.exit(1);
+const reminderKinds = ['wincrm-task-reminder-email', 'wincrm-task-reminder-telegram'];
+const deliveryKinds = constants.MESSAGING_KINDS.filter(kind => remindersContract !== 'disabled' || !reminderKinds.includes(kind));
 const contract = {
 	eventsExchange: constants.EVENTS_EXCHANGE,
 	retryExchange: constants.RETRY_EXCHANGE,
 	deadLetterExchange: constants.DEAD_LETTER_EXCHANGE,
 	manualRetryExchange: constants.MANUAL_RETRY_EXCHANGE,
-	queueNames: constants.MESSAGING_KINDS.map(
+	queueNames: deliveryKinds.map(
 		kind => constants.MESSAGING_QUEUE_NAMES[kind]
 	),
 	retryCount: constants.RETRY_DELAYS_MS.length,
-	readRoutingKeys: constants.MESSAGING_KINDS.flatMap(kind => [
+	readRoutingKeys: deliveryKinds.flatMap(kind => [
 		constants.MESSAGING_ROUTING_KEYS[kind],
 		constants.getManualRetryRoutingKey(kind),
 		constants.getDeadLetterRoutingKey(kind)
@@ -2703,11 +2716,11 @@ const contract = {
 		constants.NOTIFICATION_DELIVERY_OUTCOME_EVENT_TYPE,
 		constants.REPORTING_NOTIFICATION_DELIVERY_OUTCOME_EVENT_TYPE,
 		constants.CAMPAIGN_NOTIFICATION_DELIVERY_OUTCOME_EVENT_TYPE,
-		...constants.MESSAGING_KINDS.map(
+		...deliveryKinds.map(
 			kind => constants.getManualRetryRoutingKey(kind)
 		)
 	],
-	deadLetterRoutingKeys: constants.MESSAGING_KINDS.map(
+	deadLetterRoutingKeys: deliveryKinds.map(
 		kind => constants.getDeadLetterRoutingKey(kind)
 	)
 };
@@ -2828,6 +2841,9 @@ const monitor = process.env.RABBITMQ_MONITOR_USER ?? '';
 // This is a provisioned topology contract, not a product feature flag.
 const crmContract = process.env.CRM_RABBITMQ_CONTRACT ?? 'disabled';
 if (!['disabled', 'mvp-v1'].includes(crmContract)) process.exit(1);
+const remindersContract = process.env.CRM_REMINDERS_RABBITMQ_CONTRACT ?? 'disabled';
+if (!['disabled', 'task-reminders-v1'].includes(remindersContract) ||
+	(remindersContract !== 'disabled' && crmContract !== 'mvp-v1')) process.exit(1);
 const crmUsers = crmContract === 'mvp-v1' ? [
 	'winwidget-crm-access-worker',
 	'winwidget-crm-access-outbox-publisher',
@@ -2839,7 +2855,8 @@ const crmUsers = crmContract === 'mvp-v1' ? [
 	'winwidget-crm-intake-widget-transfer-publisher',
 	'winwidget-billing-wincrm-provider-worker'
 ] : [];
-const names = [admin, monitor, ...expectedServiceUsers, ...crmUsers];
+const names = [admin, monitor, ...expectedServiceUsers, ...crmUsers,
+	...(remindersContract === 'task-reminders-v1' ? ['winwidget-crm-sales-reminders'] : [])];
 if (
 	names.some(name => !/^[A-Za-z0-9._-]+$/.test(name)) ||
 	new Set(names).size !== names.length
@@ -2985,6 +3002,9 @@ const fail = () => {
 const value = name => process.env[name] ?? '';
 const crmContract = process.env.CRM_RABBITMQ_CONTRACT ?? 'disabled';
 if (!['disabled', 'mvp-v1'].includes(crmContract)) fail();
+const remindersContract = process.env.CRM_REMINDERS_RABBITMQ_CONTRACT ?? 'disabled';
+if (!['disabled', 'task-reminders-v1'].includes(remindersContract) ||
+	(remindersContract !== 'disabled' && crmContract !== 'mvp-v1')) fail();
 const vhost = value('RABBITMQ_VHOST');
 const managementUrl = value('RABBITMQ_MANAGEMENT_URL').replace(/\/$/, '');
 const adminUser = value('RABBITMQ_ADMIN_USER');
@@ -3138,7 +3158,34 @@ const auditQueueNames = auditSources.flatMap(source => [
 	constants.getOperationsAuditRetryQueue(source),
 	constants.getOperationsAuditDeadLetterQueue(source)
 ]);
-const exactQueuePattern = names => {
+const exactQueuePattern = (names, compact = false) => {
+	// Optional ND14 only: choose exact prefix/suffix trie partitions to keep
+	// finite ACLs below RabbitMQ's 1024-byte limit. Old contracts stay byte-exact.
+	if (compact) {
+		if (!Array.isArray(names) || !names.length || names.some(name => !/^[a-z0-9.-]+$/.test(name))) fail();
+		const cache = new Map(), escape = value => value.replaceAll('.', '\\.');
+		const emit = rows => {
+			const key = JSON.stringify(rows);
+			if (cache.has(key)) return cache.get(key);
+			if (rows.length === 1) return escape(rows[0]);
+			const candidates = [false, true].map(reverse => {
+				const groups = new Map();
+				for (const row of rows) {
+					const character = reverse ? row.slice(-1) : row.slice(0, 1);
+					if (!groups.has(character)) groups.set(character, []);
+					groups.get(character).push(reverse ? row.slice(0, -1) : row.slice(1));
+				}
+				const branches = [...groups].map(([character, rest]) => !character ? '' : reverse ? emit(rest) + escape(character) : escape(character) + emit(rest));
+				return branches.length === 1 ? branches[0] : '(?:' + branches.join('|') + ')';
+			});
+			const result = candidates.sort((a, b) => a.length - b.length)[0];
+			cache.set(key, result);
+			return result;
+		};
+		const pattern = '^' + emit([...new Set(names)].sort()) + '$';
+		if (Buffer.byteLength(pattern) > 1024) fail();
+		return pattern;
+	}
 	const root = { terminal: false, children: new Map() };
 	for (const name of [...names].sort()) {
 		let node = root;
@@ -3199,6 +3246,18 @@ if (
 	) ||
 	notificationTopology.retryCount !== 3
 ) fail();
+const remindersEnabled = remindersContract === 'task-reminders-v1';
+if (remindersEnabled) {
+	// Immutable task-reminders-v1 envelope: existing twelve kinds plus two.
+	// Test compares this fingerprint to crmReminderNotificationTopology().
+	const keys = ['eventsExchange', 'retryExchange', 'deadLetterExchange', 'manualRetryExchange', 'queueNames', 'retryCount', 'readRoutingKeys', 'writeRoutingKeys', 'deadLetterRoutingKeys'];
+	if (JSON.stringify(Object.keys(notificationTopology).sort()) !== JSON.stringify([...keys].sort())) fail();
+	const normalized = Object.fromEntries(keys.map(key => [key, notificationTopology[key]]));
+	if (require('node:crypto').createHash('sha256').update(JSON.stringify(normalized)).digest('hex') !==
+		'ec6b728126318be6291e35ef03842f4a13bafae911e10d23e7c601a31817c3ed') fail();
+} else if ([...notificationTopology.queueNames, ...notificationTopology.readRoutingKeys,
+	...notificationTopology.writeRoutingKeys, ...notificationTopology.deadLetterRoutingKeys]
+	.some(value => value.includes('wincrm.task-reminder') || value.includes('wincrm-task-reminder'))) fail();
 const notificationResourcePattern = exactQueuePattern([
 	notificationTopology.eventsExchange,
 	notificationTopology.retryExchange,
@@ -3212,15 +3271,15 @@ const notificationResourcePattern = exactQueuePattern([
 			(_, index) => `${queue}.retry-v2.${index + 1}`
 		)
 	])
-]);
+], remindersEnabled);
 const notificationReadTopicPattern = exactQueuePattern(
-	notificationTopology.readRoutingKeys
+	notificationTopology.readRoutingKeys, remindersEnabled
 );
 const notificationWriteTopicPattern = exactQueuePattern(
-	notificationTopology.writeRoutingKeys
+	notificationTopology.writeRoutingKeys, remindersEnabled
 );
 const notificationDeadLetterTopicPattern = exactQueuePattern(
-	notificationTopology.deadLetterRoutingKeys
+	notificationTopology.deadLetterRoutingKeys, remindersEnabled
 );
 if (
 	crmContract === 'mvp-v1' &&

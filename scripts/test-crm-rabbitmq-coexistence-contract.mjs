@@ -4,6 +4,12 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
+import { createHash } from 'node:crypto'
+import { parseEnv } from 'node:util'
+import {
+	crmReminderNotificationTopology,
+	crmRemindersBrokerContract
+} from './crm-reminders-broker-topology.mjs'
 
 const source = readFileSync(
 	new URL('./deploy-services-production.sh', import.meta.url),
@@ -44,7 +50,12 @@ const materialize = (overrides = {}) => {
 			'BILLING_WINCRM_WIDGETS_TOKEN',
 			'WIDGETS_WINCRM_HTTP_TIMEOUT_MS'
 		],
-		'notification-delivery': ['IDENTITY_NOTIFICATION_DELIVERY_TOKEN']
+		'notification-delivery': [
+			'IDENTITY_NOTIFICATION_DELIVERY_TOKEN',
+			'CRM_SALES_INTERNAL_BASE_URL',
+			'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
+			'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN'
+		]
 	}
 	const values = {
 		DATABASE_RESTORE_RECEIPT_HMAC_KEY_BASE64: Buffer.alloc(32, 1).toString(
@@ -183,6 +194,43 @@ test('actual env materializer requires missing credentials when their precise CR
 		mail.identity.IDENTITY_NOTIFICATION_DELIVERY_TOKEN,
 		mail['notification-delivery'].IDENTITY_NOTIFICATION_DELIVERY_TOKEN
 	)
+})
+
+test('ND reminder inputs stay optional only while both exact reader kinds are disabled', () => {
+	const off = materialize()['notification-delivery']
+	for (const key of [
+		'CRM_SALES_INTERNAL_BASE_URL',
+		'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
+		'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN'
+	])
+		assert.equal(off[key], '')
+	for (const kind of [
+		'wincrm-task-reminder-email',
+		'wincrm-task-reminder-telegram'
+	]) {
+		assert.throws(() => materialize({ NOTIFICATION_DELIVERY_KINDS: kind }))
+		const input = {
+			NOTIFICATION_DELIVERY_KINDS: kind,
+			CRM_SALES_INTERNAL_BASE_URL: 'http://127.0.0.1:4704',
+			CRM_SALES_NOTIFICATION_DELIVERY_TOKEN: 'e'.repeat(64),
+			NOTIFICATION_DELIVERY_CRM_SALES_TOKEN: 'f'.repeat(64)
+		}
+		for (const key of [
+			'CRM_SALES_INTERNAL_BASE_URL',
+			'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
+			'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN'
+		])
+			assert.throws(() => materialize({ ...input, [key]: '' }))
+		const active = materialize(input)['notification-delivery']
+		assert.equal(
+			active.CRM_SALES_NOTIFICATION_DELIVERY_TOKEN,
+			input.CRM_SALES_NOTIFICATION_DELIVERY_TOKEN
+		)
+		assert.equal(
+			active.NOTIFICATION_DELIVERY_CRM_SALES_TOKEN,
+			input.NOTIFICATION_DELIVERY_CRM_SALES_TOKEN
+		)
+	}
 })
 const inventoryCode = heredoc('RABBITMQ_EXPECTED_USERS')
 test('actual companion validation wrapper suppresses malformed input, loader and validator errors', () => {
@@ -349,6 +397,7 @@ const permissions = (mode, overrides = {}) => {
 		Buffer,
 		URL,
 		require: name => {
+			if (name === 'node:crypto') return { createHash }
 			if (name === 'amqplib')
 				return {
 					connect: () => {
@@ -640,6 +689,227 @@ test('MVP refuses missing invitation email reader before any provisioning', () =
 		assert.doesNotThrow(() => permissions('disabled', overrides))
 		assert.throws(() => permissions('mvp-v1', overrides))
 	}
+})
+
+test('optional reminders inventory accepts exactly principal 26 only with MVP, never adds it to routine credential mutations', () => {
+	const enabled = {
+		CRM_REMINDERS_RABBITMQ_CONTRACT: 'task-reminders-v1',
+		NOTIFICATION_TOPOLOGY_CONTRACT: JSON.stringify(
+			crmReminderNotificationTopology()
+		)
+	}
+	assert.deepEqual(
+		inventory('mvp-v1', enabled),
+		[...inventory('mvp-v1'), 'winwidget-crm-sales-reminders'].sort()
+	)
+	const users = permissions('mvp-v1', enabled)
+	assert.equal(
+		users.some(row => row.username === 'winwidget-crm-sales-reminders'),
+		false
+	)
+	const notification = users.find(
+		row => row.username === 'winwidget-notification-delivery'
+	)
+	const { username, password, ...acl } = notification
+	assert.deepEqual(acl, crmRemindersBrokerContract().notificationAfter)
+	const old = permissions('mvp-v1').filter(
+		row => row.username !== username
+	)
+	assert.deepEqual(
+		users.filter(row => row.username !== username),
+		old
+	)
+	assert.throws(() => inventory('disabled', enabled))
+	assert.throws(() => permissions('disabled', enabled))
+	for (const value of ['', 'true', 'task-reminders-v2']) {
+		assert.throws(() =>
+			inventory('mvp-v1', { CRM_REMINDERS_RABBITMQ_CONTRACT: value })
+		)
+		assert.throws(() =>
+			permissions('mvp-v1', { CRM_REMINDERS_RABBITMQ_CONTRACT: value })
+		)
+	}
+})
+
+test('routine optional ND14 topology is exact and fails before mutations if absent, expanded or prematurely enabled', () => {
+	const topology = crmReminderNotificationTopology()
+	assert.doesNotThrow(() =>
+		permissions('mvp-v1', {
+			CRM_REMINDERS_RABBITMQ_CONTRACT: 'task-reminders-v1',
+			NOTIFICATION_TOPOLOGY_CONTRACT: JSON.stringify(
+				Object.fromEntries(Object.entries(topology).reverse())
+			)
+		})
+	)
+	assert.throws(() =>
+		permissions('mvp-v1', {
+			CRM_REMINDERS_RABBITMQ_CONTRACT: 'task-reminders-v1'
+		})
+	)
+	assert.throws(() =>
+		permissions('mvp-v1', {
+			NOTIFICATION_TOPOLOGY_CONTRACT: JSON.stringify(topology)
+		})
+	)
+	for (const field of [
+		'queueNames',
+		'readRoutingKeys',
+		'writeRoutingKeys',
+		'deadLetterRoutingKeys'
+	]) {
+		const wrong = {
+			...topology,
+			[field]: [...topology[field], 'winwidget.rogue']
+		}
+		assert.throws(() =>
+			permissions('mvp-v1', {
+				CRM_REMINDERS_RABBITMQ_CONTRACT: 'task-reminders-v1',
+				NOTIFICATION_TOPOLOGY_CONTRACT: JSON.stringify(wrong)
+			})
+		)
+	}
+})
+
+test('actual topology extractor runs root only inside networkless readonly isolated Docker without weakening canonical mode', () => {
+	const start = source.indexOf('notification_topology_contract="$(')
+	const end = source.indexOf('reporting_topology_contract="$(', start)
+	assert.ok(start > 0 && end > start)
+	const result = spawnSync(
+		'bash',
+		[
+			'-c',
+			[
+				'set -euo pipefail',
+				'die() { exit 42; }',
+				'docker() { node -e \'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify(process.argv.slice(1))))\' "$@"; }',
+				source.slice(start, end),
+				'printf "%s" "$notification_topology_contract"'
+			].join('\n')
+		],
+		{
+			encoding: 'utf8',
+			timeout: 5000,
+			env: {
+				PATH: process.env.PATH,
+				env_file: '/synthetic/root-only/canonical.env',
+				services_revision: 'a'.repeat(40)
+			}
+		}
+	)
+	assert.equal(result.status, 0, result.stderr)
+	const args = JSON.parse(result.stdout)
+	assert.deepEqual(args, [
+		'run',
+		'--rm',
+		'--interactive',
+		'--user',
+		'0:0',
+		'--mount',
+		'type=bind,src=/synthetic/root-only/canonical.env,dst=/run/winwidget/canonical.env,readonly',
+		'--network',
+		'none',
+		'--read-only',
+		'--tmpfs',
+		'/tmp:rw,noexec,nosuid,nodev,size=8m',
+		'--cap-drop',
+		'ALL',
+		'--security-opt',
+		'no-new-privileges',
+		'--pids-limit',
+		'32',
+		'--log-driver',
+		'none',
+		'--entrypoint',
+		'node',
+		'winwidget-notification-delivery:git-' + 'a'.repeat(40),
+		'-'
+	])
+	assert.doesNotMatch(
+		source.slice(start, end),
+		/chmod|--privileged|docker\.sock|--env-file/
+	)
+})
+
+test('actual readonly candidate topology extraction gates reminder kinds without exposing canonical values', () => {
+	const expected = crmReminderNotificationTopology()
+	const kinds = expected.readRoutingKeys
+		.filter((_, i) => i % 3 === 1)
+		.map(key => key.slice('manual.'.length))
+	const constants = {
+		EVENTS_EXCHANGE: expected.eventsExchange,
+		RETRY_EXCHANGE: expected.retryExchange,
+		DEAD_LETTER_EXCHANGE: expected.deadLetterExchange,
+		MANUAL_RETRY_EXCHANGE: expected.manualRetryExchange,
+		MESSAGING_KINDS: kinds,
+		RETRY_DELAYS_MS: [30000, 300000, 1800000],
+		MESSAGING_QUEUE_NAMES: Object.fromEntries(
+			kinds.map((kind, i) => [kind, expected.queueNames[i]])
+		),
+		MESSAGING_ROUTING_KEYS: Object.fromEntries(
+			kinds.map((kind, i) => [kind, expected.readRoutingKeys[i * 3]])
+		),
+		getManualRetryRoutingKey: kind => 'manual.' + kind,
+		getDeadLetterRoutingKey: kind => kind + '.dead-letter',
+		TELEGRAM_DESTINATION_UNAVAILABLE_EVENT_TYPE:
+			expected.writeRoutingKeys[0],
+		NOTIFICATION_DELIVERY_OUTCOME_EVENT_TYPE: expected.writeRoutingKeys[1],
+		REPORTING_NOTIFICATION_DELIVERY_OUTCOME_EVENT_TYPE:
+			expected.writeRoutingKeys[2],
+		CAMPAIGN_NOTIFICATION_DELIVERY_OUTCOME_EVENT_TYPE:
+			expected.writeRoutingKeys[3]
+	}
+	const extract = overrides => {
+		let output = ''
+		const env = {
+			CRM_RABBITMQ_CONTRACT: 'mvp-v1',
+			SYNTHETIC_PRIVATE: 'never-in-output',
+			...overrides
+		}
+		runInNewContext(
+			heredoc('NOTIFICATION_TOPOLOGY'),
+			{
+				process: {
+					exit: () => {
+						throw Error('failed')
+					},
+					stdout: {
+						write: text => {
+							output += text
+						}
+					}
+				},
+				require: name => {
+					if (name === 'node:util') return { parseEnv }
+					if (name === 'node:fs')
+						return {
+							readFileSync: path => {
+								assert.equal(path, '/run/winwidget/canonical.env')
+								return Object.entries(env)
+									.map(([k, v]) => k + '=' + v)
+									.join('\n')
+							}
+						}
+					assert.equal(name, './dist/src/messaging/messaging.constants.js')
+					return constants
+				}
+			},
+			{ timeout: 1000 }
+		)
+		assert.equal(output.includes(env.SYNTHETIC_PRIVATE), false)
+		return JSON.parse(output)
+	}
+	assert.deepEqual(extract({}), crmReminderNotificationTopology(false))
+	assert.deepEqual(
+		extract({ CRM_REMINDERS_RABBITMQ_CONTRACT: 'task-reminders-v1' }),
+		expected
+	)
+	assert.throws(() =>
+		extract({
+			CRM_REMINDERS_RABBITMQ_CONTRACT: 'task-reminders-v1',
+			CRM_RABBITMQ_CONTRACT: 'disabled'
+		})
+	)
+	assert.throws(() => extract({ CRM_REMINDERS_RABBITMQ_CONTRACT: '' }))
 })
 
 test('preflight and steady-state retain exact equality; CI executes this contract', () => {

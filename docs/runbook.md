@@ -188,12 +188,14 @@ CI canonical hash обновлён. `BILLING_WINCRM_PAYMENTS_ENABLED` и
 | 2 | Billing | worker, outbox-publisher, scheduler, API |
 | 3 | CRM Access | worker, outbox-publisher, API |
 | 4 | CRM Customers | API |
-| 5 | CRM Sales | API |
-| 6 | CRM Intake | 3 workers, 3 publishers, API |
+| 5 | Notification Delivery | Только worker; прежние разрешённые виды уведомлений |
+| 6 | CRM Sales | API |
+| 7 | CRM Intake | 3 workers, 3 publishers, API |
 
-Всего 17 runtime-процессов. Перед стартом нового процесса останавливается вся
-старая группа владельца; остановка соседних групп, БД, Gateway, Notification
-Delivery, Widgets и остальных приложений запрещена. Identity API — companion
+Всего 18 runtime-процессов. Перед стартом нового процесса останавливается вся
+старая группа владельца; остановка соседних групп, БД, Gateway,
+Widgets и остальных приложений запрещена. Новый Sales reminders-процесс этим
+code-only scope не создаётся, отправка напоминаний не включается. Identity API — companion
 для согласованного каталога сотрудников: его `schema.prisma` и весь каталог
 Prisma migrations должны побайтово совпадать со старым работающим image.
 
@@ -206,8 +208,9 @@ Prisma migrations должны побайтово совпадать со ста
    минимум 2 GiB; дополнительное потребление runtime ограничено 3 GiB.
 2. Через экспорт `crmUpgradeBaseline()` из проверенного `crm-release.mjs`
    сформировать baseline из полного свежего `docker inspect` inventory
-   (включая остановленные контейнеры) и SHA-256 четырёх **полных** env-файлов:
-   canonical backend, CRM, Billing owner, Identity owner. Сам JSON baseline
+   (включая остановленные контейнеры) и SHA-256 пяти **полных** env-файлов:
+   canonical backend, CRM, Billing owner, Identity owner, Notification Delivery
+   owner. После конфигурационной активации нужен новый baseline. Сам JSON baseline
    содержит только IDs/image IDs/revisions/configuration hashes и общий hash
    нетронутых соседей; значения env туда не попадают. Исходный inspect с env
    нельзя выводить в логи. CLI `upgrade-baseline` принимает inspect через stdin,
@@ -226,12 +229,23 @@ Prisma migrations должны побайтово совпадать со ста
    перед SQL и переключениями. Ни env, ни paid flags, ни broker credentials,
    permissions, topology, volume/DB bootstrap данный scope не меняет.
 
-Controller сначала собирает и проверяет шесть immutable owner images, их OCI
+Controller сначала собирает и проверяет семь immutable owner images, их OCI
 revision/title/архитектуру; сравнивает старые Prisma-файлы со source candidate;
-запечатывает desired Compose только для 17 targets и пяти migration jobs.
+запечатывает desired Compose только для 18 targets и шести migration jobs.
 Runtime допускает только новые image/APP_REVISION: остальные env, isolation,
 healthchecks, ресурсы и конфигурация должны совпадать с approved live snapshot.
-Все шесть owner DB проходят read-only preflight **до первой мутации**.
+Все семь owner DB проходят read-only preflight **до первой мутации**.
+
+У Notification Delivery исторически нет `service_identity`. Вместо создания
+фиктивного UUID проверяется отдельный continuity contract: точный endpoint,
+database/schema, PostgreSQL database OID и первая завершённая запись migration
+ledger. Старые записи ledger, роли, memberships и ACL обязаны сохраниться.
+OID берётся из свежего preflight, а не зашивается в код. Изменения ролей и
+bootstrap этот контракт не разрешает. ND image проверяется по immutable image
+ID, точному порядку владельцев и revision; у него нет title label, runtime user
+остаётся `node`. Отдельные source/database probes работают как `1000:1000`;
+для остальных владельцев сохраняется `1001:1001`. Migration URL ND читается
+только из `NOTIFICATION_DELIVERY_MIGRATION_URL_PRODUCTION` его owner env.
 
 Для Identity/Billing membership preflight допускает только два проверенных
 существующих ребра: собственные `_migration` и `_runtime` выданы собственному
@@ -239,7 +253,7 @@ healthchecks, ресурсы и конфигурация должны совпа
 `set_option=true`. Этот `_admin` обязан оставаться LOGIN/SUPERUSER и владельцем
 своей БД. Обратные, дополнительные и чужие memberships запрещены; сами
 migration/runtime не получают членство в admin или других ролях. У четырёх
-CRM membership остаётся нулевым в обоих направлениях. Полный граф, затрагивающий
+CRM и у Notification Delivery membership остаётся нулевым в обоих направлениях. Полный граф, затрагивающий
 migration/runtime, сохраняется в DB evidence и обязан совпадать до/после
 миграций. Проверка не выполняет GRANT/REVOKE/ALTER ROLE и не ослабляет отдельный
 restore gate: historical admin edges не нужно удалять ради обычного upgrade.
@@ -279,23 +293,29 @@ host/address map, включая существующий Telegram proxy Identit
 
 Миграции — только расширяющие, явно reviewed checksum allowlist в
 `CRM_UPGRADE_MIGRATIONS`: Billing manual days, Access employee profiles/branding,
-Sales workday. Старый Billing ACL release уже должен быть успешно завершён;
+Sales workday/reminders, Customers requisites/call preferences и расширение
+allowlist видов Notification Delivery. Старый Billing ACL release уже должен быть успешно завершён;
 единственная reviewed rolled-back попытка остаётся историей, не повторяется и
 не разрешает `migrate resolve`. Для Sales `add_task_in_progress` и следующий
 `expand_workday_tasks` остаются разными migration-файлами: Prisma завершает
 первую транзакцию с enum **до** использования значения следующей миграцией.
 Identity/Intake не допускают новых миграций в этом release scope. Для Customers
-разрешена только парная экспансия `20260907210000_add_company_requisites`:
+разрешены только последовательные парные экспансии. `20260907210000_add_company_requisites`:
 SHA-256 SQL `2906853950f496d481dc831af21d824418ecd7281f105ad3b3356e98c90fbfc1`
 и переход SHA-256 `schema.prisma` с
 `be7b6d591352f4dbd77310df08f3d27971a49ede45cb653a8ff6ac6ea2823b12` на
 `7d17e1d8b4cdc31cea0e342427aa84d1b388d3f22515b2e5cfcacde1afe79b42`.
+Затем `20260907223000_add_contact_call_preferences`:
+SHA-256 SQL `6ec838976adc8aa583b29a7732fe9cbddabb60d63ab7efd3b67c7d78968e0fec`,
+переход последней схемы на
+`4ceda3fabb6a6923f5a75c540ff01b89926ea0d8c27c1f40e6e57e8fa40c51d2`.
+Для ещё не обновлённой схемы допускается применение обеих точных пар подряд.
 Одна половина этой пары без другой, новые/изменённые прежние SQL и изменение
 `database-access.json` запрещены; уже применённая неизменная пара допускается.
 
 В каждом owner: при наличии pending применяется только `prisma migrate deploy`
 от migration-role, затем для CRM исполняется service-owned точный runtime grants
-contract (без bootstrap/смены паролей), проверяются ledger, database UUID,
+contract (без bootstrap/смены паролей), проверяются ledger, database identity,
 неизменность прежних ACL/ролей и Billing append-only/retention guards. Затем
 переключается группа и проверяется каждый image/config/health/zero-restart.
 SQL rollback/restore БД в автоматической recovery не выполняется.
@@ -661,6 +681,49 @@ principals или события. Подготовка кода не доказ�
 уже включён на VPS; production env этой подготовкой не изменяется.
 Поведенческий тест исполняет фактический shell preflight и определения
 provisioner на synthetic данных, проверяя неизменность остальных grants.
+
+Напоминания задач добавляют отдельный контракт
+`CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1`, только совместно с
+`CRM_RABBITMQ_CONTRACT=mvp-v1`. Значение по умолчанию — `disabled`; пустое и
+неизвестное значения запрещены. Старый `mvp-v1` не переписывается. Новый
+контракт требует ровно 26 principals: прежние 25 и
+`winwidget-crm-sales-reminders`. Его configure — `^$`, read — только
+`winwidget.crm.sales.reminders`, write — только exchange `winwidget.events`
+с тремя точными topic keys: `crm.sales.reminder.tick.v1`,
+`notification.wincrm.task-reminder.email.requested.v1` и
+`notification.wincrm.task-reminder.telegram.requested.v1`.
+
+Отдельный locked bootstrap запускает `node crm-broker-bootstrap.mjs
+provision-reminders` из проверенного immutable payload вместе с
+`crm-broker-topology.mjs` и `crm-reminders-broker-topology.mjs`. Он требует
+прежние root/Linux/revision/`stdio-v1` fence guards и read-only файлы
+`/run/wincrm/canonical.env`, `/run/wincrm/crm.env`,
+`/run/wincrm/notification-topology.json` с соответствующими
+`CRM_BOOTSTRAP_CANONICAL_SHA256`, `CRM_BOOTSTRAP_CRM_SHA256`,
+`CRM_BOOTSTRAP_NOTIFICATION_SHA256`. Последний файл — exact 14-kind topology
+из candidate Notification Delivery, а не секрет или runtime feature flag.
+Требования uid/gid `0:0`, mode `0600` и `/run/wincrm/deploy.lock` сохраняются;
+секрет нового principal читается только из CRM owner env
+`CRM_SALES_REMINDERS_RABBITMQ_URL`, не из argv.
+
+Bootstrap добавляет 12 durable queues и 18 bindings: Sales main/DLQ плюс
+две группы ND main/DLQ/три retry. Sales DLX — `winwidget.dead-letter`, ключ
+`crm-sales-reminders.dead-letter`. ND получает два новых kinds,
+`wincrm-task-reminder-email` и `wincrm-task-reminder-telegram`, сохраняя
+предыдущие 12, включая приглашения. Точные ND ACL используют сжатие
+prefix/suffix trie, укладываются в 1024 bytes и не разрешают wildcard.
+Routine controller сохраняет эти grants, но не создаёт и не ротирует
+новый CRM principal. До provisioning новые consumers должны отсутствовать;
+старые CRM/ND consumers могут продолжать работу. Неизвестная статистика
+consumers не считается нулём.
+
+После неполного bootstrap повторяется тот же контракт под общим lock:
+совместимые очереди и выданные grants сохраняются, пароли существующих
+пользователей не заменяются, purge/delete запрещены. После добавления
+principal нельзя возвращать marker в `disabled`; сначала завершить
+provisioning и согласованную whole-file env-синхронизацию. Этот этап ничего
+не публикует и не доказывает provider delivery или включение напоминаний.
+
 Billing provider user получает read только на
 `winwidget.billing.wincrm-provider.v1`, без configure/write; отдельная DLQ
 `winwidget.billing.wincrm-provider.v1.dead-letter` связана с его direct exchange.

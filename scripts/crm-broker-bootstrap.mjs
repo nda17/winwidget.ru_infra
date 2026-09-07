@@ -10,6 +10,11 @@ import {
 	provisionCrmBrokerPrincipals,
 	readCrmBrokerSnapshot
 } from './crm-broker-topology.mjs'
+import {
+	crmReminderBrokerInputs,
+	provisionCrmRemindersBroker,
+	readCrmRemindersBrokerSnapshot
+} from './crm-reminders-broker-topology.mjs'
 
 const serviceNames = [
 	'notification-delivery',
@@ -160,6 +165,35 @@ export async function bootstrapCrmBroker({
 	}
 }
 
+export async function bootstrapCrmReminders({
+	inputs,
+	connect,
+	request,
+	assertReleaseFence
+}) {
+	let connection
+	try {
+		await assertReleaseFence()
+		connection = await connect(
+			inputs.admin.username,
+			inputs.admin.password
+		)
+		const channel = await connection.createChannel()
+		channel.on('error', () => {})
+		return await provisionCrmRemindersBroker({
+			channel,
+			connect,
+			request,
+			assertReleaseFence,
+			credentials: inputs.credentials,
+			legacyPrincipals: inputs.legacyPrincipals,
+			readSnapshot: () => readCrmRemindersBrokerSnapshot(request)
+		})
+	} finally {
+		if (connection) await connection.close()
+	}
+}
+
 export function createParentFence(input, output, timeoutMs = 15000) {
 	assert.ok(
 		Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 30000
@@ -205,7 +239,10 @@ if (
 	let parent
 	try {
 		assert.equal(process.argv.length, 3)
-		assert.equal(process.argv[2], 'provision')
+		assert.ok(
+			['provision', 'provision-reminders'].includes(process.argv[2])
+		)
+		const reminders = process.argv[2] === 'provision-reminders'
 		assert.equal(process.platform, 'linux')
 		assert.equal(process.getuid(), 0)
 		assert.equal(process.env.CRM_BOOTSTRAP_CONTROLLER_PROTOCOL, 'stdio-v1')
@@ -220,7 +257,9 @@ if (
 		const paths = {
 			canonical: '/run/wincrm/canonical.env',
 			crm: '/run/wincrm/crm.env',
-			provider: '/run/wincrm/provider-password'
+			...(reminders
+				? { notification: '/run/wincrm/notification-topology.json' }
+				: { provider: '/run/wincrm/provider-password' })
 		}
 		const checks = Object.entries(paths).map(([name, path]) => {
 			const expected =
@@ -254,10 +293,12 @@ if (
 		}
 		await assertReleaseFence()
 		stage = 'inputs'
-		const inputs = crmBrokerInputs(
+		const inputs = (reminders ? crmReminderBrokerInputs : crmBrokerInputs)(
 			parseEnv(readFileSync(paths.canonical, 'utf8')),
 			parseEnv(readFileSync(paths.crm, 'utf8')),
-			readFileSync(paths.provider, 'utf8').replace(/\n$/, '')
+			reminders
+				? JSON.parse(readFileSync(paths.notification, 'utf8'))
+				: readFileSync(paths.provider, 'utf8').replace(/\n$/, '')
 		)
 		const amqp = createRequire('/app/package.json')('amqplib')
 		const connect = async (username, password) => {
@@ -300,7 +341,9 @@ if (
 			return method === 'GET' ? response.json() : null
 		}
 		stage = 'provision'
-		const report = await bootstrapCrmBroker({
+		const report = await (
+			reminders ? bootstrapCrmReminders : bootstrapCrmBroker
+		)({
 			inputs,
 			connect,
 			request,
