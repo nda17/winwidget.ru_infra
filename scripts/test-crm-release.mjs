@@ -314,6 +314,156 @@ test('upgrade source permits only reviewed expansion SQL and proves Identity sch
 	)
 })
 
+function companyRequisitesSourceFixture() {
+	const migration = '20260907210000_add_company_requisites'
+	const checksum =
+		'2906853950f496d481dc831af21d824418ecd7281f105ad3b3356e98c90fbfc1'
+	const before = {
+		'schema.prisma':
+			'be7b6d591352f4dbd77310df08f3d27971a49ede45cb653a8ff6ac6ea2823b12',
+		'database-access.json': hash,
+		'migration_lock.toml': hash,
+		'20260101000000_initial': hash
+	}
+	const after = {
+		...before,
+		'schema.prisma':
+			'7d17e1d8b4cdc31cea0e342427aa84d1b388d3f22515b2e5cfcacde1afe79b42',
+		[migration]: checksum
+	}
+	return { migration, checksum, before, after }
+}
+
+test('Customers source accepts only the paired requisites schema and exact append-only migration', () => {
+	const { migration, checksum, before, after } =
+		companyRequisitesSourceFixture()
+	assert.deepEqual(CRM_UPGRADE_MIGRATIONS['crm-customers'], {
+		[migration]: checksum
+	})
+	assert.equal(crmUpgradeSource('crm-customers', before, after), true)
+	assert.equal(crmUpgradeSource('crm-customers', before, before), true)
+	assert.equal(crmUpgradeSource('crm-customers', after, after), true)
+	for (const owner of [
+		'identity',
+		'crm-access',
+		'crm-intake',
+		'crm-sales',
+		'billing'
+	])
+		assert.throws(() => crmUpgradeSource(owner, before, after), owner)
+})
+
+test('Customers requisites expansion preserves old SQL, schema binding and exact ACL without accepting partial changes', () => {
+	const { migration, before, after } = companyRequisitesSourceFixture()
+	const cases = [
+		['unknown old schema', source => (source.before['schema.prisma'] = hash)],
+		['unknown new schema', source => (source.after['schema.prisma'] = hash)],
+		[
+			'migration without schema',
+			source => (source.after['schema.prisma'] = before['schema.prisma'])
+		],
+		['schema without migration', source => delete source.after[migration]],
+		['modified migration', source => (source.after[migration] = hash)],
+		[
+			'renamed migration',
+			source => {
+				source.after['20260907210001_add_company_requisites'] =
+					source.after[migration]
+				delete source.after[migration]
+			}
+		],
+		[
+			'unreviewed SQL',
+			source => (source.after['20260907210001_unreviewed'] = hash)
+		],
+		[
+			'rewritten old SQL',
+			source => (source.after['20260101000000_initial'] = 'd'.repeat(64))
+		],
+		[
+			'removed old SQL',
+			source => delete source.after['20260101000000_initial']
+		],
+		[
+			'changed ACL',
+			source => (source.after['database-access.json'] = 'd'.repeat(64))
+		],
+		['removed ACL', source => delete source.after['database-access.json']],
+		[
+			'changed migration lock',
+			source => (source.after['migration_lock.toml'] = 'd'.repeat(64))
+		],
+		[
+			'removed migration lock',
+			source => delete source.after['migration_lock.toml']
+		],
+		['removed schema', source => delete source.after['schema.prisma']],
+		[
+			'preexisting mismatched migration',
+			source => (source.before[migration] = source.after[migration])
+		]
+	]
+	for (const [name, change] of cases) {
+		const source = structuredClone({ before, after })
+		change(source)
+		assert.throws(
+			() => crmUpgradeSource('crm-customers', source.before, source.after),
+			name
+		)
+	}
+	assert.throws(() => crmUpgradeSource('crm-customers', after, before))
+})
+
+test('Customers requisites ledger requires exact SQL, completed apply and no extra pending migration', () => {
+	const { migration, checksum, after } = companyRequisitesSourceFixture()
+	const initial = {
+		id: 'initial',
+		migration_name: '20260101000000_initial',
+		checksum: hash,
+		finished_at: '2026-01-01',
+		rolled_back_at: null
+	}
+	const applied = {
+		id: 'company-requisites',
+		migration_name: migration,
+		checksum,
+		finished_at: '2026-09-07',
+		rolled_back_at: null
+	}
+	assert.deepEqual(crmUpgradeLedger('crm-customers', after, [initial]), [
+		migration
+	])
+	assert.throws(() => crmUpgradeLedger('crm-customers', after, [initial], true))
+	assert.deepEqual(
+		crmUpgradeLedger('crm-customers', after, [initial, applied], true),
+		[]
+	)
+	for (const change of [
+		row => (row.checksum = hash),
+		row => (row.finished_at = null),
+		row => (row.rolled_back_at = '2026-09-07')
+	]) {
+		const row = structuredClone(applied)
+		change(row)
+		assert.throws(() =>
+			crmUpgradeLedger('crm-customers', after, [initial, row], true)
+		)
+	}
+	assert.throws(() =>
+		crmUpgradeLedger('crm-customers', after, [initial, applied, applied], true)
+	)
+	assert.throws(() =>
+		crmUpgradeLedger(
+			'crm-customers',
+			{
+				...after,
+				'20260907210001_unreviewed': hash
+			},
+			[initial, applied]
+		)
+	)
+})
+
 function privateSourceFixture(directory) {
 	const prisma = join(directory, 'prisma')
 	const migration = '20260101000000_initial'

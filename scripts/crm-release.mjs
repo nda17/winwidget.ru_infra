@@ -73,7 +73,10 @@ export const CRM_UPGRADE_MIGRATIONS = Object.freeze({
 		'20260907150000_add_workspace_branding':
 			'c4d1fb7192e1a35f82b8f2108def86d13d3fa02741a5dffa5d2ac3f273b1252e'
 	},
-	'crm-customers': {},
+	'crm-customers': {
+		'20260907210000_add_company_requisites':
+			'2906853950f496d481dc831af21d824418ecd7281f105ad3b3356e98c90fbfc1'
+	},
 	'crm-sales': {
 		'20260907120000_add_task_in_progress':
 			'1718b37fd803dd6112cbae330434c8997daf86bf4a7a890a38a55ec07cff634a',
@@ -261,11 +264,32 @@ export function crmUpgradeOldImages(baseline, owner) {
 
 export function crmUpgradeSource(owner, before, after) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+	if (owner === 'crm-customers') {
+		const migration = '20260907210000_add_company_requisites'
+		if (
+			before['schema.prisma'] !== after['schema.prisma'] ||
+			(!Object.hasOwn(before, migration) && Object.hasOwn(after, migration))
+		) {
+			// Only the reviewed five nullable Company columns. Customers keeps
+			// its existing table-level ACL manifest and every previous SQL byte.
+			assert.equal(
+				before['schema.prisma'],
+				'be7b6d591352f4dbd77310df08f3d27971a49ede45cb653a8ff6ac6ea2823b12'
+			)
+			assert.equal(
+				after['schema.prisma'],
+				'7d17e1d8b4cdc31cea0e342427aa84d1b388d3f22515b2e5cfcacde1afe79b42'
+			)
+			assert.equal(Object.hasOwn(before, migration), false)
+			assert.equal(after[migration], CRM_UPGRADE_MIGRATIONS[owner][migration])
+		}
+	}
 	for (const [name, checksum] of Object.entries(before)) {
 		assert.ok(sha(checksum))
 		if (
-			['schema.prisma', 'database-access.json'].includes(name) &&
-			['billing', 'crm-access', 'crm-sales'].includes(owner)
+			(['schema.prisma', 'database-access.json'].includes(name) &&
+				['billing', 'crm-access', 'crm-sales'].includes(owner)) ||
+			(owner === 'crm-customers' && name === 'schema.prisma')
 		) {
 			assert.ok(sha(after[name]))
 			continue
@@ -277,7 +301,7 @@ export function crmUpgradeSource(owner, before, after) {
 		if (Object.hasOwn(before, name)) continue
 		assert.equal(CRM_UPGRADE_MIGRATIONS[owner][name], checksum)
 	}
-	if (['identity', 'crm-intake', 'crm-customers'].includes(owner))
+	if (['identity', 'crm-intake'].includes(owner))
 		assert.deepEqual(after, before)
 	return true
 }
