@@ -12,6 +12,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  crm-commerce-contract:
+    name: CRM commerce activation and real Services validator contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact infrastructure revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out immutable public Services contract
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: nda17/winwidget.ru_services
+          ref: 12998b76770f670312a1d0fbb286016abdee1c08
+          path: .ci-services
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify config-only activation, database probe and real companion validator
+        env:
+          CRM_COMMERCE_SERVICES_ROOT: ${{ github.workspace }}/.ci-services
+        run: |
+          test -f "$CRM_COMMERCE_SERVICES_ROOT/.github/scripts/validate-crm-compose.mjs"
+          node --test scripts/test-crm-commerce-activation.mjs scripts/test-crm-commerce-database.mjs scripts/test-crm-commerce-controller.mjs
+
   crm-broker:
     name: CRM broker provisioning on pinned RabbitMQ
     runs-on: ubuntu-24.04
@@ -74,6 +100,11 @@ jobs:
           bash -n scripts/deploy-crm-scoped.sh
           shellcheck -x scripts/deploy-crm-scoped.sh
           node --check scripts/crm-release.mjs
+          bash -n scripts/deploy-crm-commerce-scoped.sh
+          shellcheck -x scripts/deploy-crm-commerce-scoped.sh
+          node --check scripts/crm-commerce-activation.mjs
+          node --check scripts/crm-commerce-activation-cli.mjs
+          node --check scripts/crm-commerce-database.mjs
           bash -n scripts/deploy-billing-crm-acl-scoped.sh
           shellcheck -x scripts/deploy-billing-crm-acl-scoped.sh
           node --check scripts/billing-crm-acl-release.mjs

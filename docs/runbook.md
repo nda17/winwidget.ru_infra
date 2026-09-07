@@ -284,7 +284,14 @@ Sales workday. Старый Billing ACL release уже должен быть у�
 не разрешает `migrate resolve`. Для Sales `add_task_in_progress` и следующий
 `expand_workday_tasks` остаются разными migration-файлами: Prisma завершает
 первую транзакцию с enum **до** использования значения следующей миграцией.
-Identity/Customers/Intake не допускают новых миграций в этом release scope.
+Identity/Intake не допускают новых миграций в этом release scope. Для Customers
+разрешена только парная экспансия `20260907210000_add_company_requisites`:
+SHA-256 SQL `2906853950f496d481dc831af21d824418ecd7281f105ad3b3356e98c90fbfc1`
+и переход SHA-256 `schema.prisma` с
+`be7b6d591352f4dbd77310df08f3d27971a49ede45cb653a8ff6ac6ea2823b12` на
+`7d17e1d8b4cdc31cea0e342427aa84d1b388d3f22515b2e5cfcacde1afe79b42`.
+Одна половина этой пары без другой, новые/изменённые прежние SQL и изменение
+`database-access.json` запрещены; уже применённая неизменная пара допускается.
 
 В каждом owner: при наличии pending применяется только `prisma migrate deploy`
 от migration-role, затем для CRM исполняется service-owned точный runtime grants
@@ -319,6 +326,78 @@ Health-check controller не заменяет эти проверки и не о
 реальные owner migrations/grants, enum split и business contracts. Перед
 production нужно получить зелёные оба immutable SHA; локальный mock-прогон
 не объявлять проверкой production PostgreSQL или успешным деплоем.
+
+### Отдельная активация оплаты WinCRM: `crm-commerce-activate`
+
+Это **config-only** scope после успешного code-only rollout совместимых readers.
+Наличие контроллера или зелёного CI не означает, что оплата уже включена.
+Существующие image IDs и APP_REVISION сохраняются; сборок, миграций, изменения
+ролей/ACL, broker, Nginx, frontend, Widgets-оплат и вызовов платёжного провайдера
+в этом scope нет. Последовательно пересоздаются ровно семь процессов:
+
+1. `winwidget-crm/crm-customers-api`;
+2. `winwidget-crm/crm-access-worker`;
+3. `winwidget-crm/crm-access-outbox-publisher`;
+4. `winwidget-crm/crm-access-api`;
+5. `winwidget/billing-worker`;
+6. `winwidget/billing-scheduler`;
+7. `winwidget/billing-api`.
+
+До запуска отдельно согласованно синхронизировать три **полных** env-файла:
+canonical `deploy/backend/.env.production`, Billing owner
+`winwidget.ru_services/apps/billing/.env.production` и CRM owner
+`deploy/backend/crm/.env.production`. Для каждого сначала скачать серверную
+копию и сравнить с локальной, затем атомарно установить под общим deploy lock,
+повторно скачать и доказать побайтовое совпадение. Controller сам env не меняет.
+Допустимы только `BILLING_WINCRM_PAYMENTS_ENABLED=false→true` в трёх Billing
+процессах и `CRM_ACCESS_BILLING_ENABLED=false→true` в трёх Access-процессах;
+reconciliation worker/scheduler должен стать или остаться `true`.
+`CRM_CUSTOMERS_DADATA_API_KEY` допускается только Customers API: отдельно
+одобренный ключ либо пустое optional значение, без передачи другим ролям.
+Все прочие effective env, credentials, ресурсы и isolation должны совпасть.
+
+После синхронизации создать свежий baseline через `crmCommerceBaseline()` из
+проверенного `scripts/crm-commerce-activation.mjs`: полный inventory обоих
+Compose projects, актуальная Gateway revision и hashes `{canonical,billing,crm}`
+подготовленных полных файлов. Сохранить `JSON.stringify(baseline) + '\n'` как
+root-owned `0600` файл
+`/opt/winwidget/deploy/backend/crm/commerce-activation-baseline.json`.
+Baseline содержит IDs/revisions и hashes, но не значения env; исходный inspect
+с приватной конфигурацией нельзя выводить или публиковать.
+Pinned reusable workflow получает `release_scope=crm-commerce-activate`,
+`expected_crm_commerce_baseline_sha256`, `expected_live_revision` (Gateway)
+и `expected_service_env_sha256` (CRM owner). Canonical hash передаётся через
+`BACKEND_PRODUCTION_ENV_SHA256`; Billing hash закреплён внутри baseline.
+У другого scope этот activation input должен быть пустым.
+
+Под общим production lock выполняется READ ONLY preflight существующих Billing,
+Access и Customers БД: PostgreSQL 18, точные UUID/schema/principal, image source,
+завершённый ledger и неизменные роли/ACL. До первого admission требуется свежий
+снимок без CRM orders, renewals, provider operations, paid periods, due renewals,
+недоставленных provider deliveries/outbox и Access billing operations/capacity
+fences. При ненулевом счётчике не удалять данные и не обходить gate: остановиться
+для отдельной оценки уже существующей коммерческой активности. Проверка не
+создаёт платёж и не подтверждает внешнюю фискализацию; реальные первоначальный
+и рекуррентный платежи остаются отдельной проверкой с участием пользователя.
+
+Private plan, binding и recovery receipts сохраняются в
+`/opt/winwidget/deploy/backend/crm/commerce-activations/<services-SHA>/`
+(`0700`, файлы `0600`). Это приватные release artifacts, не backup и не публичные
+CI artifacts. Durable `admission.json` появляется **до первой остановки**;
+после него разрешено только продолжение того же Services/Infra SHA, baseline,
+env и запечатанного плана. Новый коммерческий спрос после admission допустим,
+но повторный preflight по-прежнему проверяет DB identity/ledger/ACL.
+Готовый префикс не перезапускается, соседи сохраняют IDs/config/StartedAt.
+
+Перед каждой единственной попыткой Compose сохраняется `start-N.json`, затем
+`observed-N.json` привязывает фактически увиденный новый ID/StartedAt; завершение
+шага требует exact config и healthy без restart. При timeout/обрыве ответа
+**не повторять создание автоматически**: повторный запуск только наблюдает
+исходную попытку и продолжает подтверждённый префикс. Если новый контейнер не
+появился или утрачен receipt, требуется отдельно reviewed forward recovery.
+Нельзя удалять marker, готовить новый plan, возвращать старые readers или
+объявлять отсутствие контейнера доказательством, что предыдущий запуск не
+состоялся. Health-check не заменяет авторизованный billing/browser smoke.
 
 07.09.2026 успешно выполнен scope `billing-crm-commerce-acl`:
 одна immutable migration `20260909110000_restrict_wincrm_commerce_runtime_acl`,
