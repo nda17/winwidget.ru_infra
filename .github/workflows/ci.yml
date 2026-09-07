@@ -124,7 +124,7 @@ jobs:
 
       - name: Verify additive CRM broker topology and scoped ACL contract
         shell: bash
-        run: node --test scripts/test-crm-broker-topology.mjs
+        run: node --test scripts/test-crm-broker-topology.mjs scripts/test-crm-broker-bootstrap.mjs
 
       - name: Verify CRM preparation and database-only release without application activation
         shell: bash

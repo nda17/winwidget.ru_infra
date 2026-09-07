@@ -8,6 +8,10 @@ import {
 	readCrmBrokerSnapshot,
 	provisionCrmBrokerPrincipals
 } from './crm-broker-topology.mjs'
+import {
+	bootstrapCrmBroker,
+	crmBrokerInputs
+} from './crm-broker-bootstrap.mjs'
 
 const image =
 	'rabbitmq:4.2.9-management-alpine@sha256:0ab90fc05c41e9d2d8f11af5036e466c364adf5085ed83c477ab41aec0bdde86'
@@ -180,7 +184,23 @@ try {
 		await channel.assertExchange(item.name, item.type, { durable: true })
 	const legacyPrincipals = [
 		user,
-		...Array.from({ length: 15 }, (_, index) => 'legacy-contract-' + index)
+		'winwidget-monitor',
+		...[
+			'notification-delivery',
+			'campaigns',
+			'reporting',
+			'widgets',
+			'billing-worker',
+			'billing-publisher',
+			'identity-worker',
+			'identity-publisher',
+			'platform-publisher',
+			'support-worker',
+			'support-publisher',
+			'operations-worker',
+			'operations-restore-worker',
+			'operations-publisher'
+		].map(name => 'winwidget-' + name)
 	]
 	for (const name of legacyPrincipals.slice(1)) {
 		await request('/api/users/' + name, 'PUT', {
@@ -217,7 +237,45 @@ try {
 	}
 	stage = 'first-provision'
 	console.log('CRM broker test: ' + stage)
-	const first = await provisionCrmBrokerPrincipals(options)
+	const canonical = {
+		RABBITMQ_ADMIN_USER: user,
+		RABBITMQ_ADMIN_PASSWORD: password,
+		RABBITMQ_MONITOR_USER: 'winwidget-monitor',
+		RABBITMQ_VHOST: 'winwidget',
+		RABBITMQ_MANAGEMENT_URL: 'http://127.0.0.1:15672'
+	}
+	for (const name of legacyPrincipals.slice(2))
+		canonical[
+			'RABBITMQ_' +
+				name
+					.slice('winwidget-'.length)
+					.replaceAll('-', '_')
+					.toUpperCase() +
+				'_URL'
+		] = 'amqp://' + name + ':synthetic-only@127.0.0.1:5672/winwidget'
+	const crm = {
+		CRM_ACCESS_BILLING_ENABLED: 'false',
+		CRM_INTAKE_WIDGETS_ENABLED: 'false',
+		CRM_INTAKE_WIDGET_TRANSFERS_ENABLED: 'false'
+	}
+	for (const [name, secret] of Object.entries(credentials).filter(
+		([name]) => name.startsWith('winwidget-crm-')
+	))
+		crm[
+			name.slice('winwidget-'.length).replaceAll('-', '_').toUpperCase() +
+				'_RABBITMQ_URL'
+		] = 'amqp://' + name + ':' + secret + '@127.0.0.1:5672/winwidget'
+	const inputs = crmBrokerInputs(
+		canonical,
+		crm,
+		credentials['winwidget-billing-wincrm-provider-worker']
+	)
+	const first = await bootstrapCrmBroker({
+		inputs,
+		connect,
+		request,
+		assertReleaseFence: options.assertReleaseFence
+	})
 	const identities = await request('/api/users')
 	const publish = async (target, exchange, routingKey) => {
 		let returned = false
