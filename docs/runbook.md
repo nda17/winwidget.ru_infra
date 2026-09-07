@@ -40,7 +40,22 @@ Telegram bridge VPS
 Внутренние API, PostgreSQL и RabbitMQ слушают только loopback/private network.
 Публичными являются frontend, system Nginx API и согласованный Telegram relay.
 
-### WinCRM: отдельные БД и runtime в production, публичный доступ ещё закрыт
+### WinCRM: рабочее приложение в production, платные продажи закрыты
+
+07.09.2026 рабочее приложение открыто на `https://crm.winwidget.ru`.
+Авторизованный browser smoke подтвердил явный запуск Trial на 5 дней
+с двумя местами, установку шаблона «Универсальные продажи@1», ручную заявку,
+создание контакта/сделки/задачи, переход стадии с результатом и следующей
+задачей, компанию, отдел и обновление аналитики. Цены и лимиты читаются из
+редактора ADMIN `/admin/crm`; тарифы в этом smoke не изменялись.
+
+Native Widgets проверен на собственном тестовом колесе: явное подключение,
+доставка одной новой заявки в Inbox, затем явное отключение. История не
+переносилась; полученная заявка сохранилась после отключения. Тестовые записи
+помечены в названиях и оставлены в рабочем пространстве, реальных рассылок,
+приглашений и платежей не выполнялось. Это не доказательство всех ролей,
+остальных типов виджетов, платных сценариев или мобильной адаптивности.
+Оставшиеся проверки находятся в service backlog; все три paid gates закрыты.
 
 В `winwidget.ru_services/deploy/docker-compose.crm.yml` описан отдельный
 Compose project `winwidget-crm`. Он не объединяется через `-f` с действующим
@@ -168,6 +183,21 @@ Migration выполняется отдельным процессом с Billin
 После ошибки не повторять автоматически: проверить ledger и фактический ACL,
 не выполнять `migrate resolve` или расширение прав ради зелёного деплоя.
 
+Попытка CI `34080713661` остановлена guard исторической Billing runtime-роли:
+`INHERIT=true`, хотя memberships отсутствуют. Транзакция SQL откатилась,
+девять ACL не изменились; Prisma сохранил одну unfinished запись с нулём
+applied steps и `logs=null`. Для неё подготовлена отдельная reviewed recovery:
+ID `412a6ec9-35c7-4c1a-ad94-b11dbae1e889`, started
+`2026-09-07T03:47:48.537639Z`, прежний immutable migration checksum.
+Перед любым изменением проверяются exact ledger, прежние ACL, отсутствие
+активных migration connections и memberships runtime-роли. Только после
+этого Billing admin выставляет ей `NOINHERIT` (эффективные права при нулевых
+memberships не меняются), а Billing migration-role выполняет штатный
+`migrate resolve --rolled-back` исключительно для этой попытки. Исходная
+запись сохраняется; SQL не переписывается и не помечается applied без запуска.
+Это не автоматический recovery неизвестных ошибок и не разрешение удалить
+ledger, расширить права или включить оплату.
+
 При первой попытке дочерняя Compose-команда прочитала остаток SSH-сценария
 из stdin после миграций Identity. Три Identity-процесса были восстановлены
 на новой совместимой версии, без отката БД/старого writer; затем завершено
@@ -260,9 +290,9 @@ image/env, прав, mounts, health и ресурсных ограничений
 потребления памяти во время запуска не должен превышать 3 GiB. Эти проверки
 не заменяют нагрузочную проверку CPU/pools/очередей и не открывают продажи.
 
-До открытия рабочего CRM нужны capacity/business/browser gates из service backlog,
-актуальная сверка owner DB/image/migration evidence, broker ACL/bindings,
-проверенные межсервисные вызовы и фактический запуск приложений.
+Перед следующими обновлениями нужны свежая сверка owner DB/image/migration
+evidence, broker ACL/bindings, runtime и запас ресурсов. До открытия платных
+продаж остаются business/payment/browser проверки из service backlog.
 
 Подготовительный scope `crm-prepare` проходит через тот же pinned reusable
 workflow и `deploy-services-production.sh`, общий root-owned deploy lock и
@@ -885,11 +915,56 @@ Backup copies сохраняются до обычного retention; удале
 
 ### Frontend
 
+07.09.2026 четыре frontend-контейнера обновлены до
+`9d1880fc841ff09f525c684c6f79c0b193193894`: CI `34078656417`, production
+deploy `34079166307` (успешная попытка 2). Сохранены прежний лендинг Widgets,
+активная ссылка CRM и работающий WinCRM. Основные блоки 18 разделов админки
+получили общий полноширинный layout; из оплаты убрана релизная «Внешняя
+проверка», без подмены неизвестного статуса успехом. Реальные настройки,
+ошибки провайдера и backend/DEV-права сохранены.
+
+Авторизованный production browser на 1470×867 подтвердил страницы CRM,
+платежей, контента, рассылок, пользователей и системы. У платежей и рассылок
+ширина формы 1446 px с границами 12 px, таблица пользователей имеет свой
+`overflow:auto`; горизонтального переполнения страницы нет. Фактическая
+мобильная проверка остаётся в backlog: команда viewport текущего browser
+bridge не изменяет реальный размер страницы.
+
+Первая попытка этого же immutable frontend SHA остановилась на disk gate
+до переключения traffic. Под общим frontend lock удалён только неиспользуемый
+BuildKit cache старше двух часов: освобождено 35.27 GB. Контейнеры, образы,
+volumes и данные сохранены; cache восстанавливается следующей сборкой.
+Повторный deploy успешно завершён. Read-only замер 03:46 UTC:
+все четыре контейнера используют `9d1880fc`, свободно около 40 GiB диска
+и 2818 MiB MemAvailable. Это снимок после выпуска, не нагрузочный тест.
+
 Frontend выпускается из exact green SHA собственного репозитория через его
 workflow; при переходе `winwidget.ru_client` → `winwidget.ru_frontends`
 четыре приложения получают независимые image/deploy/rollback. Tracked
 `nginx/frontend.conf` описывает Landing `:3000`, CRM `:3001`, Widgets `:3002`,
 Admin `:3003` только на loopback одного текущего frontend VPS.
+
+#### Локальная уборка после первого запуска WinCRM
+
+07.09.2026 штатным `git worktree remove` без `--force` удалены восемь
+временных рабочих копий из корня workspace:
+
+- `winwidget.ru_infra_identity_manifest`;
+- `winwidget.ru_infra_operations_api`;
+- `winwidget.ru_services_notes_rollout`;
+- `winwidget.ru_services_operations_api`;
+- `winwidget.ru_services_operations_release`;
+- `winwidget.ru_services_otp_release`;
+- `winwidget.ru_services_otp_rollout`;
+- `winwidget.ru_services_worker_recovery`.
+
+Перед удалением проверены чистый Git status, untracked/ignored файлы,
+точные HEAD на GitHub и отсутствие процессов с этими cwd/путями.
+Все локальные/удалённые ветки и коммиты сохранены; копии можно восстановить
+через Git. Основные три репозитория, `deploy`, `DOCUMENTATION` и пользовательские
+файлы не удалялись. Новые backup/dump-копии для уборки не создавались.
+
+#### Первичное переключение маршрутов
 
 Перед первым переключением маршрутов:
 

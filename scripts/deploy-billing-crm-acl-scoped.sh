@@ -38,6 +38,37 @@ billing_acl_env_inventory() {
 	done
 }
 
+billing_acl_restrict_legacy_role() {
+	local id
+	id="$(docker ps --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=billing-postgres --format '{{.ID}}')"
+	[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Billing database is not unique.'
+	# Only this role flag, with zero memberships: effective Widgets grants are
+	# unchanged. No password, grants, business rows or ledger fields are written.
+	docker exec --interactive --user postgres "$id" psql -X -q -v ON_ERROR_STOP=1 -U winwidget_billing_admin -d winwidget_billing <<'SQL'
+BEGIN;
+SET LOCAL statement_timeout = '5s';
+DO $billing_role$
+BEGIN
+ IF current_database() <> 'winwidget_billing' OR current_user <> 'winwidget_billing_admin'
+  OR NOT EXISTS (SELECT 1 FROM billing.service_identity WHERE id='singleton' AND service_name='billing-service')
+  OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='winwidget_billing_runtime'
+   AND rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls)
+  OR EXISTS (SELECT 1 FROM pg_auth_members WHERE member='winwidget_billing_runtime'::regrole)
+  OR EXISTS (SELECT 1 FROM pg_stat_activity WHERE usename='winwidget_billing_migration')
+  OR NOT EXISTS (SELECT 1 FROM billing._prisma_migrations
+   WHERE id='412a6ec9-35c7-4c1a-ad94-b11dbae1e889'
+    AND migration_name='20260909110000_restrict_wincrm_commerce_runtime_acl'
+    AND checksum='ad429d7f4324f2dbf62de73e1492084dbf8b61cb589c172de891b0d5edf4a415'
+    AND started_at='2026-09-07T03:47:48.537639Z'::timestamptz
+    AND finished_at IS NULL AND rolled_back_at IS NULL AND applied_steps_count=0 AND logs IS NULL)
+ THEN RAISE EXCEPTION 'Billing legacy role recovery admission failed'; END IF;
+ ALTER ROLE winwidget_billing_runtime NOINHERIT;
+END
+$billing_role$;
+COMMIT;
+SQL
+}
+
 billing_acl_fence() {
 	[[ "$(billing_acl_env_inventory)" == "$billing_acl_envs" ]] || die 'A production env changed during Billing ACL release.'
 	[[ "$(billing_acl_inventory)" == "$billing_acl_runtime" ]] || die 'A production container changed during Billing ACL release.'
@@ -108,6 +139,16 @@ scoped_deploy_main() {
 	billing_acl_envs="$(billing_acl_env_inventory)"
 	billing_acl_runtime="$(billing_acl_inventory)"
 	[[ "$billing_acl_runtime" =~ ^[a-f0-9]{64}$ ]] || die 'Cannot seal the live runtime fingerprint.'
+	billing_acl_fence
+	# Operator-reviewed recovery of one exact, transactionally unapplied attempt.
+	# A different failed row, changed ACL or any runtime membership fails closed.
+	before="$(billing_acl_probe recovery)" || die 'Exact Billing recovery preflight failed; nothing changed.'
+	billing_acl_fence
+	billing_acl_restrict_legacy_role
+	billing_acl_fence
+	billing_acl_probe recover || die 'Billing recovery failed; inspect exact ledger and role before retry.'
+	after="$(billing_acl_probe before)"
+	[[ "$before" == "$after" ]] || die 'Billing recovery changed database identity or unrelated ACL.'
 	billing_acl_fence
 	before="$(billing_acl_probe before)" || die 'Billing ACL preflight failed; no migration was started.'
 	printf '%s\n' 'Billing-owned ACL preflight passed; all live containers will remain unchanged.'

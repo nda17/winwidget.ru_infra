@@ -11,6 +11,12 @@ export const MIGRATION =
 	'20260909110000_restrict_wincrm_commerce_runtime_acl'
 export const MIGRATION_SHA256 =
 	'ad429d7f4324f2dbf62de73e1492084dbf8b61cb589c172de891b0d5edf4a415'
+// Exact failed production attempt: explicit BEGIN was rolled back after the
+// legacy runtime INHERIT guard failed. Never generalize this to other failures.
+export const RECOVERY_ATTEMPT = Object.freeze({
+	id: '412a6ec9-35c7-4c1a-ad94-b11dbae1e889',
+	startedAt: '2026-09-07T03:47:48.537Z'
+})
 export const TABLES = Object.freeze([
 	'crm_auto_renewal_consents',
 	'crm_auto_renewals',
@@ -137,19 +143,58 @@ export function migrationUrl(value) {
 }
 
 export function verifyLedger(files, rows, phase) {
-	assert.ok(['before', 'after'].includes(phase))
+	assert.ok(['recovery', 'before', 'after'].includes(phase))
 	const expected = new Map(files.map(row => [row.name, row.checksum]))
 	assert.equal(expected.size, files.length)
 	assert.equal(expected.get(MIGRATION), MIGRATION_SHA256)
 	const applied = new Set()
+	let recoveryRows = 0
 	for (const row of rows) {
+		if (row.id === RECOVERY_ATTEMPT.id) {
+			assert.equal(++recoveryRows, 1)
+			assert.equal(row.migration_name, MIGRATION)
+			assert.equal(row.checksum, MIGRATION_SHA256)
+			assert.equal(
+				new Date(row.started_at).toISOString(),
+				RECOVERY_ATTEMPT.startedAt
+			)
+			assert.equal(row.finished_at, null)
+			assert.equal(row.applied_steps_count, 0)
+			assert.equal(row.logs, null)
+			if (phase === 'recovery') assert.equal(row.rolled_back_at, null)
+			else
+				assert.ok(
+					row.rolled_back_at &&
+						Number.isFinite(new Date(row.rolled_back_at).getTime())
+				)
+			continue
+		}
 		assert.equal(row.rolled_back_at, null)
 		assert.ok(row.finished_at && !applied.has(row.migration_name))
 		assert.equal(expected.get(row.migration_name), row.checksum)
 		applied.add(row.migration_name)
 	}
+	if (phase === 'recovery') assert.equal(recoveryRows, 1)
 	const pending = [...expected.keys()].filter(name => !applied.has(name))
-	assert.deepEqual(pending, phase === 'before' ? [MIGRATION] : [])
+	assert.deepEqual(pending, phase === 'after' ? [] : [MIGRATION])
+}
+
+export function verifyRuntimeRole(rows, phase) {
+	assert.equal(rows.length, 1)
+	const row = rows[0]
+	assert.equal(row.rolname, 'winwidget_billing_runtime')
+	assert.equal(row.rolcanlogin, true)
+	for (const key of [
+		'rolsuper',
+		'rolcreatedb',
+		'rolcreaterole',
+		'rolreplication',
+		'rolbypassrls'
+	])
+		assert.equal(row[key], false)
+	assert.equal(row.memberships, 0)
+	if (phase !== 'recovery') assert.equal(row.rolinherit, false)
+	else assert.equal(typeof row.rolinherit, 'boolean')
 }
 
 export function verifyAcl(rows, phase) {
@@ -211,7 +256,13 @@ async function database(phase, source) {
 				verifyLedger(
 					files,
 					await tx.$queryRawUnsafe(
-						'SELECT migration_name, checksum, finished_at, rolled_back_at FROM billing._prisma_migrations ORDER BY migration_name'
+						'SELECT id, migration_name, checksum, started_at, finished_at, rolled_back_at, applied_steps_count, logs FROM billing._prisma_migrations ORDER BY migration_name, started_at'
+					),
+					phase
+				)
+				verifyRuntimeRole(
+					await tx.$queryRawUnsafe(
+						"SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit, rolreplication, rolbypassrls, (SELECT count(*)::int FROM pg_auth_members WHERE member=r.oid) AS memberships FROM pg_roles r WHERE rolname='winwidget_billing_runtime'"
 					),
 					phase
 				)
@@ -225,12 +276,12 @@ async function database(phase, source) {
 				has_table_privilege('winwidget_billing_runtime',c.oid,'TRUNCATE') AS can_truncate
 				FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 				WHERE n.nspname='billing' AND c.relname IN (${TABLES.map(name => `'${name}'`).join(',')})`)
-				verifyAcl(rows, phase)
+				verifyAcl(rows, phase === 'recovery' ? 'before' : phase)
 				const routine = await tx.$queryRawUnsafe(
 					"SELECT has_function_privilege('winwidget_billing_runtime','billing.protect_wincrm_commerce_evidence()','EXECUTE') AS allowed"
 				)
 				assert.equal(routine[0].allowed, false)
-				// All non-target table ACL, schema/role/default ACL and routine ACL
+				// All non-target table ACL, schema/default ACL and routine ACL
 				// remain identical. No business rows, provider objects or secrets leave PG.
 				const unchanged =
 					await tx.$queryRawUnsafe(`SELECT kind, name, acl FROM (
@@ -263,19 +314,23 @@ async function main() {
 		)
 		return
 	}
-	assert.ok(['before', 'migrate', 'after'].includes(mode))
+	assert.ok(
+		['recovery', 'recover', 'before', 'migrate', 'after'].includes(mode)
+	)
 	const source = inventory('/run/candidate/prisma')
 	assertSourcePair(inventory('/app/prisma'), source)
-	if (mode === 'migrate') {
+	if (mode === 'migrate' || mode === 'recover') {
 		// The exact pending migration was checked again in this same process.
-		await database('before', source)
+		await database(mode === 'recover' ? 'recovery' : 'before', source)
 		const env = parseEnv(readFileSync('/run/billing.env', 'utf8'))
 		const result = spawnSync(
 			process.execPath,
 			[
 				'/app/node_modules/prisma/build/index.js',
 				'migrate',
-				'deploy',
+				...(mode === 'recover'
+					? ['resolve', '--rolled-back', MIGRATION]
+					: ['deploy']),
 				'--schema',
 				'/run/candidate/prisma/schema.prisma'
 			],
@@ -292,7 +347,12 @@ async function main() {
 			}
 		)
 		assert.equal(result.status, 0)
-		console.log('Billing CRM ACL migration process completed')
+		if (mode === 'recover') await database('before', source)
+		console.log(
+			mode === 'recover'
+				? 'Exact unapplied Billing ACL attempt recorded as rolled back; original evidence preserved'
+				: 'Billing CRM ACL migration process completed'
+		)
 		return
 	}
 	console.log(JSON.stringify(await database(mode, source)))

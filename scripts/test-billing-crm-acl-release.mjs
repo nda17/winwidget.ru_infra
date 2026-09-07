@@ -5,12 +5,14 @@ import test from 'node:test'
 import {
 	MIGRATION,
 	MIGRATION_SHA256,
+	RECOVERY_ATTEMPT,
 	TABLES,
 	assertSourcePair,
 	migrationUrl,
 	runtimeFingerprint,
 	verifyAcl,
-	verifyLedger
+	verifyLedger,
+	verifyRuntimeRole
 } from './billing-crm-acl-release.mjs'
 
 test('only the exact additive ACL migration can differ from the live Prisma source', () => {
@@ -177,6 +179,76 @@ test('all nine tables retain business grants and lose only removal and consent u
 	}
 })
 
+test('only the reviewed unapplied attempt can be recovered without discarding its evidence', () => {
+	const files = [{ name: MIGRATION, checksum: MIGRATION_SHA256 }]
+	const failed = {
+		id: RECOVERY_ATTEMPT.id,
+		migration_name: MIGRATION,
+		checksum: MIGRATION_SHA256,
+		started_at: RECOVERY_ATTEMPT.startedAt,
+		finished_at: null,
+		rolled_back_at: null,
+		applied_steps_count: 0,
+		logs: null
+	}
+	verifyLedger(files, [failed], 'recovery')
+	assert.throws(() => verifyLedger(files, [failed], 'before'))
+	assert.throws(() => verifyLedger(files, [], 'recovery'))
+	const resolved = { ...failed, rolled_back_at: '2026-09-07T04:00:00Z' }
+	verifyLedger(files, [resolved], 'before')
+	assert.throws(() => verifyLedger(files, [resolved], 'recovery'))
+	assert.throws(() => verifyLedger(files, [resolved, resolved], 'before'))
+	const applied = {
+		...failed,
+		id: 'new-attempt',
+		finished_at: '2026-09-07T04:01:00Z',
+		applied_steps_count: 1
+	}
+	verifyLedger(files, [resolved, applied], 'after')
+	for (const mutation of [
+		{ id: 'another-failure' },
+		{ checksum: 'b'.repeat(64) },
+		{ migration_name: 'another_migration' },
+		{ started_at: '2026-09-07T03:48:00Z' },
+		{ applied_steps_count: 1 },
+		{ logs: 'unexpected error' },
+		{ finished_at: '2026-09-07T04:00:00Z' }
+	])
+		assert.throws(() =>
+			verifyLedger(files, [{ ...failed, ...mutation }], 'recovery')
+		)
+})
+
+test('legacy role normalization cannot hide inherited or privileged access', () => {
+	const row = {
+		rolname: 'winwidget_billing_runtime',
+		rolcanlogin: true,
+		rolsuper: false,
+		rolcreatedb: false,
+		rolcreaterole: false,
+		rolinherit: true,
+		rolreplication: false,
+		rolbypassrls: false,
+		memberships: 0
+	}
+	verifyRuntimeRole([row], 'recovery')
+	assert.throws(() => verifyRuntimeRole([row], 'before'))
+	verifyRuntimeRole([{ ...row, rolinherit: false }], 'before')
+	for (const mutation of [
+		{ memberships: 1 },
+		{ rolname: 'another-role' },
+		{ rolcanlogin: false },
+		{ rolsuper: true },
+		{ rolcreatedb: true },
+		{ rolcreaterole: true },
+		{ rolreplication: true },
+		{ rolbypassrls: true }
+	])
+		assert.throws(() =>
+			verifyRuntimeRole([{ ...row, ...mutation }], 'recovery')
+		)
+})
+
 function fixture() {
 	return Array.from({ length: 47 }, (_, i) => ({
 		Id: i.toString(16).padStart(64, '0'),
@@ -280,6 +352,15 @@ test('scope does not build, replace, delete or publish any runtime resources', (
 	assert.match(shell, /before="\$\(billing_acl_probe before\)"/)
 	assert.match(shell, /billing_acl_probe migrate/)
 	assert.match(shell, /after="\$\(billing_acl_probe after\)"/)
+	assert.match(shell, /billing_acl_probe recovery/)
+	assert.match(shell, /billing_acl_probe recover \|\| die/)
+	assert.match(shell, /ALTER ROLE winwidget_billing_runtime NOINHERIT/)
+	assert.match(shell, /member='winwidget_billing_runtime'::regrole/)
+	assert.match(shell, /412a6ec9-35c7-4c1a-ad94-b11dbae1e889/)
+	assert.doesNotMatch(
+		shell,
+		/DELETE FROM|TRUNCATE|UPDATE billing\._prisma_migrations|GRANT /
+	)
 	assert.match(shell, /"\$before" == "\$after"/)
 	assert.equal(spawnSync('bash', ['-n'], { input: shell }).status, 0)
 })
