@@ -9,6 +9,8 @@ import {
 	readFileSync,
 	readdirSync,
 	rmSync,
+	statSync,
+	symlinkSync,
 	writeFileSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
@@ -36,6 +38,10 @@ import {
 	crmUpgradeDatabasePreserved,
 	crmUpgradeDesired,
 	crmUpgradeOldImages,
+	crmUpgradeImageSource,
+	crmUpgradeDatabaseInput,
+	crmUpgradeDatabaseConnection,
+	parseCrmUpgradeDatabaseHandoff,
 	assertCrmPublicGatesClosed
 } from './crm-release.mjs'
 
@@ -305,6 +311,428 @@ test('upgrade source permits only reviewed expansion SQL and proves Identity sch
 			'20260907120100_expand_workday_tasks': hash
 		})
 	)
+})
+
+function privateSourceFixture(directory) {
+	const prisma = join(directory, 'prisma')
+	const migration = '20260101000000_initial'
+	mkdirSync(join(prisma, 'migrations', migration), {
+		recursive: true,
+		mode: 0o700
+	})
+	for (const path of [
+		prisma,
+		join(prisma, 'migrations'),
+		join(prisma, 'migrations', migration)
+	])
+		chmodSync(path, 0o700)
+	const content = {
+		'schema.prisma': '// public synthetic Prisma schema\n',
+		'database-access.json': '{"synthetic":true}\n',
+		'migrations/migration_lock.toml': 'provider = "postgresql"\n',
+		[`migrations/${migration}/migration.sql`]: 'SELECT 1;\n'
+	}
+	for (const [name, bytes] of Object.entries(content))
+		writeFileSync(join(prisma, name), bytes, { mode: 0o600 })
+	return { prisma, migration, content }
+}
+
+test('upgrade extractor reads actual owner-private 0600/0700 Prisma files without rewriting them', () => {
+	const directory = mkdtempSync(join(tmpdir(), 'wincrm-upgrade-source-'))
+	try {
+		const { prisma, migration, content } = privateSourceFixture(directory)
+		const expected = Object.fromEntries(
+			Object.entries(content).map(([name, bytes]) => [
+				name.startsWith('migrations/')
+					? name.endsWith('/migration.sql')
+						? migration
+						: 'migration_lock.toml'
+					: name,
+				sha(bytes)
+			])
+		)
+		assert.deepEqual(crmUpgradeImageSource(prisma), expected)
+		for (const [name, bytes] of Object.entries(content)) {
+			assert.equal(statSync(join(prisma, name)).mode & 0o777, 0o600)
+			assert.equal(readFileSync(join(prisma, name), 'utf8'), bytes)
+		}
+		assert.equal(statSync(join(prisma, 'migrations')).mode & 0o777, 0o700)
+		symlinkSync(prisma, join(directory, 'alias'))
+		assert.throws(() => crmUpgradeImageSource(join(directory, 'alias')))
+		writeFileSync(
+			join(prisma, 'migrations', migration, 'unexpected.sql'),
+			'SELECT 2;'
+		)
+		assert.throws(() => crmUpgradeImageSource(prisma))
+	} finally {
+		rmSync(directory, { recursive: true, force: true })
+	}
+})
+
+function databaseInputFixture(owner = 'identity') {
+	const schema = owner.replaceAll('-', '_')
+	const migrationUrl = `postgresql://winwidget_${schema}_migration:migration-test-secret@127.0.0.1:55442/winwidget_${schema}?schema=${schema}&sslmode=disable&connection_limit=1&pool_timeout=5`
+	const runtimeUrl = `postgresql://winwidget_${schema}_runtime:runtime-secret-must-not-cross@127.0.0.1:55442/winwidget_${schema}?schema=${schema}&sslmode=disable`
+	const ownerEnv = `${schema.toUpperCase()}_MIGRATION_DATABASE_URL=${JSON.stringify(migrationUrl)}\nUNRELATED_SECRET=not-in-handoff\n`
+	const live = [
+		{
+			Config: {
+				Labels: {
+					'com.docker.compose.project': owner.startsWith('crm-')
+						? 'winwidget-crm'
+						: 'winwidget',
+					'com.docker.compose.service': `${owner}-api`
+				},
+				Env: [
+					`${schema.toUpperCase()}_DATABASE_URL=${runtimeUrl}`,
+					'OTHER_SECRET=not-in-handoff'
+				]
+			}
+		}
+	]
+	return { owner, schema, ownerEnv, live, migrationUrl, runtimeUrl }
+}
+
+test('database stdin handoff is owner-bound and contains only one migration secret for all six images', () => {
+	for (const [owner] of CRM_UPGRADE_GROUPS) {
+		const fixture = databaseInputFixture(owner)
+		const value = crmUpgradeDatabaseInput(owner, fixture.ownerEnv, fixture.live)
+		assert.deepEqual(value, {
+			owner,
+			migrationUrl: fixture.migrationUrl,
+			runtimeBinding: {
+				host: '127.0.0.1',
+				port: '55442',
+				username: `winwidget_${fixture.schema}_runtime`,
+				database: `winwidget_${fixture.schema}`,
+				schema: fixture.schema
+			}
+		})
+		assert.equal(
+			crmUpgradeDatabaseConnection(owner, value).href,
+			fixture.migrationUrl
+		)
+		assert.equal(JSON.stringify(value).includes('runtime-secret'), false)
+		assert.equal(JSON.stringify(value).includes('not-in-handoff'), false)
+		assert.ok(Buffer.byteLength(JSON.stringify(value)) <= 16384)
+	}
+})
+
+test('database root reader rejects absent, duplicate and cross-owner runtime/env bindings', () => {
+	const { owner, ownerEnv, live, schema } = databaseInputFixture()
+	for (const changed of [
+		[],
+		[...live, ...live],
+		[
+			{
+				...live[0],
+				Config: {
+					...live[0].Config,
+					Labels: {
+						...live[0].Config.Labels,
+						'com.docker.compose.project': 'foreign'
+					}
+				}
+			}
+		]
+	])
+		assert.throws(() => crmUpgradeDatabaseInput(owner, ownerEnv, changed))
+	assert.throws(() => crmUpgradeDatabaseInput('billing', ownerEnv, live))
+	assert.throws(() => crmUpgradeDatabaseInput(owner, ownerEnv + ownerEnv, live))
+	assert.throws(() => crmUpgradeDatabaseInput(owner, 'x'.repeat(1048577), live))
+	assert.throws(() =>
+		crmUpgradeDatabaseInput(owner, 'INVALID LINE\n' + ownerEnv, live)
+	)
+	const duplicate = structuredClone(live)
+	duplicate[0].Config.Env.push(duplicate[0].Config.Env[0])
+	assert.throws(() => crmUpgradeDatabaseInput(owner, ownerEnv, duplicate))
+	for (const replace of [
+		value => value.replace(':55442/', ':55443/'),
+		value => value.replace('_runtime:', '_migration:'),
+		value => value.replace('127.0.0.1', 'localhost'),
+		value => value.replace(`schema=${schema}`, 'schema=foreign'),
+		value => value + `&schema=${schema}`
+	]) {
+		const changed = structuredClone(live)
+		changed[0].Config.Env[0] = replace(changed[0].Config.Env[0])
+		assert.throws(() => crmUpgradeDatabaseInput(owner, ownerEnv, changed))
+	}
+})
+
+test('non-root database consumer revalidates exact envelope, migration identity and approved runtime binding', () => {
+	const fixture = databaseInputFixture()
+	const value = crmUpgradeDatabaseInput(
+		fixture.owner,
+		fixture.ownerEnv,
+		fixture.live
+	)
+	for (const change of [
+		entry => {
+			entry.owner = 'billing'
+		},
+		entry => {
+			entry.unexpected = 'secret'
+		},
+		entry => {
+			entry.runtimeBinding.port = '55443'
+		},
+		entry => {
+			entry.runtimeBinding.host = 'localhost'
+		},
+		entry => {
+			entry.runtimeBinding.username = 'winwidget_identity_migration'
+		},
+		entry => {
+			entry.runtimeBinding.database = 'foreign'
+		},
+		entry => {
+			entry.runtimeBinding.schema = 'foreign'
+		},
+		entry => {
+			entry.runtimeBinding.password = 'not-allowed'
+		},
+		entry => {
+			entry.migrationUrl = entry.migrationUrl.replace(
+				'_migration:',
+				'_runtime:'
+			)
+		},
+		entry => {
+			entry.migrationUrl = entry.migrationUrl.replace('127.0.0.1', 'localhost')
+		},
+		entry => {
+			entry.migrationUrl = entry.migrationUrl.replace(
+				'/winwidget_identity?',
+				'/foreign?'
+			)
+		},
+		entry => {
+			entry.migrationUrl = entry.migrationUrl.replace(
+				'schema=identity',
+				'schema=foreign'
+			)
+		},
+		entry => {
+			entry.migrationUrl = entry.migrationUrl.replace(
+				'sslmode=disable',
+				'sslmode=require'
+			)
+		},
+		entry => {
+			entry.migrationUrl += '&schema=identity'
+		},
+		entry => {
+			entry.migrationUrl += '&connection_limit=1'
+		},
+		entry => {
+			entry.migrationUrl += '&unexpected=value'
+		},
+		entry => {
+			entry.migrationUrl += '#fragment'
+		},
+		entry => {
+			entry.migrationUrl = 'x'.repeat(8193)
+		}
+	]) {
+		const changed = structuredClone(value)
+		change(changed)
+		assert.throws(() => crmUpgradeDatabaseConnection(fixture.owner, changed))
+	}
+	for (const changed of [null, [], {}, 'text'])
+		assert.throws(() => crmUpgradeDatabaseConnection(fixture.owner, changed))
+	for (const raw of [
+		'{',
+		JSON.stringify({ ...value, owner: 'billing' }),
+		JSON.stringify(value).replace(
+			'"owner":"identity"',
+			'"owner":"billing","owner":"identity"'
+		),
+		'x'.repeat(16385)
+	]) {
+		const result = spawnSync(
+			process.execPath,
+			[
+				join(root, 'crm-release.mjs'),
+				'upgrade-database',
+				fixture.owner,
+				'complete'
+			],
+			{ encoding: 'utf8', input: raw }
+		)
+		assert.notEqual(result.status, 0)
+		assert.equal(result.stdout, '')
+		assert.equal(
+			result.stderr,
+			'CRM release verification failed; private details suppressed\n'
+		)
+	}
+})
+
+test('bounded database handoff parser rejects duplicate keys and malformed bytes before Prisma loads', () => {
+	const { owner, ownerEnv, live } = databaseInputFixture()
+	const value = crmUpgradeDatabaseInput(owner, ownerEnv, live)
+	const raw = JSON.stringify(value)
+	assert.deepEqual(parseCrmUpgradeDatabaseHandoff(Buffer.from(raw)), value)
+	for (const bytes of [
+		Buffer.from(
+			raw.replace('"owner":"identity"', '"owner":"billing","owner":"identity"')
+		),
+		Buffer.from(raw.replace('"port":"55442"', '"port":"55443","port":"55442"')),
+		Buffer.from('{'),
+		Buffer.alloc(0),
+		Buffer.alloc(16385, 32),
+		Buffer.from([0xc3, 0x28])
+	])
+		assert.throws(() => parseCrmUpgradeDatabaseHandoff(bytes))
+})
+
+function probeArguments(mode, owner, producer = 'success') {
+	const directory = mkdtempSync(join(tmpdir(), 'wincrm-upgrade-argv-'))
+	try {
+		const result = spawnSync(
+			'/bin/bash',
+			[
+				'-c',
+				`
+set -euo pipefail
+source "$TEST_LIBRARY"
+scoped_payload_directory='/synthetic public payload'
+release_root='/synthetic release'
+crm_work_directory='/private workdir'
+services_repository='/synthetic services'
+crm_env_file='/private CRM/.env.production'
+expected_live_revision="$TEST_REVISION"
+services_revision="$TEST_REVISION"
+infra_revision="$TEST_REVISION"
+crm_upgrade_env_hashes='{}'
+crm_probe_image="$TEST_GATEWAY"
+export crm_upgrade_handoff='inherited-public-value'
+docker() {
+  local mode="\${@: -3:1}" input attributes
+  attributes="$(declare -p crm_upgrade_handoff 2>/dev/null || true)"
+  [[ "$attributes" != 'declare -x'* ]] || return 19
+  printf '%s\\0' "$@" >"$TEST_DIRECTORY/$mode.argv"
+  if [[ "$mode" == upgrade-database-input ]]; then
+    if [[ "$TEST_PRODUCER" == oversize ]]; then printf '%16385s' ''; return 0; fi
+    if [[ "$TEST_PRODUCER" == empty ]]; then return 0; fi
+    printf 'PRIVATE_STDIN_SENTINEL'
+    [[ "$TEST_PRODUCER" != failed ]] || return 17
+  elif [[ "$mode" == upgrade-database ]]; then
+    input="$(command dd bs=1024 count=1 2>/dev/null)"
+    [[ "$input" == PRIVATE_STDIN_SENTINEL ]] || return 18
+    printf 'true\\n'
+  fi
+}
+crm_upgrade_probe "$TEST_MODE" "$TEST_OWNER" "$TEST_IMAGE" complete
+`
+			],
+			{
+				encoding: 'utf8',
+				env: {
+					PATH: process.env.PATH,
+					TEST_LIBRARY: join(root, 'deploy-crm-scoped.sh'),
+					TEST_DIRECTORY: directory,
+					TEST_MODE: mode,
+					TEST_OWNER: owner,
+					TEST_IMAGE: image(2),
+					TEST_GATEWAY: image(1),
+					TEST_REVISION: revision,
+					TEST_PRODUCER: producer
+				}
+			}
+		)
+		return {
+			result,
+			calls: Object.fromEntries(
+				readdirSync(directory).map(file => [
+					file.replace('.argv', ''),
+					readFileSync(join(directory, file), 'utf8').split('\0').slice(0, -1)
+				])
+			)
+		}
+	} finally {
+		rmSync(directory, { recursive: true, force: true })
+	}
+}
+
+test('real upgrade probe argv isolates source and piped database reads without adding capabilities or private mounts', () => {
+	const ordinary = [
+		'upgrade-baseline',
+		'upgrade-old-images',
+		'upgrade-baseline-check',
+		'upgrade-source-check',
+		'upgrade-database-check',
+		'upgrade-pending',
+		'upgrade-grants',
+		'upgrade-env',
+		'upgrade-prepare',
+		'upgrade-fence',
+		'upgrade-complete',
+		'upgrade-compose'
+	]
+	for (const owner of CRM_UPGRADE_GROUPS.map(([owner]) => owner)) {
+		for (const mode of ['upgrade-source', 'upgrade-database', ...ordinary]) {
+			const { result, calls } = probeArguments(mode, owner)
+			assert.equal(result.status, 0, result.stderr)
+			assert.equal(result.stdout.includes('PRIVATE_STDIN_SENTINEL'), false)
+			for (const [actualMode, args] of Object.entries(calls)) {
+				const values = flag =>
+					args.flatMap((value, index) =>
+						value === flag ? [args[index + 1]] : []
+					)
+				assert.deepEqual(values('--cap-drop'), ['ALL'])
+				assert.deepEqual(values('--cap-add'), [])
+				assert.deepEqual(values('--security-opt'), ['no-new-privileges'])
+				assert.ok(args.includes('--read-only') && args.includes('--rm'))
+				assert.deepEqual(values('--log-driver'), ['none'])
+				assert.deepEqual(values('--network'), [
+					actualMode === 'upgrade-database' ? 'host' : 'none'
+				])
+				assert.deepEqual(values('--user'), [
+					['upgrade-source', 'upgrade-database'].includes(actualMode)
+						? '1001:1001'
+						: '0:0'
+				])
+				assert.ok(values('--volume').every(value => value.endsWith(':ro')))
+				assert.ok(
+					!args.some(value =>
+						/PRIVATE_STDIN|migration-test-secret|DAC_|privileged/.test(value)
+					)
+				)
+				assert.deepEqual(args.slice(-4), [
+					'/run/crm-release.mjs',
+					actualMode,
+					owner,
+					actualMode === 'upgrade-database-input' ? '' : 'complete'
+				])
+				if (['upgrade-source', 'upgrade-database'].includes(actualMode))
+					assert.deepEqual(values('--volume'), [
+						'/synthetic public payload/verifier.mjs:/run/crm-release.mjs:ro'
+					])
+				else if (actualMode === 'upgrade-database-input') {
+					assert.equal(args[args.indexOf('--entrypoint') + 2], image(1))
+					assert.deepEqual(values('--volume'), [
+						'/synthetic public payload/verifier.mjs:/run/crm-release.mjs:ro',
+						'/private workdir/live.json:/run/crm/live.json:ro',
+						owner.startsWith('crm-')
+							? '/private CRM/.env.production:/run/crm/crm.env:ro'
+							: `/synthetic services/apps/${owner}/.env.production:/run/crm/${owner}.env:ro`
+					])
+				} else
+					assert.ok(values('--volume').includes('/private workdir:/run/crm:ro'))
+			}
+			assert.equal(
+				Object.keys(calls).length,
+				mode === 'upgrade-database' ? 2 : 1
+			)
+		}
+	}
+	for (const scenario of ['failed', 'oversize', 'empty']) {
+		const failed = probeArguments('upgrade-database', 'identity', scenario)
+		assert.notEqual(failed.result.status, 0)
+		assert.equal(failed.result.stdout, '')
+		assert.deepEqual(Object.keys(failed.calls), ['upgrade-database-input'])
+	}
 })
 
 test('upgrade ledgers distinguish pending, complete and the single retained Billing rolled-back attempt', () => {
@@ -2135,8 +2563,125 @@ test(
 				composeFile,
 				...args
 			])
-		let container
+		let container, upgradeImageTag
 		try {
+			if (mode === 'ci') {
+				// Exercise the real permission boundary, not the coordinator double.
+				// A dedicated public context must not include the test DB password.
+				stage = 'actual-image-private-prisma-setup'
+				const contextDirectory = join(directory, 'upgrade-source-image')
+				mkdirSync(contextDirectory, { mode: 0o700 })
+				const { prisma } = privateSourceFixture(contextDirectory)
+				writeFileSync(
+					join(contextDirectory, 'package.json'),
+					'{"name":"synthetic-upgrade"}',
+					{ mode: 0o600 }
+				)
+				writeFileSync(
+					join(contextDirectory, 'verifier.mjs'),
+					readFileSync(join(root, 'crm-release.mjs')),
+					{ mode: 0o444 }
+				)
+				const nodeImage =
+					'node:20.20.2-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0'
+				writeFileSync(
+					join(contextDirectory, 'Dockerfile'),
+					[
+						`FROM ${nodeImage}`,
+						'WORKDIR /app',
+						'COPY --chown=1001:1001 prisma /app/prisma',
+						'COPY --chown=1001:1001 package.json /app/package.json',
+						'COPY verifier.mjs /run/crm-release.mjs',
+						''
+					].join('\n'),
+					{ mode: 0o600 }
+				)
+				const candidateTag = `wincrm-upgrade-source-test:${process.pid}`
+				assert.notEqual(docker(['image', 'inspect', candidateTag]).status, 0)
+				upgradeImageTag = candidateTag
+				output(docker(['pull', nodeImage]))
+				output(
+					docker([
+						'build',
+						'--network',
+						'none',
+						'--tag',
+						upgradeImageTag,
+						contextDirectory
+					])
+				)
+				const sourceProbe = user =>
+					docker([
+						'run',
+						'--rm',
+						'--interactive',
+						'--network',
+						'none',
+						'--read-only',
+						'--log-driver',
+						'none',
+						'--cap-drop',
+						'ALL',
+						'--security-opt',
+						'no-new-privileges',
+						'--user',
+						user,
+						'--memory',
+						'256m',
+						'--memory-swap',
+						'256m',
+						'--cpus',
+						'1',
+						'--pids-limit',
+						'64',
+						'--entrypoint',
+						'node',
+						upgradeImageTag,
+						'/run/crm-release.mjs',
+						'upgrade-source',
+						'identity',
+						''
+					])
+				stage = 'actual-root-without-dac-cannot-read-image-owner-files'
+				const denied = sourceProbe('0:0')
+				assert.equal(denied.status, 1)
+				assert.equal(denied.stdout, '')
+				assert.equal(
+					denied.stderr,
+					'CRM release verification failed; private details suppressed\n'
+				)
+				stage = 'actual-owner-without-capabilities-reads-prisma'
+				assert.deepEqual(
+					JSON.parse(output(sourceProbe('1001:1001'))),
+					crmUpgradeImageSource(prisma)
+				)
+				stage = 'actual-owner-reads-private-package-manifest'
+				assert.equal(
+					output(
+						docker([
+							'run',
+							'--rm',
+							'--network',
+							'none',
+							'--read-only',
+							'--log-driver',
+							'none',
+							'--cap-drop',
+							'ALL',
+							'--security-opt',
+							'no-new-privileges',
+							'--user',
+							'1001:1001',
+							'--entrypoint',
+							'node',
+							upgradeImageTag,
+							'-e',
+							'const fs=require("node:fs"); if((fs.statSync("/app/package.json").mode&511)!==384)process.exit(1); process.stdout.write(require("/app/package.json").name)'
+						])
+					),
+					'synthetic-upgrade'
+				)
+			}
 			stage = 'pull-pinned-postgres'
 			output(docker(['pull', image]))
 			stage = 'start-owned-postgres'
@@ -2195,6 +2740,11 @@ crm_database_auth crm-access "$TEST_CONTAINER" admin
 			output(auth())
 		} finally {
 			stage = 'owned-test-cleanup'
+			if (
+				upgradeImageTag &&
+				docker(['image', 'inspect', upgradeImageTag]).status === 0
+			)
+				output(docker(['image', 'rm', upgradeImageTag]))
 			// Compose may create the container before its startup command fails.
 			// This exact name was absent before the test; verify ownership below.
 			if (!container) {

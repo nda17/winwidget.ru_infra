@@ -233,6 +233,31 @@ Runtime допускает только новые image/APP_REVISION: оста�
 healthchecks, ресурсы и конфигурация должны совпадать с approved live snapshot.
 Все шесть owner DB проходят read-only preflight **до первой мутации**.
 
+Проверка старого и нового image не требует расширения Linux capabilities:
+
+- `upgrade-source` работает как `1001:1001`, `network=none`, читает только
+  image-owned `/app/prisma`; из хоста получает лишь hash-verified публичный
+  verifier mode `0444`. Это поддерживает исторические Prisma-файлы `0600`
+  и каталоги `0700` после checkout с `umask 077` без изменения их прав.
+- `upgrade-database-input` работает как root без сети и читает только выбранный
+  существующий owner env и approved `live.json` через read-only file mounts.
+  Он проверяет единственный нужный runtime и формирует ограниченный handoff:
+  `owner`, один migration URL, runtime host/port/principal/database/schema.
+  Runtime password и остальные значения env в handoff не попадают.
+- Только после успешного завершения preparer handoff передаётся через stdin
+  в `upgrade-database` под `1001:1001`. Краткоживущая shell-переменная не
+  экспортируется; файловых копий, credential argv/Docker env и private mounts
+  у DB verifier нет. Он повторно проверяет весь binding перед прежними
+  read-only PostgreSQL identity/ledger/ACL probes; сеть `host` остаётся только
+  у этой проверки существующей owner DB. Ошибка preparer не запускает DB probe.
+
+Во всех режимах остаются `cap-drop ALL`, `no-new-privileges`, read-only rootfs
+и default seccomp; `DAC_READ_SEARCH`, `DAC_OVERRIDE` и privileged не добавляются.
+Другие режимы, включая CRM `upgrade-grants`, сохраняют прежнюю root/no-cap
+изоляцию. Не запускать `upgrade-database-input` напрямую в терминал, CI log,
+файл или artifact: его вывод содержит migration credential и предназначен
+только для внутреннего stdin handoff. Настройки и права runtime не меняются.
+
 Миграции — только расширяющие, явно reviewed checksum allowlist в
 `CRM_UPGRADE_MIGRATIONS`: Billing manual days, Access employee profiles/branding,
 Sales workday. Старый Billing ACL release уже должен быть успешно завершён;

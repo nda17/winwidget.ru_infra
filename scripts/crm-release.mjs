@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { lstatSync, readdirSync, readFileSync } from 'node:fs'
+import { lstatSync, readdirSync, readFileSync, readSync } from 'node:fs'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
@@ -602,14 +602,16 @@ export function crmUpgradeDesired(
 	return { desired, replacements }
 }
 
-async function crmUpgradeDatabase(owner, complete) {
+// Internal stdin handoff only: never persist/print this envelope outside the
+// root-reader -> non-root image-verifier pipe. It contains one migration secret.
+export function crmUpgradeDatabaseInput(owner, ownerEnv, live) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
 	const schema = owner.replaceAll('-', '_')
+	assert.equal(typeof ownerEnv, 'string')
+	assert.ok(Buffer.byteLength(ownerEnv) <= 1048576)
+	assert.ok(Array.isArray(live) && live.length <= 1000)
 	const env = {}
-	for (const line of readFileSync(
-		`/run/crm/${owner.startsWith('crm-') ? 'crm' : owner}.env`,
-		'utf8'
-	).split(/\r?\n/)) {
+	for (const line of ownerEnv.split(/\r?\n/)) {
 		if (!line.trim() || line.trimStart().startsWith('#')) continue
 		const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line)
 		assert.ok(match && !Object.hasOwn(env, match[1]))
@@ -621,7 +623,44 @@ async function crmUpgradeDatabase(owner, complete) {
 		}
 		env[match[1]] = value
 	}
-	const url = new URL(env[`${schema.toUpperCase()}_MIGRATION_DATABASE_URL`])
+	const approved = live.filter(
+		item => upgradeKey(item) === `${upgradeProject(owner)}/${owner}-api`
+	)
+	assert.equal(approved.length, 1)
+	const runtimeUrl = new URL(
+		envObject(approved[0].Config.Env)[`${schema.toUpperCase()}_DATABASE_URL`]
+	)
+	assert.ok(['postgres:', 'postgresql:'].includes(runtimeUrl.protocol))
+	assert.equal(runtimeUrl.searchParams.getAll('schema').length, 1)
+	const input = {
+		owner,
+		migrationUrl: env[`${schema.toUpperCase()}_MIGRATION_DATABASE_URL`],
+		runtimeBinding: {
+			host: runtimeUrl.hostname,
+			port: runtimeUrl.port,
+			username: runtimeUrl.username,
+			database: runtimeUrl.pathname.slice(1),
+			schema: runtimeUrl.searchParams.get('schema')
+		}
+	}
+	crmUpgradeDatabaseConnection(owner, input)
+	assert.ok(Buffer.byteLength(JSON.stringify(input)) <= 16384)
+	return input
+}
+
+export function crmUpgradeDatabaseConnection(owner, input) {
+	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+	const schema = owner.replaceAll('-', '_')
+	assert.ok(input && typeof input === 'object' && !Array.isArray(input))
+	assert.deepEqual(Object.keys(input).sort(), [
+		'migrationUrl',
+		'owner',
+		'runtimeBinding'
+	])
+	assert.equal(input.owner, owner)
+	assert.equal(typeof input.migrationUrl, 'string')
+	assert.ok(input.migrationUrl.length > 0 && input.migrationUrl.length <= 8192)
+	const url = new URL(input.migrationUrl)
 	assert.ok(['postgres:', 'postgresql:'].includes(url.protocol))
 	assert.equal(url.hostname, '127.0.0.1')
 	assert.equal(url.username, `winwidget_${schema}_migration`)
@@ -629,23 +668,38 @@ async function crmUpgradeDatabase(owner, complete) {
 	assert.equal(url.searchParams.get('schema'), schema)
 	assert.equal(url.searchParams.get('sslmode'), 'disable')
 	assert.ok(url.password && !url.hash)
-	const live = JSON.parse(readFileSync('/run/crm/live.json', 'utf8'))
-	const approved = live.find(
-		item => upgradeKey(item) === `${upgradeProject(owner)}/${owner}-api`
-	)
-	const runtimeUrl = new URL(
-		envObject(approved.Config.Env)[`${schema.toUpperCase()}_DATABASE_URL`]
-	)
-	assert.equal(url.port, runtimeUrl.port)
 	assert.match(url.port, /^\d{2,5}$/)
-	assert.equal(runtimeUrl.hostname, '127.0.0.1')
-	assert.equal(runtimeUrl.username, `winwidget_${schema}_runtime`)
-	assert.equal(runtimeUrl.pathname, url.pathname)
-	assert.equal(runtimeUrl.searchParams.get('schema'), schema)
+	assert.ok(Number(url.port) <= 65535 && Number(url.port) > 0)
+	assert.deepEqual(input.runtimeBinding, {
+		host: '127.0.0.1',
+		port: url.port,
+		username: `winwidget_${schema}_runtime`,
+		database: `winwidget_${schema}`,
+		schema
+	})
 	for (const key of url.searchParams.keys())
 		assert.ok(
-			['schema', 'sslmode', 'connection_limit', 'pool_timeout'].includes(key)
+			['schema', 'sslmode', 'connection_limit', 'pool_timeout'].includes(key) &&
+				url.searchParams.getAll(key).length === 1
 		)
+	return url
+}
+
+export function parseCrmUpgradeDatabaseHandoff(buffer) {
+	assert.ok(
+		Buffer.isBuffer(buffer) && buffer.length > 0 && buffer.length <= 16384
+	)
+	const bytes = new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+	const value = JSON.parse(bytes)
+	// The trusted producer emits canonical compact JSON. Reject duplicate
+	// keys/alternate encodings instead of silently accepting last-key wins.
+	assert.equal(JSON.stringify(value), bytes)
+	return value
+}
+
+async function crmUpgradeDatabase(owner, complete, input) {
+	const url = crmUpgradeDatabaseConnection(owner, input)
+	const schema = owner.replaceAll('-', '_')
 	const { PrismaClient } = createRequire('/app/package.json')(
 		`@prisma/${owner}-client`
 	)
@@ -761,6 +815,16 @@ async function crmUpgradeCommand(mode) {
 		assert.ok(Buffer.byteLength(bytes) <= 8 * 1048576)
 		return JSON.parse(bytes)
 	}
+	const databaseInput = () => {
+		const buffer = Buffer.alloc(16385)
+		let size = 0
+		while (size < buffer.length) {
+			const count = readSync(0, buffer, size, buffer.length - size, null)
+			if (count === 0) break
+			size += count
+		}
+		return parseCrmUpgradeDatabaseHandoff(buffer.subarray(0, size))
+	}
 	const json = name => JSON.parse(readFileSync(`/run/crm/${name}.json`, 'utf8'))
 	if (mode === 'upgrade-baseline')
 		return crmUpgradeBaseline(
@@ -792,8 +856,24 @@ async function crmUpgradeCommand(mode) {
 			json(`${owner}-source-after`)
 		)
 	}
+	if (mode === 'upgrade-database-input') {
+		const owner = process.argv[3]
+		assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+		const envFile = `/run/crm/${owner.startsWith('crm-') ? 'crm' : owner}.env`
+		assert.ok(lstatSync(envFile).size <= 1048576)
+		assert.ok(lstatSync('/run/crm/live.json').size <= 8 * 1048576)
+		return crmUpgradeDatabaseInput(
+			owner,
+			readFileSync(envFile, 'utf8'),
+			json('live')
+		)
+	}
 	if (mode === 'upgrade-database')
-		return crmUpgradeDatabase(process.argv[3], process.argv[4] === 'complete')
+		return crmUpgradeDatabase(
+			process.argv[3],
+			process.argv[4] === 'complete',
+			databaseInput()
+		)
 	if (mode === 'upgrade-database-check') {
 		const owner = process.argv[3]
 		assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))

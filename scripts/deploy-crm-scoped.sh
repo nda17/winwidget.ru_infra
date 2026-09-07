@@ -509,24 +509,44 @@ crm_upgrade_verify_inventory() {
 }
 
 crm_upgrade_probe() {
-	local mode="$1" owner="${2:-}" selected="${3:-$crm_probe_image}" phase="${4:-}" network=none
-	local -a private_mount=()
-	if [[ "$mode" == upgrade-database ]]; then
-		network=host
-		if [[ "$owner" == crm-* ]]; then private_mount=(--volume "$crm_env_file:/run/crm/crm.env:ro")
-		else private_mount=(--volume "$services_repository/apps/$owner/.env.production:/run/crm/$owner.env:ro"); fi
-	fi
-	docker run --rm --interactive --network "$network" --read-only --log-driver none \
-		--cap-drop ALL --security-opt no-new-privileges --user 0:0 --memory 256m --memory-swap 256m --cpus 1 --pids-limit 64 \
-		--tmpfs /tmp:rw,noexec,nosuid,size=16m \
+	local mode="$1" owner="${2:-}" selected="${3:-$crm_probe_image}" phase="${4:-}" network=none user=0:0 crm_upgrade_handoff
+	export -n crm_upgrade_handoff
+	local -a mounts=() command=()
+	case "$mode" in
+		upgrade-source) user=1001:1001 ;;
+		upgrade-database) user=1001:1001; network=host ;;
+		upgrade-database-input)
+			case "$owner" in identity|billing|crm-access|crm-customers|crm-sales|crm-intake) ;; *) return 1 ;; esac
+			mounts=(--volume "$crm_work_directory/live.json:/run/crm/live.json:ro")
+			if [[ "$owner" == crm-* ]]; then mounts+=(--volume "$crm_env_file:/run/crm/crm.env:ro")
+			else mounts+=(--volume "$services_repository/apps/$owner/.env.production:/run/crm/$owner.env:ro"); fi ;;
+		*) mounts=(
+			--volume "$release_root/.github/scripts/validate-crm-compose.mjs:/run/crm-compose-validator.mjs:ro"
+			--volume "$release_root/deploy/crm/database-access.mjs:/run/crm-database-access.mjs:ro"
+			--volume "$crm_work_directory:/run/crm:ro"
+		) ;;
+	esac
+	# The image owns Prisma/package files as UID 1001, including historical
+	# 0600/0700 files. Do not add DAC capabilities or widen private artifact ACLs.
+	command=(docker run --rm --interactive --network "$network" --read-only --log-driver none
+		--cap-drop ALL --security-opt no-new-privileges --user "$user" --memory 256m --memory-swap 256m --cpus 1 --pids-limit 64
+		--tmpfs '/tmp:rw,noexec,nosuid,size=16m' \
 		--env "CRM_GATEWAY_REVISION=$expected_live_revision" --env "CRM_SERVICES_REVISION=$services_revision" \
 		--env "CRM_INFRA_REVISION=$infra_revision" --env "CRM_UPGRADE_ENV_HASHES=$crm_upgrade_env_hashes" \
 		--env "CRM_UPGRADE_SWITCHING_OWNER=${crm_upgrade_switching_owner:-}" \
-		--volume "$scoped_payload_directory/verifier.mjs:/run/crm-release.mjs:ro" \
-		--volume "$release_root/.github/scripts/validate-crm-compose.mjs:/run/crm-compose-validator.mjs:ro" \
-		--volume "$release_root/deploy/crm/database-access.mjs:/run/crm-database-access.mjs:ro" \
-		--volume "$crm_work_directory:/run/crm:ro" ${private_mount[@]+"${private_mount[@]}"} \
-		--entrypoint node "$selected" /run/crm-release.mjs "$mode" "$owner" "$phase"
+		--volume "$scoped_payload_directory/verifier.mjs:/run/crm-release.mjs:ro"
+		${mounts[@]+"${mounts[@]}"}
+		--entrypoint node "$selected" /run/crm-release.mjs "$mode" "$owner" "$phase")
+	if [[ "$mode" == upgrade-database ]]; then
+		# Buffer the bounded handoff only in this non-exported shell variable:
+		# a failing producer must never start the DB verifier, even after output.
+		# No env copy, Docker credential env, private workdir or runtime password.
+		crm_upgrade_handoff="$(crm_upgrade_probe upgrade-database-input "$owner" "$crm_probe_image")" || return 1
+		(( ${#crm_upgrade_handoff} > 0 && ${#crm_upgrade_handoff} <= 16384 )) || return 1
+		printf '%s' "$crm_upgrade_handoff" | "${command[@]}"
+	else
+		"${command[@]}"
+	fi
 }
 
 crm_upgrade_env_fence() {
