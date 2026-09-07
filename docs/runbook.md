@@ -40,7 +40,7 @@ Telegram bridge VPS
 Внутренние API, PostgreSQL и RabbitMQ слушают только loopback/private network.
 Публичными являются frontend, system Nginx API и согласованный Telegram relay.
 
-### WinCRM: отдельные БД в production, приложения ещё закрыты
+### WinCRM: отдельные БД и runtime в production, публичный доступ ещё закрыт
 
 В `winwidget.ru_services/deploy/docker-compose.crm.yml` описан отдельный
 Compose project `winwidget-crm`. Он не объединяется через `-f` с действующим
@@ -56,7 +56,7 @@ Compose project `winwidget-crm`. Он не объединяется через `
 Access 6, Intake 8, Customers 4 и Sales 6 записей; точные checksums,
 object grants и аутентификацию ролей проверил этап `crm-databases`.
 Приложения, broker principals, Trial, платежи и публичные CRM routes этим
-выпуском не включены. Read-only замер после этапа: 4.83 GiB `MemAvailable`,
+первичным выпуском не включены. Read-only замер после этапа: 4.83 GiB `MemAvailable`,
 15.97 GiB свободного диска; это не доказательство полного runtime capacity.
 При следующем запуске использовать свежую проверку состояния, а не этот снимок.
 
@@ -107,6 +107,28 @@ Widgets/Notification Delivery; проверены полные успешные 
 health — healthy, restarts — 0, OOM — false. Четыре owner env повторно скачаны
 и побайтово совпадают с локальными. Остальные 26 контейнеров не изменены.
 Продажи, native connector, invitation producer/reader и публичный CRM ещё закрыты.
+
+Полный закрытый CRM runtime запущен 07.09.2026 через зелёный production CI
+`34074371923`: все 12 application containers используют
+`837113b9f9f303bd6c043c2a2e37b0791369d7a3`, controller
+`15c4a6b34334457542a2cbed8e0af453894e81a1`. Проверка после CI подтвердила
+healthy, 0 restarts и отсутствие OOM; прежние 35 контейнеров не изменены.
+Замер 01:59 UTC: 4.44 GiB MemAvailable, 14.94 GiB диска, memory PSI 0.
+Это стартовый/idle замер, не доказательство capacity под рабочей нагрузкой.
+
+В предыдущей закрытой попытке `2131c7c` специализированный Intake worker
+не стартовал из-за обязательного `CRM_INTAKE_WIDGETS_ENABLED=true`.
+Manifest теперь включает обработку отдельно для специализированных consumers,
+сохраняя public API flags false. Девять application containers незавершённой
+попытки пересозданы; базы, volumes, очереди и данные не удалялись.
+Image CI проверяет фактический compiled role parser, не только shape Compose.
+
+Следующий этап использует `crm-public-release.mjs`: ровно восемь новых
+Gateway prefixes, `crm-source` только для ingest; старые routes не изменяются.
+Origin CRM добавляется Gateway/Identity/Billing/Widgets API, а origin общей
+админки — четырём CRM API. Это не включает платежи, invitation email или
+native widget producer. Перед переключением сверяются полные owner env,
+исходные process configs, точные image IDs и неизменность соседних контейнеров.
 
 При первой попытке дочерняя Compose-команда прочитала остаток SSH-сценария
 из stdin после миграций Identity. Три Identity-процесса были восстановлены

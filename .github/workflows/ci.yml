@@ -127,7 +127,7 @@ jobs:
         run: node --test scripts/test-crm-broker-topology.mjs scripts/test-crm-broker-bootstrap.mjs
 
       - name: Verify closed CRM companion environment preparation
-        run: node --test scripts/test-crm-companion-env.mjs scripts/test-crm-companion-release.mjs
+        run: node --test scripts/test-crm-companion-env.mjs scripts/test-crm-companion-release.mjs scripts/test-crm-public-release.mjs
 
       - name: Verify CRM preparation and database-only release without application activation
         shell: bash
