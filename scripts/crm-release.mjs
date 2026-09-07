@@ -429,24 +429,63 @@ function upgradeCompanionConfiguration(service, live, image) {
 	)
 	assert.equal(service.logging?.driver ?? 'json-file', host.LogConfig.Type)
 	same(service.logging?.options ?? {}, host.LogConfig.Config ?? {})
-	for (const key of ['ports', 'devices', 'volumes', 'secrets', 'extra_hosts'])
+	for (const key of ['ports', 'devices', 'volumes', 'secrets'])
 		assert.equal(service[key]?.length ?? 0, 0)
+	// Compose renders host mappings as an object or an array using '=' / ':'.
+	// Preserve the exact existing mappings, including Identity's Telegram proxy.
+	assert.ok(
+		service.extra_hosts == null || typeof service.extra_hosts === 'object'
+	)
+	const extraHosts = Array.isArray(service.extra_hosts)
+		? service.extra_hosts.map(value => {
+				assert.match(value, /^[^=:\s]+[=:]\S+$/)
+				return value.replace(/^([^=:]+)[=:]/, '$1:')
+			})
+		: Object.entries(service.extra_hosts ?? {}).map(([name, address]) => {
+				assert.match(name, /^[^=:\s]+$/)
+				assert.match(address, /^\S+$/)
+				return `${name}:${address}`
+			})
+	same(extraHosts.sort(), [...(host.ExtraHosts ?? [])].sort())
 	assert.equal(live.Mounts.length, 0)
 	assert.ok(
-		!host.ExtraHosts?.length &&
-			!host.Devices?.length &&
-			!host.Binds?.length &&
-			!host.CapAdd?.length
+		!host.Devices?.length && !host.Binds?.length && !host.CapAdd?.length
 	)
 	assert.equal(Object.keys(host.PortBindings ?? {}).length, 0)
 	same(service.healthcheck?.test, live.Config.Healthcheck.Test)
 	const nanos = value => {
-		if (!value) return 0
-		const match = /^(\d+)(ns|us|ms|s|m)$/.exec(value)
-		assert.ok(match)
-		return (
-			Number(match[1]) * { ns: 1, us: 1e3, ms: 1e6, s: 1e9, m: 60e9 }[match[2]]
+		if (value === undefined || value === null) return 0
+		assert.ok(
+			typeof value === 'string' && value.length > 0 && value.length <= 128
 		)
+		// Compose uses Go duration strings: 90s becomes 1m30s. Sum exact
+		// nanoseconds without floating-point rounding or accepting partial input.
+		const units = {
+			ns: 1n,
+			us: 1000n,
+			µs: 1000n,
+			μs: 1000n,
+			ms: 1000000n,
+			s: 1000000000n,
+			m: 60000000000n,
+			h: 3600000000000n
+		}
+		let cursor = 0,
+			total = 0n
+		for (const match of value.matchAll(
+			/(\d+(?:\.\d+)?)(ns|us|µs|μs|ms|s|m|h)/g
+		)) {
+			assert.equal(match.index, cursor)
+			const [whole, fraction = ''] = match[1].split('.')
+			const divisor = 10n ** BigInt(fraction.length)
+			const scaled = BigInt(whole + fraction) * units[match[2]]
+			assert.equal(scaled % divisor, 0n)
+			total += scaled / divisor
+			assert.ok(total <= BigInt(Number.MAX_SAFE_INTEGER))
+			cursor += match[0].length
+		}
+		assert.equal(cursor, value.length)
+		return Number(total)
 	}
 	for (const [key, actual] of [
 		['interval', 'Interval'],
@@ -697,6 +736,50 @@ export function parseCrmUpgradeDatabaseHandoff(buffer) {
 	return value
 }
 
+export function crmUpgradeDatabaseMemberships(owner, rows, admin = null) {
+	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+	assert.ok(Array.isArray(rows) && rows.length <= 2)
+	const companion = owner === 'identity' || owner === 'billing'
+	const prefix = `winwidget_${owner.replaceAll('-', '_')}`
+	if (companion)
+		assert.deepEqual(admin, {
+			rolname: `${prefix}_admin`,
+			rolcanlogin: true,
+			rolsuper: true,
+			databaseOwner: `${prefix}_admin`
+		})
+	else assert.equal(admin, null)
+	for (const row of rows)
+		assert.ok(
+			row &&
+				typeof row === 'object' &&
+				!Array.isArray(row) &&
+				typeof row.role === 'string'
+		)
+	const canonical = rows
+		.map(row => ({ ...row }))
+		.sort((left, right) =>
+			left.role < right.role ? -1 : left.role > right.role ? 1 : 0
+		)
+	// Existing companions grant their own application roles TO the already
+	// privileged bootstrap admin, never admin privileges TO an application role.
+	// CRM bootstrap has no memberships in either direction. No wildcard edges.
+	assert.deepEqual(
+		canonical,
+		companion
+			? ['migration', 'runtime'].map(role => ({
+					role: `${prefix}_${role}`,
+					member: `${prefix}_admin`,
+					grantor: `${prefix}_admin`,
+					admin_option: false,
+					inherit_option: true,
+					set_option: true
+				}))
+			: []
+	)
+	return canonical
+}
+
 async function crmUpgradeDatabase(owner, complete, input) {
 	const url = crmUpgradeDatabaseConnection(owner, input)
 	const schema = owner.replaceAll('-', '_')
@@ -724,7 +807,9 @@ async function crmUpgradeDatabase(owner, complete, input) {
 				assert.equal(principal.username, `winwidget_${schema}_migration`)
 				assert.equal(principal.schema, schema)
 				assert.equal(principal.recovery, false)
-				assert.ok(principal.version >= 180000 && principal.version < 190000)
+				assert.ok(
+					principal.version >= 180000 && principal.version < 190000
+				)
 				const roles = await tx.$queryRawUnsafe(
 					`SELECT rolname,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls FROM pg_roles WHERE rolname IN ('winwidget_${schema}_migration','winwidget_${schema}_runtime') ORDER BY rolname`
 				)
@@ -745,10 +830,31 @@ async function crmUpgradeDatabase(owner, complete, input) {
 					)
 						assert.equal(role.rolinherit, false)
 				}
-				const memberships = await tx.$queryRawUnsafe(
-					`SELECT 1 FROM pg_auth_members WHERE member IN ('winwidget_${schema}_migration'::regrole,'winwidget_${schema}_runtime'::regrole) OR roleid IN ('winwidget_${schema}_migration'::regrole,'winwidget_${schema}_runtime'::regrole) LIMIT 1`
+				const companion = owner === 'identity' || owner === 'billing'
+				const admins = companion
+					? await tx.$queryRawUnsafe(
+							`SELECT role_state.rolname, role_state.rolcanlogin, role_state.rolsuper,
+ pg_get_userbyid(database_state.datdba) AS "databaseOwner"
+ FROM pg_roles role_state JOIN pg_database database_state ON database_state.datname=current_database()
+ WHERE role_state.rolname='winwidget_${schema}_admin'`
+						)
+					: []
+				assert.equal(admins.length, companion ? 1 : 0)
+				const memberships = crmUpgradeDatabaseMemberships(
+					owner,
+					await tx.$queryRawUnsafe(
+						`SELECT granted_role.rolname AS "role", member_role.rolname AS "member", grantor_role.rolname AS "grantor",
+ membership.admin_option, membership.inherit_option, membership.set_option
+ FROM pg_auth_members membership
+ JOIN pg_roles granted_role ON granted_role.oid=membership.roleid
+ JOIN pg_roles member_role ON member_role.oid=membership.member
+ JOIN pg_roles grantor_role ON grantor_role.oid=membership.grantor
+ WHERE membership.member IN ('winwidget_${schema}_migration'::regrole,'winwidget_${schema}_runtime'::regrole)
+ OR membership.roleid IN ('winwidget_${schema}_migration'::regrole,'winwidget_${schema}_runtime'::regrole)
+ ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname, membership.admin_option, membership.inherit_option, membership.set_option`
+					),
+					admins[0] ?? null
 				)
-				assert.equal(memberships.length, 0)
 				const rows = await tx.$queryRawUnsafe(
 					`SELECT id, migration_name, checksum, finished_at::text, rolled_back_at::text FROM ${schema}._prisma_migrations ORDER BY migration_name, started_at`
 				)
@@ -785,10 +891,18 @@ async function crmUpgradeDatabase(owner, complete, input) {
 						'crm_admin_command_receipts_no_truncate'
 					])
 						assert.ok(
-							triggers.some(row => row.tgname === name && row.tgenabled === 'O')
+							triggers.some(
+								row => row.tgname === name && row.tgenabled === 'O'
+							)
 						)
 				}
-				return { databaseId: identity.database_id, pending, acl, roles }
+				return {
+					databaseId: identity.database_id,
+					pending,
+					acl,
+					roles,
+					memberships
+				}
 			},
 			{ timeout: 20000 }
 		)
@@ -797,13 +911,24 @@ async function crmUpgradeDatabase(owner, complete, input) {
 	}
 }
 
-export function crmUpgradeDatabasePreserved(before, after, complete = true) {
+export function crmUpgradeDatabasePreserved(
+	before,
+	after,
+	complete = true
+) {
 	assert.equal(after.databaseId, before.databaseId)
+	assert.ok(Array.isArray(before.roles) && Array.isArray(after.roles))
 	assert.deepEqual(after.roles, before.roles)
+	assert.ok(
+		Array.isArray(before.memberships) && Array.isArray(after.memberships)
+	)
+	assert.deepEqual(after.memberships, before.memberships)
 	if (complete) assert.equal(after.pending.length, 0)
 	for (const row of before.acl)
 		assert.deepEqual(
-			after.acl.find(item => item.kind === row.kind && item.name === row.name),
+			after.acl.find(
+				item => item.kind === row.kind && item.name === row.name
+			),
 			row
 		)
 	return true

@@ -41,6 +41,7 @@ import {
 	crmUpgradeImageSource,
 	crmUpgradeDatabaseInput,
 	crmUpgradeDatabaseConnection,
+	crmUpgradeDatabaseMemberships,
 	parseCrmUpgradeDatabaseHandoff,
 	assertCrmPublicGatesClosed
 } from './crm-release.mjs'
@@ -783,20 +784,198 @@ test('upgrade ledgers distinguish pending, complete and the single retained Bill
 	)
 })
 
-test('upgrade database proof preserves UUID and existing ACL while allowing new owned objects', () => {
+function companionMembershipFixture(owner) {
+	const prefix = `winwidget_${owner}`
+	return {
+		admin: {
+			rolname: `${prefix}_admin`,
+			rolcanlogin: true,
+			rolsuper: true,
+			databaseOwner: `${prefix}_admin`
+		},
+		memberships: ['migration', 'runtime'].map(role => ({
+			role: `${prefix}_${role}`,
+			member: `${prefix}_admin`,
+			grantor: `${prefix}_admin`,
+			admin_option: false,
+			inherit_option: true,
+			set_option: true
+		}))
+	}
+}
+
+test('companion membership proof permits only two own-admin edges in canonical order', () => {
+	for (const owner of ['identity', 'billing']) {
+		const { admin, memberships } = companionMembershipFixture(owner)
+		const reversed = [...memberships].reverse()
+		const result = crmUpgradeDatabaseMemberships(owner, reversed, admin)
+		assert.deepEqual(result, memberships)
+		assert.deepEqual(reversed, [...memberships].reverse())
+		assert.notEqual(result, memberships)
+		assert.notEqual(result[0], memberships[0])
+	}
+})
+
+test('companion membership proof rejects every missing, extra, reversed or changed edge', () => {
+	for (const owner of ['identity', 'billing']) {
+		const fixture = companionMembershipFixture(owner)
+		for (const mutate of [
+			value => {
+				value.memberships = []
+			},
+			value => {
+				value.memberships.pop()
+			},
+			value => {
+				value.memberships.push({ ...value.memberships[0] })
+			},
+			value => {
+				value.memberships[1] = { ...value.memberships[0] }
+			},
+			value => {
+				value.memberships[0].role = `winwidget_${owner}_backup`
+			},
+			value => {
+				value.memberships[0].role = 'pg_maintain'
+			},
+			value => {
+				value.memberships[0].role = 'winwidget_foreign_migration'
+			},
+			value => {
+				value.memberships[0].member = 'winwidget_foreign_admin'
+			},
+			value => {
+				value.memberships[0].member = `winwidget_${owner}_runtime`
+			},
+			value => {
+				value.memberships[0].grantor = 'winwidget_foreign_admin'
+			},
+			value => {
+				value.memberships[0].admin_option = true
+			},
+			value => {
+				value.memberships[0].inherit_option = false
+			},
+			value => {
+				value.memberships[0].set_option = false
+			},
+			value => {
+				value.memberships[0].admin_option = 'false'
+			},
+			value => {
+				delete value.memberships[0].grantor
+			},
+			value => {
+				value.memberships[0].unexpected = true
+			},
+			value => {
+				const row = value.memberships[0]
+				const role = row.role
+				row.role = row.member
+				row.member = role
+			}
+		]) {
+			const altered = structuredClone(fixture)
+			mutate(altered)
+			assert.throws(() =>
+				crmUpgradeDatabaseMemberships(
+					owner,
+					altered.memberships,
+					altered.admin
+				)
+			)
+		}
+		for (const malformed of [
+			null,
+			{},
+			[null],
+			[1],
+			['migration'],
+			[[...fixture.memberships]]
+		])
+			assert.throws(() =>
+				crmUpgradeDatabaseMemberships(owner, malformed, fixture.admin)
+			)
+	}
+})
+
+test('companion membership proof requires its exact login superuser to own the database', () => {
+	for (const owner of ['identity', 'billing']) {
+		const { memberships, admin } = companionMembershipFixture(owner)
+		for (const invalid of [
+			null,
+			undefined,
+			{},
+			[],
+			{ ...admin, rolname: 'winwidget_foreign_admin' },
+			{ ...admin, rolname: `winwidget_${owner}_migration` },
+			{ ...admin, rolcanlogin: false },
+			{ ...admin, rolsuper: false },
+			{ ...admin, rolsuper: 'true' },
+			{ ...admin, databaseOwner: `winwidget_${owner}_migration` },
+			{ ...admin, databaseOwner: 'winwidget_foreign_admin' },
+			{ ...admin, unexpected: true }
+		])
+			assert.throws(() =>
+				crmUpgradeDatabaseMemberships(owner, memberships, invalid)
+			)
+	}
+})
+
+test('four CRM databases still forbid memberships in either direction without companion exceptions', () => {
+	for (const owner of owners) {
+		assert.deepEqual(crmUpgradeDatabaseMemberships(owner, []), [])
+		const prefix = `winwidget_${owner.replaceAll('-', '_')}`
+		const row = {
+			role: `${prefix}_migration`,
+			member: `${prefix}_admin`,
+			grantor: `${prefix}_admin`,
+			admin_option: false,
+			inherit_option: true,
+			set_option: true
+		}
+		assert.throws(() => crmUpgradeDatabaseMemberships(owner, [row]))
+		assert.throws(() =>
+			crmUpgradeDatabaseMemberships(owner, [
+				{ ...row, role: row.member, member: row.role }
+			])
+		)
+		assert.throws(() =>
+			crmUpgradeDatabaseMemberships(
+				owner,
+				[],
+				companionMembershipFixture('identity').admin
+			)
+		)
+	}
+	for (const owner of ['operations', 'crm', '', 'identity; SELECT 1'])
+		assert.throws(() => crmUpgradeDatabaseMemberships(owner, []))
+})
+
+test('upgrade database proof preserves UUID, roles, memberships and existing ACL while allowing new owned objects', () => {
 	const before = {
 		databaseId: 'owned-db',
 		pending: ['new'],
+		roles: [
+			{ rolname: 'winwidget_crm_access_runtime', rolinherit: false }
+		],
+		memberships: [],
 		acl: [{ kind: 'relation', name: 'legacy', acl: 'unchanged' }]
 	}
 	const after = {
 		...before,
 		pending: [],
-		acl: [...before.acl, { kind: 'relation', name: 'new', acl: 'restricted' }]
+		acl: [
+			...before.acl,
+			{ kind: 'relation', name: 'new', acl: 'restricted' }
+		]
 	}
 	assert.equal(crmUpgradeDatabasePreserved(before, after), true)
 	assert.throws(() =>
-		crmUpgradeDatabasePreserved(before, { ...after, databaseId: 'other-db' })
+		crmUpgradeDatabasePreserved(before, {
+			...after,
+			databaseId: 'other-db'
+		})
 	)
 	assert.throws(() =>
 		crmUpgradeDatabasePreserved(before, { ...after, acl: [] })
@@ -804,6 +983,55 @@ test('upgrade database proof preserves UUID and existing ACL while allowing new 
 	assert.throws(() =>
 		crmUpgradeDatabasePreserved(before, { ...after, pending: ['new'] })
 	)
+	assert.throws(() =>
+		crmUpgradeDatabasePreserved(before, { ...after, roles: [] })
+	)
+	assert.throws(() =>
+		crmUpgradeDatabasePreserved(before, {
+			...after,
+			memberships: companionMembershipFixture('identity').memberships
+		})
+	)
+	for (const field of ['roles', 'memberships']) {
+		const legacy = { ...before }
+		delete legacy[field]
+		assert.throws(() => crmUpgradeDatabasePreserved(legacy, legacy))
+		assert.throws(() =>
+			crmUpgradeDatabasePreserved(before, { ...after, [field]: undefined })
+		)
+	}
+	for (const owner of ['identity', 'billing']) {
+		const memberships = companionMembershipFixture(owner).memberships
+		const companionBefore = { ...before, memberships }
+		const companionAfter = {
+			...after,
+			memberships: structuredClone(memberships)
+		}
+		assert.equal(
+			crmUpgradeDatabasePreserved(companionBefore, companionAfter),
+			true
+		)
+		for (const mutate of [
+			rows => {
+				rows.pop()
+			},
+			rows => {
+				rows[0].set_option = false
+			},
+			rows => {
+				rows[0].grantor = 'winwidget_foreign_admin'
+			}
+		]) {
+			const altered = structuredClone(companionAfter)
+			mutate(altered.memberships)
+			assert.throws(() =>
+				crmUpgradeDatabasePreserved(companionBefore, altered)
+			)
+			assert.throws(() =>
+				crmUpgradeDatabasePreserved(companionBefore, altered, false)
+			)
+		}
+	}
 })
 
 function upgradeDesiredFixture() {
@@ -830,6 +1058,12 @@ function upgradeDesiredFixture() {
 		const config = owner.startsWith('crm-') ? crm : companions
 		const candidate = images[index]
 		for (const name of names) {
+			const stopSeconds =
+				owner === 'identity' || name === 'billing-api'
+					? 30
+					: owner === 'billing'
+						? 90
+						: 45
 			const service = {
 				image: candidate.Id,
 				user: '1001:1001',
@@ -843,7 +1077,7 @@ function upgradeDesiredFixture() {
 				init: true,
 				cap_drop: ['ALL'],
 				restart: 'unless-stopped',
-				stop_grace_period: '45s',
+				stop_grace_period: stopSeconds === 90 ? '1m30s' : `${stopSeconds}s`,
 				mem_limit: 384 * 1048576,
 				memswap_limit: 384 * 1048576,
 				cpus: 1,
@@ -862,6 +1096,8 @@ function upgradeDesiredFixture() {
 					retries: 3
 				}
 			}
+			if (owner === 'identity')
+				service.extra_hosts = ['tg.winwidget.ru=127.0.0.1']
 			config.services[name] = service
 			const current = live.find(
 				row => row.Config.Labels['com.docker.compose.service'] === name
@@ -872,7 +1108,7 @@ function upgradeDesiredFixture() {
 				Cmd: candidate.Config.Cmd,
 				Entrypoint: candidate.Config.Entrypoint,
 				WorkingDir: '/app',
-				StopTimeout: 45,
+				StopTimeout: stopSeconds,
 				Env: [
 					'PATH=/usr/bin',
 					`APP_REVISION=${previous}`,
@@ -892,6 +1128,7 @@ function upgradeDesiredFixture() {
 			})
 			current.HostConfig = {
 				NetworkMode: 'host',
+				ExtraHosts: owner === 'identity' ? ['tg.winwidget.ru:127.0.0.1'] : [],
 				Privileged: false,
 				ReadonlyRootfs: true,
 				Init: true,
@@ -993,6 +1230,153 @@ test('upgrade desired contract selects only approved groups and isolated migrati
 			throw new Error('invalid owner shape')
 		})
 	)
+})
+
+test('upgrade desired preserves exact Identity proxy hosts across Compose representations', () => {
+	const input = upgradeDesiredFixture()
+	const current = input.live.find(
+		row => row.Config.Labels['com.docker.compose.service'] === 'identity-api'
+	)
+	current.HostConfig.ExtraHosts.push('ipv6.example.test:::1')
+	input.baseline = crmUpgradeBaseline(
+		input.live,
+		previous,
+		input.baseline.environmentHashes
+	)
+	for (const hosts of [
+		['tg.winwidget.ru=127.0.0.1', 'ipv6.example.test=::1'],
+		['ipv6.example.test:::1', 'tg.winwidget.ru:127.0.0.1'],
+		{ 'ipv6.example.test': '::1', 'tg.winwidget.ru': '127.0.0.1' }
+	]) {
+		const candidate = structuredClone(input)
+		candidate.companions.services['identity-api'].extra_hosts = hosts
+		const { desired } = crmUpgradeDesired(candidate, () => {})
+		assert.deepEqual(
+			desired.companions.services['identity-api'].extra_hosts,
+			hosts
+		)
+	}
+})
+
+test('upgrade desired rejects host, address, addition, removal and malformed proxy drift', () => {
+	const input = upgradeDesiredFixture()
+	for (const hosts of [
+		['other.example.test=127.0.0.1'],
+		['tg.winwidget.ru=127.0.0.2'],
+		['tg.winwidget.ru=127.0.0.1', 'other.example.test=127.0.0.1'],
+		['tg.winwidget.ru=127.0.0.1', 'tg.winwidget.ru=127.0.0.1'],
+		[],
+		{},
+		undefined,
+		null,
+		'',
+		false,
+		['tg.winwidget.ru'],
+		['tg.winwidget.ru='],
+		['tg.winwidget.ru=127.0.0.1 extra'],
+		{ 'tg.winwidget.ru': 127 },
+		{ 'invalid host': '127.0.0.1' }
+	]) {
+		const candidate = structuredClone(input)
+		candidate.companions.services['identity-api'].extra_hosts = hosts
+		assert.throws(() => crmUpgradeDesired(candidate, () => {}))
+	}
+	// An unchanged candidate also cannot hide live drift behind normalization.
+	const changedLive = structuredClone(input)
+	changedLive.live.find(
+		row => row.Config.Labels['com.docker.compose.service'] === 'identity-api'
+	).HostConfig.ExtraHosts = ['tg.winwidget.ru:127.0.0.2']
+	assert.throws(() => crmUpgradeDesired(changedLive, () => {}))
+})
+
+test('upgrade desired compares compound companion durations as exact nanoseconds', () => {
+	for (const name of ['identity-api', ...CRM_UPGRADE_GROUPS[1].slice(1)]) {
+		const input = upgradeDesiredFixture()
+		const current = input.live.find(
+			row => row.Config.Labels['com.docker.compose.service'] === name
+		)
+		current.Config.StopTimeout = 90
+		input.baseline = crmUpgradeBaseline(
+			input.live,
+			previous,
+			input.baseline.environmentHashes
+		)
+		for (const value of [
+			'90s',
+			'1m30s',
+			'0h1m30s',
+			'90000ms',
+			'1.5m',
+			'1m29.999999999s1ns'
+		]) {
+			const candidate = structuredClone(input)
+			candidate.companions.services[name].stop_grace_period = value
+			assert.doesNotThrow(() => crmUpgradeDesired(candidate, () => {}))
+		}
+	}
+	for (const [field, actual] of [
+		['interval', 'Interval'],
+		['timeout', 'Timeout'],
+		['start_period', 'StartPeriod']
+	]) {
+		for (const [value, expected] of [
+			['1m30s', 90e9],
+			['9s1000ms', 10e9],
+			['1h2m3.004005006s', 3723004005006],
+			['1µs', 1000],
+			['1μs', 1000],
+			['1us', 1000],
+			['0s', 0]
+		]) {
+			const input = upgradeDesiredFixture()
+			input.companions.services['billing-worker'].healthcheck[field] = value
+			input.live.find(
+				row =>
+					row.Config.Labels['com.docker.compose.service'] === 'billing-worker'
+			).Config.Healthcheck[actual] = expected
+			input.baseline = crmUpgradeBaseline(
+				input.live,
+				previous,
+				input.baseline.environmentHashes
+			)
+			assert.doesNotThrow(() => crmUpgradeDesired(input, () => {}))
+		}
+	}
+})
+
+test('upgrade desired rejects changed or invalid durations instead of rounding or ignoring suffixes', () => {
+	for (const value of [
+		'89s',
+		'91s',
+		'1m29s',
+		'1m31s',
+		'1m29.999999999s',
+		'1m30.000000001s',
+		'',
+		'1m30',
+		' 90s',
+		'90s ',
+		'90s extra',
+		'+90s',
+		'-90s',
+		'1d',
+		'Infinitys',
+		'0.0000000001s',
+		'9007199254740992ns',
+		`${'1'.repeat(129)}s`,
+		'1..5m',
+		90,
+		false
+	]) {
+		const input = upgradeDesiredFixture()
+		input.companions.services['billing-worker'].stop_grace_period = value
+		assert.throws(() => crmUpgradeDesired(input, () => {}))
+	}
+	for (const field of ['interval', 'timeout', 'start_period']) {
+		const input = upgradeDesiredFixture()
+		input.companions.services['identity-api'].healthcheck[field] = '1ns'
+		assert.throws(() => crmUpgradeDesired(input, () => {}))
+	}
 })
 
 // Execute the real coordinator with isolated command/verification doubles.

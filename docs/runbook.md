@@ -233,6 +233,25 @@ Runtime допускает только новые image/APP_REVISION: оста�
 healthchecks, ресурсы и конфигурация должны совпадать с approved live snapshot.
 Все шесть owner DB проходят read-only preflight **до первой мутации**.
 
+Для Identity/Billing membership preflight допускает только два проверенных
+существующих ребра: собственные `_migration` и `_runtime` выданы собственному
+`_admin` (он же grantor), с `admin_option=false`, `inherit_option=true`,
+`set_option=true`. Этот `_admin` обязан оставаться LOGIN/SUPERUSER и владельцем
+своей БД. Обратные, дополнительные и чужие memberships запрещены; сами
+migration/runtime не получают членство в admin или других ролях. У четырёх
+CRM membership остаётся нулевым в обоих направлениях. Полный граф, затрагивающий
+migration/runtime, сохраняется в DB evidence и обязан совпадать до/после
+миграций. Проверка не выполняет GRANT/REVOKE/ALTER ROLE и не ослабляет отдельный
+restore gate: historical admin edges не нужно удалять ради обычного upgrade.
+
+Сравнение companions учитывает только эквивалентные представления Compose:
+`extra_hosts` как object или массив с `=` / `:` должен точно совпадать с live
+host/address map, включая существующий Telegram proxy Identity. Добавление,
+удаление или изменение записи блокирует release. Составные длительности
+(`1m30s` и `90s`) сравниваются в точных наносекундах; невалидное значение,
+округление долей наносекунды и изменение healthcheck/stop timeout запрещены.
+Это нормализация формы, а не разрешение изменять approved конфигурацию.
+
 Проверка старого и нового image не требует расширения Linux capabilities:
 
 - `upgrade-source` работает как `1001:1001`, `network=none`, читает только
