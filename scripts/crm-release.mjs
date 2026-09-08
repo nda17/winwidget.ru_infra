@@ -472,6 +472,40 @@ export function crmUpgradeOldImages(baseline, owner) {
 
 export function crmUpgradeSource(owner, before, after) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+	let intakeExpansion = false
+	if (owner === 'crm-intake') {
+		const migration = '20260908150000_add_intake_sla'
+		if (
+			before['schema.prisma'] !== after['schema.prisma'] ||
+			before['database-access.json'] !== after['database-access.json'] ||
+			Object.hasOwn(before, migration) !== Object.hasOwn(after, migration)
+		) {
+			// One reviewed forward-only schema/ACL/SQL pair. All older SQL and
+			// the migration lock remain byte-identical in the checks below.
+			assert.equal(
+				before['schema.prisma'],
+				'257d0a67d31d85da2c4d33c0faae2432c78c0f277dcd6b14df2f608b049e0127'
+			)
+			assert.equal(
+				before['database-access.json'],
+				'7b725eb5dd949b495b0c7d220d5e06b7becd0bb32561806ead18edc75f1985e7'
+			)
+			assert.equal(Object.hasOwn(before, migration), false)
+			assert.equal(
+				after['schema.prisma'],
+				'3b4e7e2aee31723947be674c718b5fbde51caa90061485d12106a7ce47cc5e22'
+			)
+			assert.equal(
+				after['database-access.json'],
+				'30bcb199891779d8f6eefe89cb1af8280b957e98e6c7eb2db1d749146384ae01'
+			)
+			assert.equal(
+				after[migration],
+				CRM_UPGRADE_MIGRATIONS[owner][migration]
+			)
+			intakeExpansion = true
+		}
+	}
 	if (owner === 'crm-customers') {
 		const migrations = Object.keys(CRM_UPGRADE_MIGRATIONS[owner])
 		const schemas = [
@@ -507,7 +541,8 @@ export function crmUpgradeSource(owner, before, after) {
 		assert.ok(sha(checksum))
 		if (
 			(['schema.prisma', 'database-access.json'].includes(name) &&
-				['billing', 'crm-access', 'crm-sales'].includes(owner)) ||
+				(['billing', 'crm-access', 'crm-sales'].includes(owner) ||
+					intakeExpansion)) ||
 			(owner === 'crm-customers' && name === 'schema.prisma')
 		) {
 			assert.ok(sha(after[name]))
@@ -520,7 +555,7 @@ export function crmUpgradeSource(owner, before, after) {
 		if (Object.hasOwn(before, name)) continue
 		assert.equal(CRM_UPGRADE_MIGRATIONS[owner][name], checksum)
 	}
-	if (['identity', 'crm-intake'].includes(owner))
+	if (owner === 'identity' || (owner === 'crm-intake' && !intakeExpansion))
 		assert.deepEqual(after, before)
 	return true
 }

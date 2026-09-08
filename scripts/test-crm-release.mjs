@@ -789,6 +789,74 @@ test('Sales recurring, assignment and in-app upgrades accept only their exact re
 	)
 })
 
+test('Intake SLA source accepts only the exact forward schema ACL and SQL pair', () => {
+	const migration = '20260908150000_add_intake_sla'
+	const before = {
+		'schema.prisma':
+			'257d0a67d31d85da2c4d33c0faae2432c78c0f277dcd6b14df2f608b049e0127',
+		'database-access.json':
+			'7b725eb5dd949b495b0c7d220d5e06b7becd0bb32561806ead18edc75f1985e7',
+		'migration_lock.toml': hash,
+		'20260101000000_initial': hash
+	}
+	const after = {
+		...before,
+		'schema.prisma':
+			'3b4e7e2aee31723947be674c718b5fbde51caa90061485d12106a7ce47cc5e22',
+		'database-access.json':
+			'30bcb199891779d8f6eefe89cb1af8280b957e98e6c7eb2db1d749146384ae01',
+		[migration]:
+			'589b0303e2153e90d5a2edf6dc9655a1a4d96f59ade4f7057d17419bcd7b3234'
+	}
+	assert.equal(crmUpgradeSource('crm-intake', before, after), true)
+	assert.equal(crmUpgradeSource('crm-intake', before, before), true)
+	assert.equal(crmUpgradeSource('crm-intake', after, after), true)
+	assert.throws(() => crmUpgradeSource('crm-intake', after, before))
+	for (const name of [
+		'schema.prisma',
+		'database-access.json',
+		migration
+	]) {
+		for (const replacement of [hash, before[name], undefined]) {
+			const changed = { ...after, [name]: replacement }
+			if (replacement === undefined) delete changed[name]
+			assert.throws(
+				() => crmUpgradeSource('crm-intake', before, changed),
+				name
+			)
+		}
+	}
+	for (const name of ['schema.prisma', 'database-access.json'])
+		assert.throws(() =>
+			crmUpgradeSource('crm-intake', { ...before, [name]: hash }, after)
+		)
+	assert.throws(() =>
+		crmUpgradeSource(
+			'crm-intake',
+			{ ...before, [migration]: after[migration] },
+			after
+		)
+	)
+	for (const name of ['migration_lock.toml', '20260101000000_initial']) {
+		assert.throws(() =>
+			crmUpgradeSource('crm-intake', before, {
+				...after,
+				[name]: 'd'.repeat(64)
+			})
+		)
+		const changed = { ...after }
+		delete changed[name]
+		assert.throws(() => crmUpgradeSource('crm-intake', before, changed))
+	}
+	assert.throws(() =>
+		crmUpgradeSource('crm-intake', before, {
+			...after,
+			'20260908150001_unreviewed': hash
+		})
+	)
+	assert.throws(() => crmUpgradeSource('identity', before, after))
+})
+
 test('enabled Sales upgrade retains Access and ND readers before its reminders producer', () => {
 	const starts = crmUpgradeGroups('task-reminders-v1').flatMap(
 		([, ...names]) => names
