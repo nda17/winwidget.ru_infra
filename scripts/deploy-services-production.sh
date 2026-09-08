@@ -702,7 +702,9 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 	if [[ "${release_scope:-all}" == gateway-tilda-upgrade ]]; then
 		printf '%s' "$scoped_node_base64" | base64 --decode | gzip -dc | head -c 262145 >"$scoped_payload_directory/verifier.mjs" || die 'Gateway envelope decompression failed.'
 		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
-		[[ "$scoped_envelope_size" =~ ^[0-9]+$ ]] && (( scoped_envelope_size > 0 && scoped_envelope_size <= 262144 )) || die 'Gateway envelope exceeds its decoded limit.'
+		if [[ ! "$scoped_envelope_size" =~ ^[0-9]+$ ]] || (( scoped_envelope_size <= 0 || scoped_envelope_size > 262144 )); then
+			die 'Gateway envelope exceeds its decoded limit.'
+		fi
 	elif [[ "${release_scope:-all}" == crm-commerce-activate ]]; then
 		# Config-only activations use 512 KiB decoded JSON envelopes
 		# and 112000-byte encoded SSH budgets; each bundled file is <= 144 KiB.
