@@ -706,6 +706,39 @@ test('backup runtime admits only four Operations processes with mixed approved r
 	assert.equal(rollback.services['operations-worker'].environment.APP_REVISION, 'f'.repeat(40))
 })
 
+test('backup runtime manifest-only update preserves all four existing worker URLs and rejects partial state or rotation', () => {
+	const steady = () => {
+		const input = backupRuntimeFixture()
+		const worker = input.live.find(item => item.Config.Labels['com.docker.compose.service'] === 'operations-worker')
+		for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) worker.Config.Env.push(`${key}=${input.compose.services['operations-worker'].environment[key]}`)
+		return input
+	}
+	const seal = input => {
+		input.backupBaseline = [...structuredClone(input.live), input.backupBaseline.at(-1)]
+		input.backupBaselineSha256 = operationsBackupFingerprint(input.backupBaseline)
+		return input
+	}
+	const input = seal(steady()), { desired, rollback } = prepareScopedCompose(input)
+	for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) {
+		assert.equal(desired.services['operations-worker'].environment[key], input.compose.services['operations-worker'].environment[key])
+		assert.equal(rollback.services['operations-worker'].environment[key], desired.services['operations-worker'].environment[key])
+	}
+	for (const count of [1, 2, 3]) {
+		const partial = steady(), keys = OPERATIONS_CRM_BACKUP_TARGETS.slice(0, count).map(([key]) => key)
+		const worker = partial.live.find(item => item.Config.Labels['com.docker.compose.service'] === 'operations-worker')
+		worker.Config.Env = worker.Config.Env.filter(row => !keys.some(key => row.startsWith(`${key}=`)))
+		assert.throws(() => prepareScopedCompose(seal(partial)))
+	}
+	for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) {
+		const rotated = seal(steady())
+		rotated.compose.services['operations-worker'].environment[key] = rotated.compose.services['operations-worker'].environment[key].replace(':synthetic@', ':different@')
+		assert.throws(() => prepareScopedCompose(rotated))
+		const wrongOwner = steady()
+		wrongOwner.live[0].Config.Env.push(`${key}=${wrongOwner.compose.services['operations-worker'].environment[key]}`)
+		assert.throws(() => prepareScopedCompose(seal(wrongOwner)))
+	}
+})
+
 test('backup runtime fails closed on baseline, role, inherited credentials, restore, URL or unrelated config changes', () => {
 	for (const mutate of [
 		input => { input.backupBaselineSha256 = '0'.repeat(64) },

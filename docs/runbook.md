@@ -247,6 +247,15 @@ schema/ACL даже для внесённой в allowlist SLA migration. Исп
 green Infra/Services SHA и повторной сверки прежнего runtime/env baseline;
 повтор старого failed SHA с изменённым кодом не допускается.
 
+Продолжение завершено: Infra `c3882a99f3f3fdc1822246e77882e9774533001c`
+(CI `34233836633` — SUCCESS), Services
+`6eab2581089a90ccb88ca08ba9bae0481d483d1e` (CI `34235625042`, production
+`34235994499` — SUCCESS). Повторная сверка 19-role baseline сохранила hash
+`4f9c5072a49d3b9d0099fc151237533dcdecb5d26e7a760a6671fad432e07273`.
+Для reminders/SLA envelope применяется gzip level 9 вместо 6; прежние
+ограничения размера, hashes и decompression checks сохранены. Локально
+прошли 19 activation tests; внешние сообщения и платежи этим не проверяются.
+
 ### Отдельная активация Intake SLA
 
 `crm-intake-sla-activate` — второй закрытый вариант того же activation controller,
@@ -1411,6 +1420,15 @@ CRM; подписки и цены не менялись. `/admin/databases` ве
 Использован новый изолированный Chrome-профиль без входа: цены CRM после
 авторизации этим smoke не проверяются, пользовательский профиль не читался.
 
+После совместимого backend `6eab2581` выпущен frontend
+`c193d5bf6d03225c463e6b170617dc9015cb68bf`: CI `34229334897`, production
+`34237253888` — SUCCESS. Публичные health CRM/landing подтвердили этот SHA.
+Версия включает серии задач и центр уведомлений; SLA сохраняет отключённое
+состояние до отдельной серверной активации. Новые авторизованные browser-сценарии
+не объявляются проверенными: доступный native Chrome открыт на посторонней
+вкладке, чтение которой остановлено. Подменять эту проверку JWT или чтением
+пользовательского профиля браузера нельзя.
+
 Ранее 07.09.2026 была выпущена production-ревизия:
 `d010a3aa67f7290776c2783d82d86e3d0a0ed8ea`, CI `34082138618`, успешный
 deploy `34082579545` от 07.09.2026. Выпуск уточняет только подпись закрытой
@@ -1654,6 +1672,16 @@ production deploy `34206570376` — SUCCESS. Четыре Operations process rol
 обновлены без изменения соседних сервисов и без активации restore.
 Registry содержит 13 backup-целей, 11 подписываемых целей и только семь
 прежних restore-целей; четыре CRM-цели остаются backup-only.
+
+После CRM schema upgrade повторный runtime-выпуск Services `72e1b425`
+(CI `34237415802` — SUCCESS, production `34238336722` — FAILURE) остановлен
+до admission и остановки процессов: initial-only guard запрещал уже
+настроенные CRM backup URL. Контроллер дополнен точным steady-state режимом:
+все четыре URL сохраняются неизменными только у worker; частичная настройка,
+rotation и передача другим ролям отвергаются. Три focused tests, два packaging
+tests и read-only replay полного prepare на сохранённом production snapshot
+прошли. Четыре исходных Operations-процесса остались healthy; продолжение —
+только новым green Infra/Services SHA, без повторного запуска старого failed SHA.
 
 Первые четыре задания созданы штатным расписанием в 08:52 UTC, не вручную.
 Read-only проверка durable результатов Operations подтвердила `SUCCEEDED`

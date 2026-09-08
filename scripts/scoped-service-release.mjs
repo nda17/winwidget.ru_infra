@@ -371,7 +371,8 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 		if (backup) {
 			assert.equal(new Set(container.Config.Env.map(row => row.slice(0, row.indexOf('=')))).size, container.Config.Env.length);
 			assert.equal(before.APP_REVISION, expectedPreviousRevision);
-			for (const [key] of OPERATIONS_CRM_BACKUP_TARGETS) assert.equal(Object.hasOwn(before, key), false);
+			const count = OPERATIONS_CRM_BACKUP_TARGETS.filter(([key]) => Object.hasOwn(before, key)).length;
+			assert.ok(count === 0 || (name === 'operations-worker' && count === OPERATIONS_CRM_BACKUP_TARGETS.length));
 		}
 		if (scope === 'platform-marketing-runtime') {
 			assert.equal(name, 'platform-api'); assert.equal(before.APP_REVISION, previousRevision);
@@ -390,8 +391,8 @@ export function prepareScopedCompose({ scope, revision, previousRevision, operat
 				assert.equal(before[key], 'http://127.0.0.1:4401/internal/notification-delivery');
 				assert.equal(value, 'http://127.0.0.1:4401');
 			} else if (backup && name === 'operations-worker' && OPERATIONS_CRM_BACKUP_TARGETS.some(([backupKey]) => backupKey === key)) {
-				// Exactly the four validated backup-only additions; never a runtime URL.
-				assert.equal(Object.hasOwn(before, key), false);
+				// Initial four-key addition or exact steady-state reuse; never rotation.
+				if (Object.hasOwn(before, key)) assert.equal(value, before[key]);
 			} else if (key === 'APP_REVISION' && scope !== 'gateway-remove-notes') {
 				assert.equal(value, revision);
 			} else if (scope === 'identity-with-operations-manifest' && name === 'identity-api' && key === 'IDENTITY_LOGIN_OTP_ENABLED') {
