@@ -273,7 +273,13 @@ test('owner ledger verification uses the ND database anchor and service identiti
 			if(sql==='SHOW transaction_read_only')return [{transaction_read_only:'on'}]
 			if(sql==='SHOW server_version_num')return [{server_version_num:'180003'}]
 			if(sql.includes('AS database_oid'))return [{database:`winwidget_${schema}`,username:`winwidget_${schema}_backup`,session_user:`winwidget_${schema}_backup`,schema,recovery:false,database_oid:'16596'}]
-			if(sql.includes('AS restricted'))return [{restricted:true,no_memberships:true,database_owner:true,schema_owner:true,connect:true,no_database_ddl:true,read_schema:true,no_dml:true,no_routine_execute:true}]
+			if(sql.includes('AS restricted')){
+				assert.ok(sql.includes(`roleid=current_user::regrole)=${target==='notification-delivery'?0:1}`))
+				assert.ok(sql.includes(`a.rolname='winwidget_${schema}_admin'`))
+				assert.match(sql,/m.grantor=a.oid AND NOT m.admin_option AND m.inherit_option AND m.set_option/)
+				assert.match(sql,/a.rolsuper AND a.rolcanlogin/)
+				return [{restricted:true,membership_contract:true,database_owner:true,schema_owner:true,connect:true,no_database_ddl:true,read_schema:true,no_dml:true,no_routine_execute:true}]
+			}
 			if(sql.includes('_prisma_migrations'))return ledger
 			if(sql.includes('service_identity'))return [{id:'singleton',service_name:`${target}-service`,database_id:'11111111-1111-4111-8111-111111111111'}]
 			if(sql.includes('AS acl_sha256'))return [{acl_sha256:'d'.repeat(64)}]
@@ -301,7 +307,7 @@ test('ND backup trust recognizes only the exact reviewed historical failed-and-r
 		if(sql==='SHOW transaction_read_only')return [{transaction_read_only:'on'}];
 		if(sql==='SHOW server_version_num')return [{server_version_num:'180003'}];
 		if(sql.includes('AS database_oid'))return [{database:`winwidget_${schema}`,username:`winwidget_${schema}_backup`,session_user:`winwidget_${schema}_backup`,schema,recovery:false,database_oid:'16596'}];
-		if(sql.includes('AS restricted'))return [{restricted:true,no_memberships:true,database_owner:true,schema_owner:true,connect:true,no_database_ddl:true,read_schema:true,no_dml:true,no_routine_execute:true}];
+		if(sql.includes('AS restricted'))return [{restricted:true,membership_contract:true,database_owner:true,schema_owner:true,connect:true,no_database_ddl:true,read_schema:true,no_dml:true,no_routine_execute:true}];
 		if(sql.includes('_prisma_migrations'))return ledger;
 		if(sql.includes('AS acl_sha256'))return [{acl_sha256:'d'.repeat(64)}];
 		throw Error('Unexpected SQL');

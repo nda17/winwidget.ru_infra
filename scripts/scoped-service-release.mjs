@@ -1435,9 +1435,19 @@ export async function verifyOperationsBackupTrustState(client, target, manifest)
 	assert.ok(session); const { database_oid, ...binding } = session;
 	same(binding, { database: `winwidget_${schema}`, username: principal, session_user: principal, schema, recovery: false });
 	assert.match(database_oid ?? '', /^[1-9][0-9]{0,9}$/); assert.ok(Number(database_oid) <= 4294967295);
+	// Widgets/Identity already grant their backup role TO their own bootstrap
+	// superuser, never privileges TO the backup reader. Preserve that exact edge;
+	// ND has none. Unknown members, grantors or options remain rejected.
+	const expectedAdminEdges = target === 'notification-delivery' ? 0 : 1;
 	const role = await client.$queryRawUnsafe(`SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
 		AND NOT rolreplication AND NOT rolbypassrls AS restricted,
-		NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=current_user::regrole OR roleid=current_user::regrole) AS no_memberships,
+		NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=current_user::regrole)
+		AND (SELECT count(*) FROM pg_auth_members WHERE roleid=current_user::regrole)=${expectedAdminEdges}
+		AND NOT EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles a ON a.oid=m.member
+			WHERE m.roleid=current_user::regrole AND NOT (a.rolname='winwidget_${schema}_admin'
+			AND m.grantor=a.oid AND NOT m.admin_option AND m.inherit_option AND m.set_option
+			AND a.rolsuper AND a.rolcanlogin
+			AND a.oid=(SELECT datdba FROM pg_database WHERE datname=current_database()))) AS membership_contract,
 		(SELECT pg_get_userbyid(datdba)='winwidget_${schema}_admin' FROM pg_database WHERE datname=current_database()) AS database_owner,
 		(SELECT pg_get_userbyid(nspowner)='winwidget_${schema}_migration' FROM pg_namespace WHERE nspname='${schema}') AS schema_owner,
 		has_database_privilege(current_user,current_database(),'CONNECT') AS connect,
@@ -1449,7 +1459,7 @@ export async function verifyOperationsBackupTrustState(client, target, manifest)
 		NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
 		WHERE n.nspname='${schema}' AND has_function_privilege(current_user,p.oid,'EXECUTE')) AS no_routine_execute
 		FROM pg_roles WHERE rolname=current_user`);
-	same(role, [{ restricted: true, no_memberships: true, database_owner: true, schema_owner: true, connect: true, no_database_ddl: true, read_schema: true, no_dml: true, no_routine_execute: true }]);
+	same(role, [{ restricted: true, membership_contract: true, database_owner: true, schema_owner: true, connect: true, no_database_ddl: true, read_schema: true, no_dml: true, no_routine_execute: true }]);
 	const rows = await client.$queryRawUnsafe(target === 'notification-delivery'
 		? `SELECT id, migration_name, checksum,
 			to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS started_at,
