@@ -394,9 +394,15 @@ scoped_deploy_gateway_tilda() {
 	scoped_assert_hash "$scoped_gateway_crm_env" "$scoped_gateway_crm_hash"
 	while IFS='=' read -r key value || [[ -n "$key" ]]; do
 		case "$key" in
-			CRM_RABBITMQ_CONTRACT) (( (count & 1) == 0 )) && [[ "$value" == mvp-v1 ]] || die 'Gateway requires one active CRM contract.'; count=$((count | 1)) ;;
-			CRM_REMINDERS_RABBITMQ_CONTRACT) (( (count & 2) == 0 )) && [[ "$value" == task-reminders-v1 ]] || die 'Gateway must preserve one reminders activation marker.'; count=$((count | 2)) ;;
-			CRM_INTAKE_SLA_RABBITMQ_CONTRACT) (( (count & 4) == 0 )) && [[ "$value" == intake-sla-v1 ]] || die 'Gateway must preserve one Intake SLA activation marker.'; count=$((count | 4)) ;;
+			CRM_RABBITMQ_CONTRACT)
+				if (( (count & 1) != 0 )) || [[ "$value" != mvp-v1 ]]; then die 'Gateway requires one active CRM contract.'; fi
+				count=$((count | 1)) ;;
+			CRM_REMINDERS_RABBITMQ_CONTRACT)
+				if (( (count & 2) != 0 )) || [[ "$value" != task-reminders-v1 ]]; then die 'Gateway must preserve one reminders activation marker.'; fi
+				count=$((count | 2)) ;;
+			CRM_INTAKE_SLA_RABBITMQ_CONTRACT)
+				if (( (count & 4) != 0 )) || [[ "$value" != intake-sla-v1 ]]; then die 'Gateway must preserve one Intake SLA activation marker.'; fi
+				count=$((count | 4)) ;;
 		esac
 	done <"$env_file"
 	[[ "$count" == 7 ]] || die 'Gateway activation markers are missing or duplicated.'
