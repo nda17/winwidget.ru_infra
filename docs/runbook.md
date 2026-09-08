@@ -1388,6 +1388,20 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   Использовать совместимые `-s TERM -k 5 35` с теми же ограничениями времени;
   продолжать только новым green Infra/Services SHA, не повторять старый run.
 
+  Forward-выпуск завершён на Infra `8393b7bcf5cafb5cf36a590ebf77e20760df2025`
+  (CI `34258888210`) и Gateway `fc3669057a748c6cd2a6cfe89b0d6ccd9a23c681`
+  (Services CI `34259242574`, production `34259606795`) — SUCCESS.
+  Новый 21-role baseline с сохранёнными reminders/SLA markers:
+  `81a9319aa9da4953cd59ea824fa0087b30fc36e8e74fbe4c9f0fcc401f186b02`.
+  Следующий `crm-upgrade` Services `c4189c74e04a53c4d818aaa1bb1d334daf5038ee`
+  завершён: CI `34260229592` и production `34260848762` — SUCCESS.
+  В первом CI только failed jobs повторены без изменения SHA после Docker Hub
+  HTTP 500 при pull; release gates не отключались. Canonical/owner env не менялись.
+  Публичный Tilda probe со случайным несуществующим source ID и синтетическим
+  ключом вернул 401 без создания заявки. Реальная форма сайта Tilda и доставка
+  её заявки этим не проверялись; локальные HTTP/form/replay tests и CI не заменяют
+  настройку формы владельцем сайта.
+
 Локальный proof producer не принимает production URL и не восстанавливает
 Operations поверх неё самой. Для проверенной копии backup, receipt и точной
 SQL migration используется существующий immutable PostgreSQL 18 image:
