@@ -131,7 +131,9 @@ export const CRM_UPGRADE_MIGRATIONS = Object.freeze({
 		'20260907220000_add_reminder_rules':
 			'd207e844a7f74b858745d598ebfb9a76cb910f83847931dfb087ad86e9794ddf',
 		'20260907230000_add_reminder_delivery':
-			'd05634a4704c8947cb48a9bf379436e519417545d09ddec6833b1bb692491190'
+			'd05634a4704c8947cb48a9bf379436e519417545d09ddec6833b1bb692491190',
+		'20260908090000_allow_task_reopen_after_deal_close':
+			'7e5c9fb33cc6451ef5d2fb974e9bf1b018827bbdd0d0d518d60015220280a650'
 	},
 	'crm-intake': {}
 })
@@ -328,6 +330,14 @@ export function crmUpgradeImageSource(prismaRoot) {
 		lstatSync(migrations).isDirectory() &&
 			!lstatSync(migrations).isSymbolicLink()
 	)
+	// Billing/CRM keep the lock beside schema.prisma; Notification Delivery
+	// keeps it inside migrations. Hash exactly one real file in either layout.
+	const rootLock = join(prismaRoot, 'migration_lock.toml')
+	if (readdirSync(prismaRoot).includes('migration_lock.toml')) {
+		assert.ok(lstatSync(rootLock).isFile() && !lstatSync(rootLock).isSymbolicLink())
+		assert.ok(!readdirSync(migrations).includes('migration_lock.toml'))
+		files['migration_lock.toml'] = digest(readFileSync(rootLock))
+	}
 	for (const name of readdirSync(migrations).sort()) {
 		if (name === 'migration_lock.toml') {
 			const lock = join(migrations, name)

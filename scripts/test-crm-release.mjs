@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	mkdirSync,
 	readFileSync,
+	renameSync,
 	readdirSync,
 	rmSync,
 	statSync,
@@ -723,6 +724,25 @@ test('upgrade extractor reads actual owner-private 0600/0700 Prisma files withou
 			join(prisma, 'migrations', migration, 'unexpected.sql'),
 			'SELECT 2;'
 		)
+		assert.throws(() => crmUpgradeImageSource(prisma))
+	} finally {
+		rmSync(directory, { recursive: true, force: true })
+	}
+})
+
+test('upgrade extractor hashes the Billing/CRM root lock and refuses ambiguous or linked locks', () => {
+	const directory = mkdtempSync(join(tmpdir(), 'wincrm-root-lock-'))
+	try {
+		const { prisma } = privateSourceFixture(directory)
+		const expected = crmUpgradeImageSource(prisma)
+		const nested = join(prisma, 'migrations/migration_lock.toml')
+		const rootLock = join(prisma, 'migration_lock.toml')
+		renameSync(nested, rootLock)
+		assert.deepEqual(crmUpgradeImageSource(prisma), expected)
+		writeFileSync(nested, readFileSync(rootLock))
+		assert.throws(() => crmUpgradeImageSource(prisma))
+		rmSync(rootLock)
+		symlinkSync(nested, rootLock)
 		assert.throws(() => crmUpgradeImageSource(prisma))
 	} finally {
 		rmSync(directory, { recursive: true, force: true })
