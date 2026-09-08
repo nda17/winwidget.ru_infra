@@ -1972,6 +1972,7 @@ docker() {
     run)
       if [[ "$TEST_SCOPE" == gateway-tilda-upgrade && " $* " == *' gateway-tilda-http '* ]]; then
         [[ " $* " == *' --network host '* && " $* " == *' --user node '* && " $* " != *' --env-file '* ]] || return 1
+        [[ " $* " == *' -s TERM -k 5 35 node '* && " $* " != *' --signal='* && " $* " != *' --kill-after='* ]] || return 1
         [[ "$TEST_SCENARIO" != http-failed || "$last" != tilda ]]; return
       fi
       if [[ "$TEST_SCOPE" == platform-marketing-runtime ]]; then

@@ -1381,6 +1381,13 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   отдельного `crm-upgrade`. Публичный успешный Tilda form/replay smoke и
   авторизованный browser-сценарий не заменяются отрицательной проверкой ingress.
 
+  Первый выпуск Services `760ab06e8abb6e1c83f982fae6682ab03e86e87e`
+  (production CI `34258239203`) остановился до сборки и остановки Gateway:
+  Alpine BusyBox не поддерживает GNU-опции `timeout --signal/--kill-after`.
+  Read-only проверка подтвердила прежний healthy Gateway `837113b9f9f303bd6c043c2a2e37b0791369d7a3`.
+  Использовать совместимые `-s TERM -k 5 35` с теми же ограничениями времени;
+  продолжать только новым green Infra/Services SHA, не повторять старый run.
+
 Локальный proof producer не принимает production URL и не восстанавливает
 Operations поверх неё самой. Для проверенной копии backup, receipt и точной
 SQL migration используется существующий immutable PostgreSQL 18 image:

@@ -362,7 +362,7 @@ scoped_gateway_http() {
 		--env SCOPED_SCOPE=gateway-tilda-upgrade \
 		--volume "$scoped_payload_directory/gateway-tilda-release.mjs:/run/scoped-verifier.mjs:ro" \
 		--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro" \
-		--entrypoint timeout "$scoped_image_id" --signal=TERM --kill-after=5s 35s \
+		--entrypoint timeout "$scoped_image_id" -s TERM -k 5 35 \
 		node /run/scoped-verifier.mjs gateway-tilda-http "$1" || return 1
 }
 
