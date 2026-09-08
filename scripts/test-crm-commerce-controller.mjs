@@ -168,6 +168,10 @@ test('exact bounded public module envelope fits unchanged SSH boundary and rejec
 	const value = envelope(),
 		bytes = JSON.stringify(value)
 	assert.equal(validateCommercePayload(bytes).length, 5)
+	const boundary = structuredClone(value)
+	boundary.files[0].content = 'x'.repeat(147456)
+	boundary.files[0].sha256 = sha(boundary.files[0].content)
+	assert.equal(validateCommercePayload(JSON.stringify(boundary)).length, 5)
 	assert.ok(
 		gzipSync(bytes).toString('base64').length +
 			gzipSync(shell).toString('base64').length <=
@@ -201,7 +205,7 @@ test('exact bounded public module envelope fits unchanged SSH boundary and rejec
 			v.schemaVersion = 2
 		},
 		v => {
-			const data = Buffer.alloc(131073)
+			const data = Buffer.alloc(147457, 'x')
 			v.files[0].content = data.toString('utf8')
 			v.files[0].sha256 = sha(data)
 		},
@@ -255,7 +259,8 @@ test('production router keeps old decoder unchanged and isolates commerce envelo
 		controller,
 		/Commerce activation authorization cannot be reused by another scope/
 	)
-	assert.match(controller, /head -c 131073/)
+	assert.match(controller, /local encoded="\$1" destination="\$2" size limit=131072/)
+	assert.match(controller, /head -c "\$\(\(limit \+ 1\)\)"/)
 	assert.match(controller, /head -c 524289/)
 	assert.match(
 		controller,

@@ -303,6 +303,15 @@ function serviceConfiguration(service, row, image) {
 	)
 }
 
+// Reused by the one-target Customers provider configuration scope. These are
+// validation primitives only; commerce targets, flags and admission stay local.
+export {
+	configuration as crmConfigOnlyConfiguration,
+	environment as crmContainerEnvironment,
+	ready as assertCrmConfigOnlyReady,
+	serviceConfiguration as assertCrmConfigOnlyService
+}
+
 // This returns a PRIVATE plan containing materialized environments. Never log
 // it; the shell must seal it 0600 and use only its digest in public receipts.
 export function prepareCrmCommerceActivation(

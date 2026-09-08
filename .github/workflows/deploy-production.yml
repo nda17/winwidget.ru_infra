@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, or billing-crm-commerce-acl
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, crm-customers-provider-config, or billing-crm-commerce-acl
         default: all
         type: string
       expected_live_revision:
@@ -33,6 +33,10 @@ on:
         type: string
       expected_operations_backup_baseline_sha256:
         description: Fresh approved exact Operations and unchanged neighbors runtime baseline hash (operations-backup-runtime only)
+        default: ''
+        type: string
+      expected_crm_customers_provider_baseline_sha256:
+        description: Fresh approved Customers API, neighbors and full prepared env baseline hash (crm-customers-provider-config only)
         default: ''
         type: string
       expected_operations_revision:
@@ -134,6 +138,7 @@ jobs:
           EXPECTED_CRM_UPGRADE_BASELINE_SHA256: ${{ inputs.expected_crm_upgrade_baseline_sha256 }}
           EXPECTED_CRM_COMMERCE_BASELINE_SHA256: ${{ inputs.expected_crm_commerce_baseline_sha256 }}
           EXPECTED_CRM_REMINDERS_BASELINE_SHA256: ${{ inputs.expected_crm_reminders_baseline_sha256 }}
+          EXPECTED_CRM_CUSTOMERS_PROVIDER_BASELINE_SHA256: ${{ inputs.expected_crm_customers_provider_baseline_sha256 }}
           EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256: ${{ inputs.expected_operations_backup_baseline_sha256 }}
           EXPECTED_OPERATIONS_REVISION: ${{ inputs.expected_operations_revision }}
           EXPECTED_OPERATIONS_API_REVISION: ${{ inputs.expected_operations_api_revision }}

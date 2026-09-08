@@ -2521,7 +2521,8 @@ function runTransport(scenario = 'success', scope = identityScope) {
 			if (scenario === 'missing-payload' && relative === 'scripts/' + nodePayload) continue
 			writeFileSync(join(checkout, relative), readFileSync(join(scriptsRoot, '..', relative)))
 		}
-		if (scenario === 'oversized-payload') writeFileSync(join(checkout, 'scripts', nodePayload), Buffer.alloc(131073, 35))
+		if (scenario === 'oversized-payload') writeFileSync(join(checkout, 'scripts', nodePayload), Buffer.alloc(nodePayload === 'scoped-service-release.mjs' ? 147457 : 131073, 35))
+		if (scenario === 'shared-verifier-boundary') writeFileSync(join(checkout, 'scripts', nodePayload), Buffer.alloc(147456, 35))
 		if (scenario === 'empty-payload') writeFileSync(join(checkout, 'scripts', nodePayload), '')
 		if (scenario === 'encoded-envelope') for (const filename of [shellPayload, nodePayload]) writeFileSync(join(checkout, 'scripts', filename), randomBytes(64000))
 		const shim = `#!${process.execPath}
@@ -2642,6 +2643,20 @@ test('backup runtime uses the same pinned transport with separate non-reusable b
 	}
 })
 
+test('shared verifier source guard admits exactly 144 KiB for existing Identity and backup scopes only', () => {
+	for (const scope of [identityScope, backupRuntimeScope]) {
+		const allowed = runTransport('shared-verifier-boundary', scope)
+		assert.equal(allowed.status, 0, allowed.stderr)
+		assert.equal(allowed.calls.length, 1)
+		const denied = runTransport('oversized-payload', scope)
+		assert.notEqual(denied.status, 0)
+		assert.deepEqual(denied.calls, [])
+	}
+	const other = runTransport('shared-verifier-boundary', 'crm-upgrade')
+	assert.notEqual(other.status, 0)
+	assert.deepEqual(other.calls, [])
+})
+
 for (const scope of crmScopes) test(scope + ' uses only its two bounded hash-pinned payloads through the existing root transport', () => {
 	const result = runTransport('success', scope)
 	assert.equal(result.status, 0, result.stderr)
@@ -2726,7 +2741,9 @@ test('bounded gzip receiver rejects corrupt, truncated, oversized and mismatched
 		['wrong original hash', { scoped_node_sha256: 'f'.repeat(64) }],
 		['wrong shell hash', { scoped_shell_sha256: 'f'.repeat(64) }],
 		['empty raw payload', { scoped_node_base64: encode(Buffer.alloc(0)), scoped_node_sha256: sha256(Buffer.alloc(0)) }],
-		['raw sentinel exceeded', { scoped_node_base64: encode(Buffer.alloc(131073, 35)), scoped_node_sha256: sha256(Buffer.alloc(131073, 35)) }],
+		['raw shared verifier sentinel exceeded', { scoped_node_base64: encode(Buffer.alloc(147457, 35)), scoped_node_sha256: sha256(Buffer.alloc(147457, 35)) }],
+		['other Node sentinel unchanged', { release_scope: 'crm-upgrade', scoped_node_base64: encode(Buffer.alloc(131073, 35)), scoped_node_sha256: sha256(Buffer.alloc(131073, 35)) }],
+		['shell sentinel unchanged', { scoped_shell_base64: encode(Buffer.alloc(131073, 35)), scoped_shell_sha256: sha256(Buffer.alloc(131073, 35)) }],
 		['decompression bomb', { scoped_node_base64: encode(Buffer.alloc(8 * 1024 * 1024, 35)) }],
 		['encoded envelope exceeded', { scoped_node_base64: 'A'.repeat(90004) }]
 	]
@@ -2765,7 +2782,7 @@ source "$scoped_payload_directory/controller.sh"
 		assert.equal(result.error, undefined, name)
 		assert.equal(result.signal, null, name)
 		assert.equal(result.status, 73, `${name}: ${result.stderr}`)
-		for (const size of result.stdout.matchAll(/RAW_BYTES=(\d+)/g)) assert.ok(Number(size[1]) <= 131073, `${name}: decompression cannot write beyond the sentinel before cleanup`)
+		for (const size of result.stdout.matchAll(/RAW_BYTES=(\d+)/g)) assert.ok(Number(size[1]) <= (name.includes('unchanged') ? 131073 : 147457), `${name}: decompression cannot write beyond the selected sentinel before cleanup`)
 		assert.equal(existsSync(marker), false, `${name}: shell cannot execute before both hashes pass`)
 		assert.equal(existsSync(payloadDirectory), false, `${name}: actual cleanup removes only its partial payload files`)
 		assert.equal(readFileSync(outside, 'utf8'), 'preserve')
@@ -2800,6 +2817,27 @@ source "$scoped_payload_directory/controller.sh"
 		assert.equal(statSync(join(directory, 'controller.sh')).mode & 0o777, 0o600)
 		assert.equal(statSync(join(directory, 'verifier.mjs')).mode & 0o777, 0o444)
 		assert.equal(readFileSync(marker, 'utf8'), 'executed')
+	})
+})
+
+test('shared verifier decoder accepts 144 KiB in every matching existing scope without widening other files', () => {
+	const scopes = ['all', identityScope, 'operations-runtime', backupRuntimeScope, 'operations-backlog-backup', 'operations-backlog-finalize', 'gateway-remove-notes', 'workers-bootstrap-recovery', 'operations-federation-config', apiScope, 'platform-marketing-runtime']
+	for (const scope of scopes) privateFixture(directory => {
+		const shell = Buffer.from('# bounded harmless controller\n'), verifier = Buffer.alloc(147456, 35)
+		const result = spawnSync('/bin/bash', ['-c', `
+set -euo pipefail
+umask 077
+die() { exit 73; }
+sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$@"; }
+${payloadMaterialization()}
+`], {encoding:'utf8',timeout:5000,env:{PATH:'/usr/bin:/bin',TEST_NODE:process.execPath,release_scope:scope,scoped_payload_directory:directory,
+			scoped_shell_base64:gzipSync(shell,{level:6}).toString('base64'),scoped_shell_sha256:sha256(shell),
+			scoped_node_base64:gzipSync(verifier,{level:6}).toString('base64'),scoped_node_sha256:sha256(verifier)}})
+		assert.equal(result.error,undefined,scope)
+		assert.equal(result.status,0,`${scope}: ${result.stderr}`)
+		assert.deepEqual(readFileSync(join(directory,'verifier.mjs')),verifier)
+		assert.equal(statSync(join(directory,'verifier.mjs')).mode&0o777,0o444)
+		assert.deepEqual(readFileSync(join(directory,'controller.sh')),shell)
 	})
 })
 

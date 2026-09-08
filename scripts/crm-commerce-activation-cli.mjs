@@ -42,7 +42,7 @@ export function validateCommercePayload(bytes) {
 		assert.equal(typeof file.content, 'string')
 		const content = Buffer.from(file.content, 'utf8')
 		assert.equal(content.toString('utf8'), file.content)
-		assert.ok(content.length > 0 && content.length <= 131072)
+		assert.ok(content.length > 0 && content.length <= 147456)
 		assert.equal(sha(content), file.sha256)
 		return { name: file.name, content }
 	})

@@ -287,6 +287,57 @@ test('owner ledger verification uses the ND database anchor and service identiti
 	}
 })
 
+test('ND backup trust recognizes only the exact reviewed historical failed-and-recovered receipt pair', async () => {
+	const target='notification-delivery', schema='notification_delivery', manifest=trustManifest.targets[target], calls=[];
+	const name='20260828000000_remove_online_consultant_delivery_data';
+	const reviewed=[
+		{id:'9fcc2093-f12e-4c6b-9633-0687acbc2320', migration_name:name, checksum:'c19ca8b79eae01ef55034640ed0c1fb3fd6aa9700bdd7c403e5ef6f6e7cc76e4', started_at:'2026-08-28 06:44:36.325562+00', finished_at:null, rolled_back_at:'2026-08-28 07:33:40.575583+00', applied_steps_count:0, logs_fingerprint:'d41d8cd98f00b204e9800998ecf8427e'},
+		{id:'18a2268c-e992-4115-82be-0c80552297bc', migration_name:name, checksum:'b87064c3e4269c660c5cd16d8e83afbfb78c3362afc8c30f1b9a9efa927d4596', started_at:'2026-08-28 07:37:05.763502+00', finished_at:'2026-08-28 07:37:05.780369+00', rolled_back_at:null, applied_steps_count:1, logs_fingerprint:'d41d8cd98f00b204e9800998ecf8427e'}
+	];
+	const normal=manifest.migrations.filter(row=>row.name!==name).map((row,i)=>({id:`00000000-0000-4000-8000-${String(i+1).padStart(12,'0')}`, migration_name:row.name, checksum:row.checksum, started_at:'2026-08-01 00:00:00.000001+00', finished_at:'2026-08-01 00:00:01.000001+00', rolled_back_at:null, applied_steps_count:1, logs_fingerprint:'d41d8cd98f00b204e9800998ecf8427e'}));
+	let ledger;
+	const reset=()=>{ledger=structuredClone([...normal,...reviewed]).sort((a,b)=>a.migration_name.localeCompare(b.migration_name)||a.id.localeCompare(b.id));};
+	const client={$queryRawUnsafe:async sql=>{calls.push(sql);
+		if(sql==='SHOW transaction_read_only')return [{transaction_read_only:'on'}];
+		if(sql==='SHOW server_version_num')return [{server_version_num:'180003'}];
+		if(sql.includes('AS database_oid'))return [{database:`winwidget_${schema}`,username:`winwidget_${schema}_backup`,session_user:`winwidget_${schema}_backup`,schema,recovery:false,database_oid:'16596'}];
+		if(sql.includes('AS restricted'))return [{restricted:true,no_memberships:true,database_owner:true,schema_owner:true,connect:true,no_database_ddl:true,read_schema:true,no_dml:true,no_routine_execute:true}];
+		if(sql.includes('_prisma_migrations'))return ledger;
+		if(sql.includes('AS acl_sha256'))return [{acl_sha256:'d'.repeat(64)}];
+		throw Error('Unexpected SQL');
+	}};
+	reset();
+	const proof=await verifyOperationsBackupTrustState(client,target,manifest);
+	assert.equal(proof.manifestSha256,OPERATIONS_BACKUP_TRUST_TARGETS[0][3]);
+	const query=calls.find(sql=>sql.includes('_prisma_migrations'));
+	assert.match(query,/to_char\(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS\.US'\)/);
+	assert.match(query,/applied_steps_count, md5\(coalesce\(logs, ''\)\) AS logs_fingerprint/);
+	assert.equal(calls.some(sql=>/^\s*(ALTER|INSERT|UPDATE|DELETE)\b|service_identity/.test(sql)),false);
+	for (const expected of reviewed) {
+		for (const key of Object.keys(expected)) {
+			reset();
+			const row=ledger.find(row=>row.id===expected.id);
+			row[key]=typeof expected[key]==='number'?expected[key]+1:expected[key]===null?'2026-08-28 09:00:00.000000+00':expected[key]+'changed';
+			await assert.rejects(verifyOperationsBackupTrustState(client,target,manifest),`changed reviewed ${expected.id}/${key}`);
+		}
+		reset(); ledger=ledger.filter(row=>row.id!==expected.id);
+		await assert.rejects(verifyOperationsBackupTrustState(client,target,manifest),'incomplete reviewed pair');
+	}
+	for (const mutate of [
+		rows=>rows.push({...reviewed[0],id:'33333333-3333-4333-8333-333333333333'}),
+		rows=>rows.push({...reviewed[1],id:'44444444-4444-4444-8444-444444444444'}),
+		rows=>rows.push({...reviewed[0],migration_name:'unknown_migration',id:'55555555-5555-4555-8555-555555555555'}),
+		rows=>{rows[0].rolled_back_at='2026-08-28 09:00:00.000000+00';},
+		rows=>{rows[0].finished_at=null;},
+		rows=>{rows[0].checksum='f'.repeat(64);},
+		rows=>{rows[0].migration_name='unknown_migration';}
+	]) {reset();mutate(ledger);await assert.rejects(verifyOperationsBackupTrustState(client,target,manifest));}
+	reset();
+	const changed=structuredClone(manifest);
+	changed.migrations.find(row=>row.name===name).checksum=reviewed[0].checksum;
+	await assert.rejects(verifyOperationsBackupTrustState(client,target,changed),'source SQL must match reviewed successful checksum');
+})
+
 const migrationUrl = 'postgresql://winwidget_operations_migration:synthetic%40password@127.0.0.1:55441/winwidget_operations?schema=operations&sslmode=disable'
 const fixture = () => {
 	const services = Object.fromEntries(['operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'].map(name => [name, { environment: {} }]))

@@ -1388,6 +1388,40 @@ export function createOperationsBackupTrustInput(desired) {
 	} catch { throw new Error('Cannot prepare Operations trust input; private details suppressed'); }
 }
 
+const ND_BACKUP_RECOVERED_MIGRATION = '20260828000000_remove_online_consultant_delivery_data';
+// Read-only recognition of the two reviewed historical receipts. Never resolve
+// migrations or discard arbitrary failed/rolled-back rows from the owner ledger.
+const ND_BACKUP_RECOVERED_ROWS = Object.freeze([
+	Object.freeze({
+		id: '9fcc2093-f12e-4c6b-9633-0687acbc2320', migration_name: ND_BACKUP_RECOVERED_MIGRATION,
+		checksum: 'c19ca8b79eae01ef55034640ed0c1fb3fd6aa9700bdd7c403e5ef6f6e7cc76e4',
+		started_at: '2026-08-28 06:44:36.325562+00', finished_at: null,
+		rolled_back_at: '2026-08-28 07:33:40.575583+00', applied_steps_count: 0,
+		logs_fingerprint: 'd41d8cd98f00b204e9800998ecf8427e'
+	}),
+	Object.freeze({
+		id: '18a2268c-e992-4115-82be-0c80552297bc', migration_name: ND_BACKUP_RECOVERED_MIGRATION,
+		checksum: 'b87064c3e4269c660c5cd16d8e83afbfb78c3362afc8c30f1b9a9efa927d4596',
+		started_at: '2026-08-28 07:37:05.763502+00', finished_at: '2026-08-28 07:37:05.780369+00',
+		rolled_back_at: null, applied_steps_count: 1,
+		logs_fingerprint: 'd41d8cd98f00b204e9800998ecf8427e'
+	})
+]);
+function operationsBackupNdLedger(ledger, manifest) {
+	const rows = ledger.filter(row => row.migration_name === ND_BACKUP_RECOVERED_MIGRATION);
+	if (rows.length > 1 || ledger.some(row => ND_BACKUP_RECOVERED_ROWS.some(known => known.id === row.id))) {
+		assert.equal(rows.length, 2);
+		assert.equal(manifest.migrations.find(row => row.name === ND_BACKUP_RECOVERED_MIGRATION)?.checksum, ND_BACKUP_RECOVERED_ROWS[1].checksum);
+		for (const expected of ND_BACKUP_RECOVERED_ROWS) {
+			const matching = ledger.filter(row => row.id === expected.id);
+			assert.equal(matching.length, 1);
+			same(matching[0], expected);
+		}
+		return ledger.filter(row => row.id !== ND_BACKUP_RECOVERED_ROWS[0].id);
+	}
+	return ledger;
+}
+
 export async function verifyOperationsBackupTrustState(client, target, manifest) {
 	const contract = OPERATIONS_BACKUP_TRUST_TARGETS.find(row => row[0] === target); assert.ok(contract);
 	const schema = target.replaceAll('-', '_'), principal = `winwidget_${schema}_backup`;
@@ -1416,7 +1450,15 @@ export async function verifyOperationsBackupTrustState(client, target, manifest)
 		WHERE n.nspname='${schema}' AND has_function_privilege(current_user,p.oid,'EXECUTE')) AS no_routine_execute
 		FROM pg_roles WHERE rolname=current_user`);
 	same(role, [{ restricted: true, no_memberships: true, database_owner: true, schema_owner: true, connect: true, no_database_ddl: true, read_schema: true, no_dml: true, no_routine_execute: true }]);
-	const ledger = await client.$queryRawUnsafe(`SELECT id, migration_name, checksum, finished_at, rolled_back_at FROM "${schema}"._prisma_migrations ORDER BY migration_name`);
+	const rows = await client.$queryRawUnsafe(target === 'notification-delivery'
+		? `SELECT id, migration_name, checksum,
+			to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS started_at,
+			to_char(finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS finished_at,
+			to_char(rolled_back_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS rolled_back_at,
+			applied_steps_count, md5(coalesce(logs, '')) AS logs_fingerprint
+			FROM "${schema}"._prisma_migrations ORDER BY migration_name, id`
+		: `SELECT id, migration_name, checksum, finished_at, rolled_back_at FROM "${schema}"._prisma_migrations ORDER BY migration_name`);
+	const ledger = target === 'notification-delivery' ? operationsBackupNdLedger(rows, manifest) : rows;
 	same(ledger.map(row => ({ name: row.migration_name, checksum: row.checksum })), manifest.migrations);
 	assert.ok(ledger.length && ledger.every(row => row.finished_at && !row.rolled_back_at));
 	let identity;

@@ -49,7 +49,7 @@ export function validateRemindersPayload(bytes) {
 		assert.equal(typeof row.content, 'string')
 		const content = Buffer.from(row.content)
 		assert.equal(content.toString('utf8'), row.content)
-		assert.ok(content.length > 0 && content.length <= 131072)
+		assert.ok(content.length > 0 && content.length <= 147456)
 		assert.equal(sha(content), row.sha256)
 		return { name: row.name, content }
 	})

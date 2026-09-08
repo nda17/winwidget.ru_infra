@@ -109,6 +109,9 @@ jobs:
           shellcheck -x scripts/deploy-crm-reminders-scoped.sh
           node --check scripts/crm-reminders-activation.mjs
           node --check scripts/crm-reminders-activation-cli.mjs
+          bash -n scripts/deploy-crm-customers-provider-scoped.sh
+          shellcheck -x scripts/deploy-crm-customers-provider-scoped.sh
+          node --check scripts/crm-customers-provider-config.mjs
           bash -n scripts/deploy-billing-crm-acl-scoped.sh
           shellcheck -x scripts/deploy-billing-crm-acl-scoped.sh
           node --check scripts/billing-crm-acl-release.mjs
@@ -173,6 +176,9 @@ jobs:
 
       - name: Verify isolated CRM reminders activation contracts
         run: node --test scripts/test-crm-reminders-activation.mjs scripts/test-crm-reminders-controller.mjs
+
+      - name: Verify one-target Customers provider configuration
+        run: node --test scripts/test-crm-customers-provider-config.mjs
 
       - name: Verify isolated restore rehearsal contract
         shell: bash

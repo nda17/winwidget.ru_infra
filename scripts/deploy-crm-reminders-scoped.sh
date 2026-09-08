@@ -23,7 +23,7 @@ try {
  exact(value,['schemaVersion','files']);assert.equal(value.schemaVersion,1);assert.ok(Array.isArray(value.files));
  assert.deepEqual(value.files.map(item=>item.name).sort(),names.sort());
  const files=value.files.map(item=>{exact(item,['name','sha256','content']);assert.match(item.sha256,/^[a-f0-9]{64}$/);assert.equal(typeof item.content,'string');
- const data=Buffer.from(item.content,'utf8');assert.equal(data.toString('utf8'),item.content);assert.ok(data.length>0&&data.length<=131072);
+ const data=Buffer.from(item.content,'utf8');assert.equal(data.toString('utf8'),item.content);assert.ok(data.length>0&&data.length<=147456);
  assert.equal(createHash('sha256').update(data).digest('hex'),item.sha256);return {...item,data};});
  for(const file of files) writeFileSync('/run/payload/'+file.name,file.data,{flag:'wx',mode:0o444});
 } catch {process.stderr.write('CRM reminders payload rejected; private details suppressed\n');process.exitCode=1;}

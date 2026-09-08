@@ -46,6 +46,13 @@ test('private parser and immutable payload refuse duplicates, traversal, altered
 		REMINDERS_PAYLOAD_FILES
 	)
 	assert.ok(Buffer.byteLength(pack.stdout) <= 524288)
+	const boundary = structuredClone(parsed)
+	boundary.files[0].content = 'x'.repeat(147456)
+	boundary.files[0].sha256 = hash(boundary.files[0].content)
+	assert.equal(
+		validateRemindersPayload(JSON.stringify(boundary)).length,
+		REMINDERS_PAYLOAD_FILES.length
+	)
 	assert.ok(
 		gzipSync(pack.stdout).toString('base64').length +
 			gzipSync(shell).toString('base64').length <=
@@ -63,7 +70,7 @@ test('private parser and immutable payload refuse duplicates, traversal, altered
 			value.files.push(value.files[0])
 		},
 		value => {
-			value.files[0].content = 'x'.repeat(131073)
+			value.files[0].content = 'x'.repeat(147457)
 			value.files[0].sha256 = hash(value.files[0].content)
 		}
 	]) {

@@ -1929,6 +1929,75 @@ frontend Nginx, но не устанавливает bridge-конфигурац
 6. Временную production-правку перенести в Git, создать новый commit, получить
    green CI и повторить routine deploy с полным post-deploy checklist.
 
+### Configuration-only подключение DaData после выпуска Customers
+
+Scope `crm-customers-provider-config` применяется только после успешного
+`crm-upgrade` с реализованным server-side adapter. Это не повторный запуск
+`crm-commerce-activate` и не изменение правил code-only upgrade. Единственная
+разрешённая effective Env-дельта — `CRM_CUSTOMERS_DADATA_API_KEY` из явно
+пустого значения в 40-hex ключ только у `winwidget-crm/crm-customers-api`.
+Ротация уже непустого ключа, новые flags, изменение image/revision, URL БД,
+mounts, ports, limits, security, команд или соседних контейнеров не разрешены.
+Ручной ввод компаний остаётся доступным; авторизацию и квоты lookup по-прежнему
+проверяет Customers API. Контроллер не делает запросов к DaData и не меняет SQL.
+
+Закрытые JSON bundles `crm-commerce-activate`, `crm-reminders-activate` и
+`crm-customers-provider-config` ограничены 144 KiB на public-code файл,
+512 KiB на полный decoded envelope и 112000 bytes на encoded SSH payload.
+Точные имена файлов, их SHA-256, pinned Infra/Services SHA и scope-specific
+approval обязательны. Приватные env-файлы, shell и остальные одиночные Node
+payloads ограничены прежними 128 KiB. Только точный общий
+`scoped-service-release.mjs`, включающий проверенные owner-ledger proofs,
+допускает 144 KiB также в standalone transport. Ограничение совпадает у
+source guard и remote decoder для всех существующих scopes, выбирающих этот
+модуль. Их encoded SSH budget остаётся 90000 bytes; это не расширяет scope,
+авторизацию или допустимые production-изменения.
+
+Порядок оператора:
+
+1. Завершить текущие CRM/Operations rollout; baseline брать **после** них.
+   Под глобальным `.production-deploy.lock` сверить полные canonical и CRM env
+   с локальными файлами по принятой двусторонней процедуре. Ключ из локального
+   игнорируемого файла перенести только в полную CRM `.env.production`,
+   атомарно установить её root:root/0600 и скачать обратно для byte/hash proof.
+   Не передавать ключ через workflow input, CLI аргумент или отдельный mount.
+2. Снять `docker inspect` всех контейнеров Compose projects `winwidget` и
+   `winwidget-crm` непосредственно в root-private файл (не stdout). В isolated
+   Node-контейнере с public modules из exact green Infra SHA вызвать
+   `customersProviderBaseline(live, gatewayRevision, {canonical, crm})` из
+   `scripts/crm-customers-provider-config.mjs`. Значения `canonical`/`crm` —
+   SHA-256 уже подготовленных полных env. Функция проверит healthy baseline,
+   всё ещё пустой runtime ключ и соседей. Результат содержит только IDs/hashes.
+3. Сериализовать результат как `JSON.stringify(result) + '\n'` и атомарно
+   установить root:root/0600 в
+   `/opt/winwidget/deploy/backend/crm/customers-provider-baseline.json`.
+   Не переставлять JSON-ключи вручную: контроллер сравнивает канонические bytes.
+   Зафиксировать SHA-256 результата, gateway revision, SHA-256 CRM env и
+   согласованный canonical hash в соответствующем GitHub secret.
+4. В новом Services commit вызвать reusable production workflow, pinned на
+   exact green Infra SHA, с `release_scope: crm-customers-provider-config`,
+   `expected_live_revision`, `expected_service_env_sha256` и
+   `expected_crm_customers_provider_baseline_sha256`. Перед prod push получить
+   green CI для этого точного Services SHA. Другие scope-specific baseline
+   inputs должны быть пустыми. Новые runtime images этот scope не собирает.
+5. Контроллер под тем же lock сверяет baseline/полные файлы/payload, создаёт
+   root-private plan и runtime config в
+   `crm/customers-provider-activations/<Services SHA>/`, пишет отдельные
+   durable `admission.json`, `switching.json`, `started.json`,
+   `observed.json`, `completed.json`. Останавливает исходный ID и создаёт
+   только Customers API с `--no-build --pull never --no-deps` на прежнем image.
+   `completed.json` допускается только при healthy exact replacement и
+   неизменном fingerprint всех соседей, включая Gateway и PostgreSQL.
+6. При неопределённом stop/create не удалять receipts и не вызывать Compose
+   вручную: повторный запуск того же неизменённого контроллера наблюдает
+   существующий результат без второго stop/create. Старый ещё running после
+   unknown stop или отсутствующий результат create требуют проверки оператора,
+   не автоматического повтора. Любая правка кода требует нового green SHA,
+   а уже начатый переход — явного forward recovery, не rollback.
+7. После успешного runtime proof отдельно проверить поиск ИНН через обычный
+   авторизованный UI: просмотр результата и подтверждение заполнения формы.
+   Реальный provider HTTP и бизнес-данные не входят в работу deploy controller.
+
 Ручные ad hoc изменения production Compose/Nginx/env должны быть немедленно
 возвращены в `winwidget.ru_infra`; временный VPS-файл не является источником
 истины.

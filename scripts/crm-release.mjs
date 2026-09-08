@@ -23,7 +23,8 @@ export const CRM_RUNTIME_NAMES = Object.freeze([
 const digest = value => createHash('sha256').update(value).digest('hex')
 const revision = value =>
 	typeof value === 'string' && /^[a-f0-9]{40}$/.test(value)
-const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+const sha = value =>
+	typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 const imageId = value =>
 	typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value)
 
@@ -322,7 +323,9 @@ export function crmUpgradeImageSource(prismaRoot) {
 			!readdirSync(prismaRoot).includes(name)
 		)
 			continue
-		assert.ok(lstatSync(file).isFile() && !lstatSync(file).isSymbolicLink())
+		assert.ok(
+			lstatSync(file).isFile() && !lstatSync(file).isSymbolicLink()
+		)
 		files[name] = digest(readFileSync(file))
 	}
 	const migrations = join(prismaRoot, 'migrations')
@@ -334,14 +337,18 @@ export function crmUpgradeImageSource(prismaRoot) {
 	// keeps it inside migrations. Hash exactly one real file in either layout.
 	const rootLock = join(prismaRoot, 'migration_lock.toml')
 	if (readdirSync(prismaRoot).includes('migration_lock.toml')) {
-		assert.ok(lstatSync(rootLock).isFile() && !lstatSync(rootLock).isSymbolicLink())
+		assert.ok(
+			lstatSync(rootLock).isFile() && !lstatSync(rootLock).isSymbolicLink()
+		)
 		assert.ok(!readdirSync(migrations).includes('migration_lock.toml'))
 		files['migration_lock.toml'] = digest(readFileSync(rootLock))
 	}
 	for (const name of readdirSync(migrations).sort()) {
 		if (name === 'migration_lock.toml') {
 			const lock = join(migrations, name)
-			assert.ok(lstatSync(lock).isFile() && !lstatSync(lock).isSymbolicLink())
+			assert.ok(
+				lstatSync(lock).isFile() && !lstatSync(lock).isSymbolicLink()
+			)
 			files[name] = digest(readFileSync(lock))
 			continue
 		}
@@ -353,10 +360,14 @@ export function crmUpgradeImageSource(prismaRoot) {
 		)
 		assert.deepEqual(readdirSync(directory), ['migration.sql'])
 		const file = join(directory, 'migration.sql')
-		assert.ok(lstatSync(file).isFile() && !lstatSync(file).isSymbolicLink())
+		assert.ok(
+			lstatSync(file).isFile() && !lstatSync(file).isSymbolicLink()
+		)
 		files[name] = digest(readFileSync(file))
 	}
-	assert.ok(Object.keys(files).length > 1 && Object.keys(files).length <= 103)
+	assert.ok(
+		Object.keys(files).length > 1 && Object.keys(files).length <= 103
+	)
 	return files
 }
 
@@ -431,13 +442,72 @@ export function crmUpgradeSource(owner, before, after) {
 	return true
 }
 
+// Exact, read-only evidence of ND's completed 28 Aug recovery. Failed SQL is
+// historical only; it is never run, resolved, removed or silently reclassified.
+export const CRM_NOTIFICATION_RECOVERY_ROWS = Object.freeze([
+	Object.freeze({
+		id: '9fcc2093-f12e-4c6b-9633-0687acbc2320',
+		migration_name:
+			'20260828000000_remove_online_consultant_delivery_data',
+		checksum:
+			'c19ca8b79eae01ef55034640ed0c1fb3fd6aa9700bdd7c403e5ef6f6e7cc76e4',
+		started_at: '2026-08-28 06:44:36.325562+00',
+		finished_at: null,
+		rolled_back_at: '2026-08-28 07:33:40.575583+00',
+		applied_steps_count: 0,
+		logs_fingerprint: 'd41d8cd98f00b204e9800998ecf8427e'
+	}),
+	Object.freeze({
+		id: '18a2268c-e992-4115-82be-0c80552297bc',
+		migration_name:
+			'20260828000000_remove_online_consultant_delivery_data',
+		checksum:
+			'b87064c3e4269c660c5cd16d8e83afbfb78c3362afc8c30f1b9a9efa927d4596',
+		started_at: '2026-08-28 07:37:05.763502+00',
+		finished_at: '2026-08-28 07:37:05.780369+00',
+		rolled_back_at: null,
+		applied_steps_count: 1,
+		logs_fingerprint: 'd41d8cd98f00b204e9800998ecf8427e'
+	})
+])
+
+function assertNotificationRecovery(files, rows) {
+	const name = CRM_NOTIFICATION_RECOVERY_ROWS[0].migration_name
+	assert.equal(files[name], CRM_NOTIFICATION_RECOVERY_ROWS[1].checksum)
+	const recovered = rows.filter(row => row.migration_name === name)
+	assert.equal(recovered.length, 2)
+	for (const expected of CRM_NOTIFICATION_RECOVERY_ROWS) {
+		const actual = recovered.find(row => row.id === expected.id)
+		assert.ok(actual)
+		assert.deepEqual(
+			Object.fromEntries(
+				Object.keys(expected).map(key => [key, actual[key]])
+			),
+			expected
+		)
+	}
+}
+
 export function crmUpgradeLedger(owner, files, rows, complete = false) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+	if (
+		owner === 'notification-delivery' &&
+		rows.some(row => CRM_NOTIFICATION_RECOVERY_ROWS.some(known => known.id === row.id))
+	)
+		assertNotificationRecovery(files, rows)
 	const applied = new Set()
 	for (const row of rows) {
 		if (row.rolled_back_at) {
-			// The sole already reviewed production recovery is history, not a
-			// reason to repeat role mutation or migrate resolve on a later release.
+			if (owner === 'notification-delivery') {
+				assert.equal(row.id, CRM_NOTIFICATION_RECOVERY_ROWS[0].id)
+				assert.equal(
+					row.migration_name,
+					CRM_NOTIFICATION_RECOVERY_ROWS[0].migration_name
+				)
+				assertNotificationRecovery(files, rows)
+				continue
+			}
+			// Retain the separately reviewed Billing recovery unchanged.
 			assert.equal(owner, 'billing')
 			assert.equal(row.id, '412a6ec9-35c7-4c1a-ad94-b11dbae1e889')
 			assert.equal(
@@ -462,7 +532,10 @@ export function crmUpgradeLedger(owner, files, rows, complete = false) {
 	for (const name of pending) {
 		assert.equal(CRM_UPGRADE_MIGRATIONS[owner][name], files[name])
 		// The old ACL release must already have completed successfully.
-		assert.notEqual(name, '20260909110000_restrict_wincrm_commerce_runtime_acl')
+		assert.notEqual(
+			name,
+			'20260909110000_restrict_wincrm_commerce_runtime_acl'
+		)
 	}
 	if (complete) assert.equal(pending.length, 0)
 	return pending
@@ -513,12 +586,18 @@ export function crmUpgradeFence(
 		)
 		if (item.Image === previous.image) {
 			assert.equal(item.Id, previous.id)
-			assert.equal(envObject(item.Config.Env).APP_REVISION, previous.revision)
+			assert.equal(
+				envObject(item.Config.Env).APP_REVISION,
+				previous.revision
+			)
 		} else {
 			assert.ok(next && imageId(next.image) && revision(next.revision))
 			assert.equal(item.Image, next.image)
 			assert.equal(envObject(item.Config.Env).APP_REVISION, next.revision)
-			assert.equal(item.Config.Labels['org.opencontainers.image.revision'], next.revision)
+			assert.equal(
+				item.Config.Labels['org.opencontainers.image.revision'],
+				next.revision
+			)
 		}
 		assert.equal(item.State.OOMKilled, false)
 		assert.equal(item.RestartCount, 0)
@@ -556,9 +635,15 @@ function upgradeCompanionConfiguration(service, live, image) {
 	assert.equal(Boolean(service.privileged), false)
 	assert.equal(host.Privileged, false)
 	assert.equal(service.pid ?? '', host.PidMode ?? '')
-	assert.equal(service.user ?? image.Config.User ?? '', live.Config.User ?? '')
+	assert.equal(
+		service.user ?? image.Config.User ?? '',
+		live.Config.User ?? ''
+	)
 	same(service.command ?? image.Config.Cmd, live.Config.Cmd)
-	same(service.entrypoint ?? image.Config.Entrypoint, live.Config.Entrypoint)
+	same(
+		service.entrypoint ?? image.Config.Entrypoint,
+		live.Config.Entrypoint
+	)
 	assert.equal(image.Config.WorkingDir, live.Config.WorkingDir)
 	assert.equal(Boolean(service.read_only), Boolean(host.ReadonlyRootfs))
 	for (const [key, actual] of [
@@ -566,7 +651,10 @@ function upgradeCompanionConfiguration(service, live, image) {
 		['cap_drop', 'CapDrop'],
 		['security_opt', 'SecurityOpt']
 	])
-		same([...(service[key] ?? [])].sort(), [...(host[actual] ?? [])].sort())
+		same(
+			[...(service[key] ?? [])].sort(),
+			[...(host[actual] ?? [])].sort()
+		)
 	assert.equal(service.restart ?? 'no', host.RestartPolicy.Name)
 	for (const [key, actual] of [
 		['mem_limit', 'Memory'],
@@ -872,7 +960,9 @@ export function crmUpgradeDatabaseInput(owner, ownerEnv, live) {
 	)
 	assert.equal(approved.length, 1)
 	const runtimeUrl = new URL(
-		envObject(approved[0].Config.Env)[`${schema.toUpperCase()}_DATABASE_URL`]
+		envObject(approved[0].Config.Env)[
+			`${schema.toUpperCase()}_DATABASE_URL`
+		]
 	)
 	assert.ok(['postgres:', 'postgresql:'].includes(runtimeUrl.protocol))
 	assert.equal(runtimeUrl.searchParams.getAll('schema').length, 1)
@@ -908,7 +998,9 @@ export function crmUpgradeDatabaseConnection(owner, input) {
 	])
 	assert.equal(input.owner, owner)
 	assert.equal(typeof input.migrationUrl, 'string')
-	assert.ok(input.migrationUrl.length > 0 && input.migrationUrl.length <= 8192)
+	assert.ok(
+		input.migrationUrl.length > 0 && input.migrationUrl.length <= 8192
+	)
 	const url = new URL(input.migrationUrl)
 	assert.ok(['postgres:', 'postgresql:'].includes(url.protocol))
 	assert.equal(url.hostname, '127.0.0.1')
@@ -928,8 +1020,9 @@ export function crmUpgradeDatabaseConnection(owner, input) {
 	})
 	for (const key of url.searchParams.keys())
 		assert.ok(
-			['schema', 'sslmode', 'connection_limit', 'pool_timeout'].includes(key) &&
-				url.searchParams.getAll(key).length === 1
+			['schema', 'sslmode', 'connection_limit', 'pool_timeout'].includes(
+				key
+			) && url.searchParams.getAll(key).length === 1
 		)
 	return url
 }
@@ -944,6 +1037,39 @@ export function parseCrmUpgradeDatabaseHandoff(buffer) {
 	// keys/alternate encodings instead of silently accepting last-key wins.
 	assert.equal(JSON.stringify(value), bytes)
 	return value
+}
+
+export function crmUpgradeDatabaseRoles(owner, roles) {
+	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+	const prefix = `winwidget_${owner.replaceAll('-', '_')}`
+	assert.ok(Array.isArray(roles))
+	assert.deepEqual(roles.map(role => role.rolname).sort(), [
+		`${prefix}_migration`,
+		`${prefix}_runtime`
+	])
+	for (const role of roles) {
+		assert.equal(role.rolcanlogin, true)
+		for (const key of [
+			'rolsuper',
+			'rolcreatedb',
+			'rolcreaterole',
+			'rolreplication',
+			'rolbypassrls'
+		])
+			assert.equal(role[key], false)
+		assert.equal(typeof role.rolinherit, 'boolean')
+		if (
+			owner.startsWith('crm-') ||
+			role.rolname === 'winwidget_billing_runtime'
+		)
+			assert.equal(role.rolinherit, false)
+		// ND's existing owner roles use PostgreSQL's INHERIT default and have
+		// zero memberships in either direction (checked independently below).
+		// Preserve that exact baseline, not Billing's explicit NOINHERIT rollout.
+		if (owner === 'notification-delivery')
+			assert.equal(role.rolinherit, true)
+	}
+	return roles
 }
 
 export function crmUpgradeDatabaseMemberships(owner, rows, admin = null) {
@@ -1078,24 +1204,7 @@ async function crmUpgradeDatabase(owner, complete, input) {
 				const roles = await tx.$queryRawUnsafe(
 					`SELECT rolname,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls FROM pg_roles WHERE rolname IN ('winwidget_${schema}_migration','winwidget_${schema}_runtime') ORDER BY rolname`
 				)
-				assert.equal(roles.length, 2)
-				for (const role of roles) {
-					assert.equal(role.rolcanlogin, true)
-					for (const key of [
-						'rolsuper',
-						'rolcreatedb',
-						'rolcreaterole',
-						'rolreplication',
-						'rolbypassrls'
-					])
-						assert.equal(role[key], false)
-					if (
-						owner.startsWith('crm-') ||
-						role.rolname === 'winwidget_billing_runtime' ||
-						role.rolname === 'winwidget_notification_delivery_runtime'
-					)
-						assert.equal(role.rolinherit, false)
-				}
+				crmUpgradeDatabaseRoles(owner, roles)
 				const companion = owner === 'identity' || owner === 'billing'
 				const admins = companion
 					? await tx.$queryRawUnsafe(
@@ -1240,7 +1349,8 @@ async function crmUpgradeCommand(mode) {
 		}
 		return parseCrmUpgradeDatabaseHandoff(buffer.subarray(0, size))
 	}
-	const json = name => JSON.parse(readFileSync(`/run/crm/${name}.json`, 'utf8'))
+	const json = name =>
+		JSON.parse(readFileSync(`/run/crm/${name}.json`, 'utf8'))
 	const baselineInput = () => {
 		const baseline = json('baseline')
 		assert.equal(
@@ -1268,7 +1378,8 @@ async function crmUpgradeCommand(mode) {
 				process.env.CRM_REMINDERS_RABBITMQ_CONTRACT
 			)
 		)
-	if (mode === 'upgrade-source') return crmUpgradeImageSource('/app/prisma')
+	if (mode === 'upgrade-source')
+		return crmUpgradeImageSource('/app/prisma')
 	if (mode === 'upgrade-old-images') {
 		const values = crmUpgradeOldImages(json('baseline'), process.argv[3])
 		process.stdout.write(values.join('\n') + '\n')
@@ -1280,7 +1391,10 @@ async function crmUpgradeCommand(mode) {
 			baseline.environmentHashes,
 			JSON.parse(process.env.CRM_UPGRADE_ENV_HASHES)
 		)
-		assert.equal(baseline.gatewayRevision, process.env.CRM_GATEWAY_REVISION)
+		assert.equal(
+			baseline.gatewayRevision,
+			process.env.CRM_GATEWAY_REVISION
+		)
 		crmUpgradeFence(input(), baseline)
 		return true
 	}
@@ -1329,7 +1443,10 @@ async function crmUpgradeCommand(mode) {
 		assert.ok(owners.includes(owner))
 		const { readDatabaseAccess, databaseRuntimeGrantsSql } =
 			await import('/run/crm-database-access.mjs')
-		const { contract, migrations } = readDatabaseAccess('/app/prisma', owner)
+		const { contract, migrations } = readDatabaseAccess(
+			'/app/prisma',
+			owner
+		)
 		process.stdout.write(databaseRuntimeGrantsSql(contract, migrations))
 		return undefined
 	}
@@ -1357,11 +1474,15 @@ async function crmUpgradeCommand(mode) {
 					reporting: 'reporting-service',
 					widgets: 'widgets-service'
 				}[owner] ?? `${owner}-api`
-			const item = live.find(row => upgradeKey(row) === `winwidget/${role}`)
+			const item = live.find(
+				row => upgradeKey(row) === `winwidget/${role}`
+			)
 			assert.ok(item && imageId(item.Image))
 			const prefix = owner.replaceAll('-', '_').toUpperCase()
 			values[`${prefix}_IMAGE`] = item.Image
-			values[`${prefix}_REVISION`] = envObject(item.Config.Env).APP_REVISION
+			values[`${prefix}_REVISION`] = envObject(
+				item.Config.Env
+			).APP_REVISION
 			assert.ok(revision(values[`${prefix}_REVISION`]))
 		}
 		process.stdout.write(
@@ -1485,8 +1606,10 @@ async function crmUpgradeCommand(mode) {
 		const unit = process.argv[3]
 		assert.ok(['crm', 'companions'].includes(unit))
 		process.stdout.write(
-			JSON.stringify(json('plan').desired[unit]).replaceAll('$', () => '$$') +
-				'\n'
+			JSON.stringify(json('plan').desired[unit]).replaceAll(
+				'$',
+				() => '$$'
+			) + '\n'
 		)
 		return undefined
 	}
@@ -1502,10 +1625,14 @@ export function crmNeighborFingerprint(containers, gatewayRevision) {
 			containers.length > 0 &&
 			containers.length <= 200
 	)
-	assert.equal(new Set(containers.map(item => item.Id)).size, containers.length)
+	assert.equal(
+		new Set(containers.map(item => item.Id)).size,
+		containers.length
+	)
 	const gateway = containers.filter(
 		item =>
-			item.Config?.Labels?.['com.docker.compose.project'] === 'winwidget' &&
+			item.Config?.Labels?.['com.docker.compose.project'] ===
+				'winwidget' &&
 			item.Config?.Labels?.['com.docker.compose.service'] === 'api-gateway'
 	)
 	assert.equal(gateway.length, 1)
@@ -1516,7 +1643,9 @@ export function crmNeighborFingerprint(containers, gatewayRevision) {
 	const stable = containers
 		.map(item => {
 			assert.ok(
-				sha(item.Id) && imageId(item.Image) && typeof item.Name === 'string'
+				sha(item.Id) &&
+					imageId(item.Image) &&
+					typeof item.Name === 'string'
 			)
 			assert.equal(item.State?.Running, true)
 			assert.equal(item.State?.Paused, false)
@@ -1526,7 +1655,9 @@ export function crmNeighborFingerprint(containers, gatewayRevision) {
 			assert.ok(
 				Number.isSafeInteger(item.RestartCount) && item.RestartCount >= 0
 			)
-			assert.ok(item.Config && item.HostConfig && Array.isArray(item.Mounts))
+			assert.ok(
+				item.Config && item.HostConfig && Array.isArray(item.Mounts)
+			)
 			assert.ok(
 				item.NetworkSettings && typeof item.NetworkSettings === 'object'
 			)
@@ -1558,7 +1689,10 @@ export function crmDatabaseNeighbors(containers, gatewayRevision) {
 	assert.ok(Array.isArray(containers))
 	const seen = new Set()
 	const neighbors = containers.filter(item => {
-		if (item.Config?.Labels?.['com.docker.compose.project'] !== 'winwidget-crm')
+		if (
+			item.Config?.Labels?.['com.docker.compose.project'] !==
+			'winwidget-crm'
+		)
 			return true
 		const name = item.Config.Labels['com.docker.compose.service']
 		assert.ok(owners.some(owner => name === owner + '-postgres'))
@@ -1574,7 +1708,8 @@ export function crmRuntimeNeighbors(containers, gatewayRevision) {
 	return crmNeighborFingerprint(
 		containers.filter(item => {
 			if (
-				item.Config?.Labels?.['com.docker.compose.project'] !== 'winwidget-crm'
+				item.Config?.Labels?.['com.docker.compose.project'] !==
+				'winwidget-crm'
 			)
 				return true
 			const name = item.Config.Labels['com.docker.compose.service']
@@ -1729,7 +1864,11 @@ export function crmRuntimeLedger(migrations, rows) {
 	return migrations.length
 }
 
-export function crmDatabaseResources(config, validateCompose, availableMemory) {
+export function crmDatabaseResources(
+	config,
+	validateCompose,
+	availableMemory
+) {
 	const shape = validateCompose(config)
 	assert.equal(shape.releaseApproved, false)
 	assertCrmPublicGatesClosed(config)
@@ -1737,7 +1876,10 @@ export function crmDatabaseResources(config, validateCompose, availableMemory) {
 		owner => config.services[owner + '-postgres'].image
 	)
 	assert.equal(new Set(databaseImages).size, 1)
-	assert.match(databaseImages[0], /^postgres:18-bookworm@sha256:[a-f0-9]{64}$/)
+	assert.match(
+		databaseImages[0],
+		/^postgres:18-bookworm@sha256:[a-f0-9]{64}$/
+	)
 	// Conservative preparation headroom, not a full runtime/load approval.
 	// Count all four DB caps even on replay, plus the largest sequential
 	// migration job, a 128 MiB verifier and the agreed 2 GiB host reserve.
@@ -1770,7 +1912,12 @@ export function assertCrmPublicGatesClosed(config) {
 		}
 }
 
-export function crmDatabaseContainer(container, config, postgresImage, owner) {
+export function crmDatabaseContainer(
+	container,
+	config,
+	postgresImage,
+	owner
+) {
 	assert.ok(owners.includes(owner))
 	const expected = config.services[owner + '-postgres']
 	assert.ok(sha(container.Id) && imageId(postgresImage.Id))
@@ -1822,16 +1969,23 @@ export function crmDatabaseContainer(container, config, postgresImage, owner) {
 		MaximumRetryCount: 0
 	})
 	assert.deepEqual(host.PortBindings, {
-		'5432/tcp': [{ HostIp: '127.0.0.1', HostPort: expected.ports[0].published }]
+		'5432/tcp': [
+			{ HostIp: '127.0.0.1', HostPort: expected.ports[0].published }
+		]
 	})
 	assert.deepEqual(container.NetworkSettings.Ports, {
-		'5432/tcp': [{ HostIp: '127.0.0.1', HostPort: expected.ports[0].published }]
+		'5432/tcp': [
+			{ HostIp: '127.0.0.1', HostPort: expected.ports[0].published }
+		]
 	})
 	assert.deepEqual(Object.keys(container.NetworkSettings.Networks), [
 		'winwidget-crm_' + owner + '-postgres'
 	])
 	assert.deepEqual(container.Config.Cmd, expected.command)
-	assert.deepEqual(container.Config.Entrypoint, postgresImage.Config.Entrypoint)
+	assert.deepEqual(
+		container.Config.Entrypoint,
+		postgresImage.Config.Entrypoint
+	)
 	assert.equal(container.Config.User, postgresImage.Config.User ?? '')
 	assert.equal(
 		container.Config.Healthcheck.Test.join('|'),
@@ -1855,13 +2009,16 @@ export function crmDatabaseContainer(container, config, postgresImage, owner) {
 	})
 	const mounts = container.Mounts
 	assert.equal(mounts.length, 2)
-	const volume = mounts.find(item => item.Destination === '/var/lib/postgresql')
+	const volume = mounts.find(
+		item => item.Destination === '/var/lib/postgresql'
+	)
 	assert.equal(volume?.Type, 'volume')
 	assert.equal(volume.Name, 'winwidget-crm_' + owner + '-postgres-data')
 	assert.equal(volume.RW, true)
 	const secret = mounts.find(
 		item =>
-			item.Destination === '/run/secrets/' + owner + '-postgres-admin-password'
+			item.Destination ===
+			'/run/secrets/' + owner + '-postgres-admin-password'
 	)
 	assert.equal(secret?.Type, 'bind')
 	assert.equal(
@@ -1890,7 +2047,8 @@ export function crmDatabaseCredentials(config, owner, backupPassword) {
 	}
 	assert.ok(
 		Object.values(passwords).every(
-			value => typeof value === 'string' && /^[a-f0-9]{48,128}$/.test(value)
+			value =>
+				typeof value === 'string' && /^[a-f0-9]{48,128}$/.test(value)
 		)
 	)
 	assert.equal(new Set(Object.values(passwords)).size, 3)
@@ -1943,7 +2101,8 @@ export function crmPreparationReceipt(
 			servicesRevision
 		)
 		for (const [name, process] of Object.entries(config.services)) {
-			if (!name.startsWith(owner + '-') || name.endsWith('-postgres')) continue
+			if (!name.startsWith(owner + '-') || name.endsWith('-postgres'))
+				continue
 			assert.equal(process.image, image.Id)
 			assert.equal(process.environment.APP_REVISION, servicesRevision)
 		}
@@ -1981,7 +2140,9 @@ if (
 			if (result !== undefined)
 				process.stdout.write(JSON.stringify(result) + '\n')
 		} else if (
-			['inventory', 'database-neighbors', 'runtime-neighbors'].includes(mode)
+			['inventory', 'database-neighbors', 'runtime-neighbors'].includes(
+				mode
+			)
 		) {
 			assert.equal(process.argv.length, 3)
 			const input = readFileSync(0, 'utf8')
@@ -2020,7 +2181,9 @@ if (
 			const composeBytes = readFileSync('/run/crm/desired.json', 'utf8')
 			const config = JSON.parse(composeBytes)
 			validateCrmCompose(config)
-			const images = JSON.parse(readFileSync('/run/crm/images.json', 'utf8'))
+			const images = JSON.parse(
+				readFileSync('/run/crm/images.json', 'utf8')
+			)
 			if (mode === 'runtime-seal') {
 				const receipt = JSON.parse(
 					readFileSync('/run/crm/receipt.json', 'utf8')
@@ -2062,7 +2225,8 @@ if (
 				const input = JSON.parse(readFileSync(0, 'utf8'))
 				assert.equal(input.length, 1)
 				process.stdout.write(
-					crmRuntimeContainer(input[0], config, images, process.argv[3]) + '\n'
+					crmRuntimeContainer(input[0], config, images, process.argv[3]) +
+						'\n'
 				)
 			} else if (mode === 'runtime-ledger') {
 				const owner = process.argv[3]
@@ -2072,7 +2236,10 @@ if (
 				const { migrations } = readDatabaseAccess('/app/prisma', owner)
 				process.stdout.write(
 					String(
-						crmRuntimeLedger(migrations, JSON.parse(readFileSync(0, 'utf8')))
+						crmRuntimeLedger(
+							migrations,
+							JSON.parse(readFileSync(0, 'utf8'))
+						)
 					) + '\n'
 				)
 			} else throw new Error('Unsupported runtime mode')
@@ -2080,7 +2247,9 @@ if (
 			assert.ok(process.argv.length === 3 || process.argv.length === 4)
 			const { validateCrmCompose } =
 				await import('/run/crm-compose-validator.mjs')
-			const config = JSON.parse(readFileSync('/run/crm/desired.json', 'utf8'))
+			const config = JSON.parse(
+				readFileSync('/run/crm/desired.json', 'utf8')
+			)
 			validateCrmCompose(config)
 			const owner = process.argv[3]
 			if (mode === 'database-resources') {
@@ -2099,7 +2268,8 @@ if (
 				)
 				assert.equal(images.length, 1)
 				process.stdout.write(
-					crmDatabaseContainer(container[0], config, images[0], owner) + '\n'
+					crmDatabaseContainer(container[0], config, images[0], owner) +
+						'\n'
 				)
 			} else {
 				assert.ok(owners.includes(owner))
@@ -2125,7 +2295,9 @@ if (
 				else if (mode === 'database-bootstrap')
 					process.stdout.write(databaseBootstrapSql(contract, passwords))
 				else if (mode === 'database-grants')
-					process.stdout.write(databaseRuntimeGrantsSql(contract, migrations))
+					process.stdout.write(
+						databaseRuntimeGrantsSql(contract, migrations)
+					)
 				else if (/^database-auth-(migration|runtime|backup)$/.test(mode)) {
 					const role = mode.slice('database-auth-'.length)
 					// Private pipe only: a single password line, then SQL for psql.
