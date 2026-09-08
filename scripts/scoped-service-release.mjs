@@ -18,7 +18,8 @@ export const SCOPED_SERVICES = Object.freeze({
 	'operations-backup-runtime': ['operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
 	'operations-backlog-backup': [],
 	'operations-backlog-finalize': [],
-	'gateway-remove-notes': ['api-gateway']
+	'gateway-remove-notes': ['api-gateway'],
+	'gateway-tilda-upgrade': ['api-gateway']
 });
 export const OPERATIONS_API_SOURCE_PATHS = Object.freeze([
 	'apps/operations/src/messaging-admin/messaging-admin.service.ts',

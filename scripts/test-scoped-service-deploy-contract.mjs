@@ -48,6 +48,8 @@ import {
 	verifyOperationsApiHttp,
 	verifyDatabaseState
 } from './scoped-service-release.mjs'
+import { GATEWAY_TILDA_CRM_ROLES, assertGatewayTildaImages, gatewayTildaNeighborFingerprint, verifyGatewayTildaHttp,
+	prepareGatewayTildaCompose, validateGatewayTildaPayload, GATEWAY_TILDA_PAYLOAD_FILES } from './gateway-tilda-release.mjs'
 
 const scriptsRoot = dirname(fileURLToPath(import.meta.url))
 const controllerPath = join(scriptsRoot, 'deploy-services-production.sh')
@@ -61,6 +63,7 @@ const workerScope = 'workers-bootstrap-recovery'
 const apiScope = 'operations-api-runtime'
 const platformScope = 'platform-marketing-runtime'
 const backupRuntimeScope = 'operations-backup-runtime'
+const gatewayTildaScope = 'gateway-tilda-upgrade'
 
 function platformInventoryFixture() {
 	return {
@@ -369,7 +372,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', workerScope, apiScope, platformScope, ...crmScopes]) {
+	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', gatewayTildaScope, workerScope, apiScope, platformScope, ...crmScopes]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -1378,6 +1381,101 @@ test('Gateway scoped adapter pins the already running image and changes only rou
 	assert.throws(() => prepareScopedCompose(changedRevision))
 })
 
+test('Tilda Gateway code-only compose preserves all effective env bytes and both CRM auth routes', () => {
+	const prepareScopedCompose = prepareGatewayTildaCompose
+	const input = composeFixture(gatewayTildaScope)
+	const routes = JSON.stringify([
+		{ id: 'crm-intake', pathPrefix: '/api/v1/crm/intake', authPolicy: 'required', upstreamUrl: 'http://127.0.0.1:5310', timeoutMs: 60000 },
+		{ id: 'crm-intake-ingest', pathPrefix: '/api/v1/crm/intake/ingest', authPolicy: 'crm-source', upstreamUrl: 'http://127.0.0.1:5310', timeoutMs: 60000 }
+	])
+	input.live[0].Config.Env.push(`GATEWAY_ROUTES_JSON=${routes}`)
+	input.compose.services['api-gateway'].environment.GATEWAY_ROUTES_JSON = routes
+	const result = prepareScopedCompose(input)
+	assert.deepEqual(Object.keys(result.desired.services), ['api-gateway'])
+	assert.equal(result.desired.services['api-gateway'].image, input.image.Id)
+	assert.equal(result.rollback.services['api-gateway'].image, input.live[0].Image)
+	assert.equal(result.desired.services['api-gateway'].environment.GATEWAY_ROUTES_JSON, routes)
+	assert.equal(result.rollback.services['api-gateway'].environment.GATEWAY_ROUTES_JSON, routes)
+	for (const mutate of [
+		value => { value.compose.services['api-gateway'].environment.GATEWAY_ROUTES_JSON = routes + ' ' },
+		value => { value.compose.services['api-gateway'].environment.CORS_ALLOWED_ORIGINS = '*' },
+		value => { value.image.Config.Env.push('HIDDEN_NEW_ENV=synthetic') },
+		value => { value.live[0].Config.Env.push('SERVICE_NAME=api-gateway') },
+		value => { value.image.Config.Labels['org.opencontainers.image.revision'] = oldRevision },
+		value => { value.compose.services['api-gateway'].network_mode = 'bridge' },
+		value => { value.live[0].State.Health.Status = 'unhealthy' }
+	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareScopedCompose(changed), undefined, mutate.toString()) }
+	const badRoutes = structuredClone(input)
+	const altered = routes.replace('"crm-source"', '"optional"')
+	badRoutes.live[0].Config.Env = badRoutes.live[0].Config.Env.map(row => row.startsWith('GATEWAY_ROUTES_JSON=') ? `GATEWAY_ROUTES_JSON=${altered}` : row)
+	badRoutes.compose.services['api-gateway'].environment.GATEWAY_ROUTES_JSON = altered
+	assert.throws(() => prepareScopedCompose(badRoutes))
+})
+
+test('Tilda Gateway dedicated envelope preserves existing shared budgets and materializes only two verified public modules', () => {
+	const packed = spawnSync(process.execPath, [join(scriptsRoot, 'gateway-tilda-release.mjs'), 'pack'], { encoding: 'utf8' })
+	assert.equal(packed.status, 0, packed.stderr)
+	assert.deepEqual(validateGatewayTildaPayload(packed.stdout).map(row => row.name), GATEWAY_TILDA_PAYLOAD_FILES)
+	assert.ok(gzipSync(packed.stdout).toString('base64').length + gzipSync(readFileSync(scopedControllerPath)).toString('base64').length <= 90000)
+	const unpack = readFileSync(scopedControllerPath, 'utf8').split("<<'GATEWAY_TILDA_UNPACK'\n")[1].split('\nGATEWAY_TILDA_UNPACK')[0]
+	for (const mutate of [undefined, value => { value.files[0].sha256 = envHash }, value => { value.files[1].name = '../outside.mjs' },
+		value => { value.files.push(value.files[0]) }, value => { value.files[1].content = 'x'.repeat(32769); value.files[1].sha256 = sha256(value.files[1].content) }]) {
+		const envelope = JSON.parse(packed.stdout); mutate?.(envelope); const bytes = JSON.stringify(envelope)
+		if (mutate) assert.throws(() => validateGatewayTildaPayload(bytes))
+		privateFixture(directory => {
+			writeFileSync(join(directory, 'verifier.mjs'), bytes, { mode: 0o444 })
+			const result = spawnSync(process.execPath, ['--input-type=module', '-e', unpack.replaceAll('/run/payload/', directory + '/')], { encoding: 'utf8' })
+			assert.equal(result.status, mutate ? 1 : 0, result.stderr)
+			if (mutate) assert.deepEqual(readdirSync(directory), ['verifier.mjs'])
+			else for (const file of envelope.files) { assert.equal(readFileSync(join(directory, file.name), 'utf8'), file.content); assert.equal(statSync(join(directory, file.name)).mode & 0o777, 0o444) }
+		})
+	}
+})
+
+test('Tilda Gateway full inventory preserves all 21 CRM/companion roles, DBs and other Docker projects', () => {
+	const gateway = composeFixture(gatewayTildaScope).live[0]
+	const live = [gateway, ...[...GATEWAY_TILDA_CRM_ROLES.map(name => ['winwidget-crm', name]),
+		...['identity-api', 'billing-api', 'billing-worker', 'billing-outbox-publisher', 'billing-scheduler', 'notification-delivery-worker'].map(name => ['winwidget', name]), ['another-project', 'unrelated']]
+		.map(([project, name], index) => ({ ...structuredClone(gateway), Id: (index + 2).toString(16).padStart(64, '0'),
+			Config: { ...structuredClone(gateway.Config), Labels: { ...gateway.Config.Labels, 'com.docker.compose.project': project, 'com.docker.compose.service': name } },
+			State: { ...structuredClone(gateway.State), Running: true, StartedAt: '2026-09-08T00:00:00Z' }, RestartCount: 0 }))]
+	const before = gatewayTildaNeighborFingerprint(live)
+	const changedGateway = structuredClone(live); changedGateway[0].Image = 'sha256:' + 'f'.repeat(64); changedGateway[0].State.Status = 'exited'
+	assert.equal(gatewayTildaNeighborFingerprint(changedGateway), before)
+	for (const mutate of [value => { value[1].RestartCount++ }, value => { value[2].Config.Env.push('CHANGED=synthetic') },
+		value => { value.at(-1).Image = 'sha256:' + 'f'.repeat(64) }, value => { value[3].HostConfig.Memory = 42 }]) {
+		const changed = structuredClone(live); mutate(changed); assert.notEqual(gatewayTildaNeighborFingerprint(changed), before)
+	}
+	for (const mutate of [value => { value.splice(1, 1) }, value => { value[2].State.Health.Status = 'unhealthy' },
+		value => { value.push(value[1]) }, value => { value.find(item => item.Config.Labels['com.docker.compose.service'] === 'crm-intake-sla-worker').State.Running = false }]) {
+		const changed = structuredClone(live); mutate(changed); assert.throws(() => gatewayTildaNeighborFingerprint(changed))
+	}
+})
+
+test('Tilda Gateway image pair permits only exact compiled server change', () => {
+	const before = Object.fromEntries(['config.js', 'jwks.js', 'jwt.js', 'logger.js', 'main.js', 'server.js'].map(name => [name, envHash]))
+	const after = { ...before, 'server.js': '5be487540905e7511db2d568f706284a804007a46ef620f7ba298ec74f2b570a' }
+	assertGatewayTildaImages(before, after)
+	for (const changed of [{ ...after, 'jwt.js': 'f'.repeat(64) }, { ...after, 'server.js': envHash }, { ...after, 'unknown.js': envHash }]) assert.throws(() => assertGatewayTildaImages(before, changed))
+})
+
+test('Tilda Gateway live smoke is bounded and never sends credentials or business payload', async () => {
+	for (const mode of ['legacy', 'tilda']) {
+		const calls = []
+		const fake = (mutate = () => {}) => async (url, options) => {
+			assert.equal(new URL(url).origin, 'http://127.0.0.1:4100'); assert.equal(options.redirect, 'error')
+			assert.equal(options.headers, undefined); assert.equal(options.body, undefined); calls.push([url, options.method])
+			const path = new URL(url).pathname, tilda = path.endsWith('/tilda')
+			const status = path.startsWith('/health/') ? 200 : path === '/api/v1/internal' || url.includes('%74') || url.includes('?') || (tilda && (mode === 'legacy' || options.method !== 'POST')) ? 404 : 401
+			const value = status === 200 ? { status: path.endsWith('ready') ? 'ready' : 'ok' } : { code: status === 404 ? 'route_not_found' : 'authentication_required' }
+			mutate(value)
+			return new Response(JSON.stringify(value), { status, headers: { 'cache-control': 'no-store' } })
+		}
+		await verifyGatewayTildaHttp(mode, fake()); assert.equal(calls.length, 9)
+		await assert.rejects(() => verifyGatewayTildaHttp(mode, fake(value => { value.status = 'wrong' })))
+	}
+})
+
 function restoreFixture() {
 	const receipt = {
 		schemaVersion: 1,
@@ -1652,6 +1750,17 @@ if [[ "$release_scope" == platform-marketing-runtime ]]; then
   if [[ "$TEST_SCENARIO" == foreign-authority ]]; then operations_runtime_revision="$TEST_PREVIOUS_REVISION"; fi
   scoped_platform_source() { printf 'PLATFORM_SOURCE\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != source-drift ]]; }
 fi
+if [[ "$release_scope" == gateway-tilda-upgrade ]]; then
+  expected_operations_revision=''; expected_operations_env_sha256=''; expected_support_env_sha256=''
+  if [[ "$TEST_SCENARIO" == foreign-authority ]]; then operations_runtime_revision="$TEST_PREVIOUS_REVISION"; fi
+  if [[ "$TEST_SCENARIO" == owner-hash-drift ]]; then expected_service_env_sha256="$(printf '%064d' 2)"; fi
+  scoped_gateway_unpack() { printf 'GATEWAY_UNPACK\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != payload-failed ]]; }
+  scoped_gateway_source() { printf 'GATEWAY_SOURCE\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != source-drift ]]; }
+  scoped_gateway_neighbors() {
+    printf 'GATEWAY_ALL_PROJECTS\n' >>"$SCOPED_CALLS"
+    if [[ "$TEST_SCENARIO" == crm-neighbor-drift && "$(<"$SCOPED_PHASE")" == desired ]]; then printf '%064d' 2; else printf '%064d' 1; fi
+  }
+fi
 if [[ "$release_scope" == operations-backlog-finalize || "$release_scope" == operations-backlog-backup ]]; then
   operations_runtime_revision="$expected_live_revision"
   if [[ "$release_scope" == operations-backlog-finalize ]]; then operations_evidence_sha256="$TEST_EVIDENCE_HASH"; fi
@@ -1717,6 +1826,7 @@ docker() {
     if [[ "$last" =~ ^0+8$ && "$TEST_SCENARIO" == billing-api-revision-drift ]]; then rev="$TEST_PREVIOUS_REVISION"; fi
   fi
   case "$1" in
+    context) printf 'unix:///var/run/docker.sock\n' ;;
     ps)
       if [[ ( "$TEST_SCOPE" == operations-api-runtime || "$TEST_SCOPE" == platform-marketing-runtime ) && " $* " != *'label=com.docker.compose.service='* ]]; then
         for number in {1..31}; do printf '%064d\n' "$number"; done
@@ -1860,6 +1970,10 @@ docker() {
       fi
       return 84 ;;
     run)
+      if [[ "$TEST_SCOPE" == gateway-tilda-upgrade && " $* " == *' gateway-tilda-http '* ]]; then
+        [[ " $* " == *' --network host '* && " $* " == *' --user node '* && " $* " != *' --env-file '* ]] || return 1
+        [[ "$TEST_SCENARIO" != http-failed || "$last" != tilda ]]; return
+      fi
       if [[ "$TEST_SCOPE" == platform-marketing-runtime ]]; then
         case " $* " in
           *' platform-image-inventory '*)
@@ -1926,6 +2040,8 @@ docker() {
           [[ "$TEST_SCENARIO" != prepare-failed ]] || return 1
           printf '{}\n' >"$scoped_work_directory/desired.json"
           printf '{}\n' >"$scoped_work_directory/rollback.json" ;;
+        gateway-tilda-image) printf '{}\n' ;;
+        gateway-tilda-images) [[ "$TEST_SCENARIO" != image-drift ]] ;;
         phase-a) printf '{}\n' >"$scoped_work_directory/phase-a.json" ;;
         backup-admission) [[ "$TEST_SCENARIO" != backup-admission-failed ]] ;;
         backup-verify) [[ "$TEST_SCENARIO" != backup-corrupt ]] ;;
@@ -1946,15 +2062,20 @@ function runRuntime(scope, scenario = 'success') {
 	return privateFixture(directory => {
 		const root = join(directory, 'app')
 		for (const relative of [
-			'deploy/backend', 'payload', 'release/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog',
+			'deploy/backend', 'deploy/backend/crm', 'payload', 'release/apps/operations/prisma/migrations/20260910110000_remove_admin_backlog',
 			'services/apps/operations', 'services/apps/api-gateway', 'services/apps/identity', 'services/apps/billing', 'services/apps/support', 'services/apps/platform',
 			`deploy/backend/scoped-releases/operations-backlog/${oldRevision}`
 		]) mkdirSync(join(root, relative), { recursive: true })
-		const env = 'SYNTHETIC_ONLY=true\n' + (scope === 'operations-backlog-backup' ? 'OPERATIONS_BACKUP_URL=synthetic-only-private-backup-url\n' : '')
+		const env = 'SYNTHETIC_ONLY=true\n' + (scope === 'operations-backlog-backup' ? 'OPERATIONS_BACKUP_URL=synthetic-only-private-backup-url\n' : '') +
+			(scope === gatewayTildaScope ? 'CRM_RABBITMQ_CONTRACT=mvp-v1\nCRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1\nCRM_INTAKE_SLA_RABBITMQ_CONTRACT=intake-sla-v1\n' : '')
 		for (const relative of [
-			'deploy/backend/.env.production', 'services/apps/operations/.env.production',
+			'deploy/backend/.env.production', 'deploy/backend/crm/.env.production', 'services/apps/operations/.env.production',
 			'services/apps/api-gateway/.env.production', 'services/apps/identity/.env.production', 'services/apps/billing/.env.production', 'services/apps/support/.env.production', 'services/apps/platform/.env.production'
-		]) writeFileSync(join(root, relative), env, { mode: 0o600 })
+		]) {
+			if (scope === gatewayTildaScope && relative === 'services/apps/api-gateway/.env.production') continue
+			writeFileSync(join(root, relative), env, { mode: 0o600 })
+		}
+		if (scope === gatewayTildaScope) assert.equal(existsSync(join(root, 'services/apps/api-gateway/.env.production')), false)
 		for (const owner of ['billing', 'operations', 'support']) {
 			mkdirSync(join(root, `release/apps/${owner}/src/runtime`), { recursive: true })
 			for (const name of ['main.ts', 'runtime/bootstrap-failure.ts']) writeFileSync(join(root, `release/apps/${owner}/src/${name}`), '// synthetic\n')
@@ -2331,6 +2452,50 @@ test('real Gateway coordinator reuses its image without any build or migration',
 	assert.ok(!result.calls.includes('MIGRATE '), result.calls)
 })
 
+test('Tilda Gateway coordinator builds once and gracefully replaces only Gateway with full CRM fences', () => {
+	const result = runRuntime(gatewayTildaScope)
+	assert.equal(result.status, 0, result.stderr)
+	assertOnlyScopedUp(result, ['api-gateway'])
+	assert.equal(result.calls.split('\n').filter(line => line.startsWith('DOCKER <build>')).length, 1)
+	assert.equal(result.calls.split('\n').filter(line => line.startsWith('DOCKER <kill>')).length, 1)
+	assert.ok(result.calls.includes('<gateway-tilda-images>'), result.calls)
+	assert.ok(result.calls.includes('<gateway-tilda-http> <legacy>'), result.calls)
+	assert.ok(result.calls.includes('<gateway-tilda-http> <tilda>'), result.calls)
+	assert.ok(result.calls.split('GATEWAY_ALL_PROJECTS').length >= 5, result.calls)
+	assert.ok(!result.calls.includes('MIGRATE '), result.calls)
+	assert.ok(!result.calls.includes('DATABASE '), result.calls)
+	assert.ok(!result.calls.includes('/services/apps/api-gateway/.env.production'), result.calls)
+})
+
+test('Tilda Gateway rejects source/image/config/lock drift before stopping any runtime', () => {
+	for (const scenario of ['source-drift', 'image-drift', 'prepare-failed', 'build-failed', 'lost-lock', 'foreign-authority', 'owner-hash-drift', 'payload-failed']) {
+		const result = runRuntime(gatewayTildaScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('<up>'), result.calls)
+		assert.ok(!result.calls.includes('<kill>'), result.calls)
+	}
+})
+
+test('Tilda Gateway rolls back only its preserved image after failed replacement, HTTP proof or signal', () => {
+	for (const scenario of ['replace-failed', 'unhealthy', 'http-failed', 'term', 'hup']) {
+		const result = runRuntime(gatewayTildaScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assertOnlyScopedUp(result, ['api-gateway'], true)
+		assert.equal(result.phase, 'rollback')
+		assert.match(result.stderr, /Gateway rollback restored/)
+	}
+})
+
+test('Tilda Gateway refuses recovery if a CRM/SLA neighbor changed or graceful exit is unknown', () => {
+	for (const scenario of ['crm-neighbor-drift', 'stop-timeout', 'still-running']) {
+		const result = runRuntime(gatewayTildaScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('/rollback.json>'), result.calls)
+		assert.match(result.stderr, /RECOVERY_REQUIRED/)
+		assert.ok(!result.calls.includes('<stop>'), result.calls)
+	}
+})
+
 test('real coordinator rejects bad candidate or migration ledger before runtime replacement', () => {
 	for (const scenario of ['prepare-failed', 'ledger-failed', 'build-failed', 'lost-lock']) {
 		const result = runRuntime('operations-runtime', scenario)
@@ -2540,7 +2705,7 @@ test('successful or unknown Identity DDL never restores any old Operations manif
 function runTransport(scenario = 'success', scope = identityScope) {
 	return privateFixture(directory => {
 		const shellPayload = crmScopes.includes(scope) ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
-		const nodePayload = crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
+		const nodePayload = scope === gatewayTildaScope ? 'gateway-tilda-release.mjs' : crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
 		const checkout = join(directory, 'infra')
 		const bin = join(directory, 'bin')
 		const trace = join(directory, 'transport.jsonl')
@@ -2549,6 +2714,7 @@ function runTransport(scenario = 'success', scope = identityScope) {
 		for (const relative of [
 			'scripts/deploy-services-production.sh', 'scripts/deploy-identity-operations-scoped.sh',
 			'scripts/scoped-service-release.mjs', 'scripts/deploy-crm-scoped.sh', 'scripts/crm-release.mjs',
+			'scripts/gateway-tilda-release.mjs',
 			'nginx/backend-api.conf', 'nginx/frontend.conf'
 		]) {
 			if (scenario === 'missing-payload' && relative === 'scripts/' + nodePayload) continue
@@ -2569,6 +2735,7 @@ if (name === 'git') {
     if (scenario === 'untracked-payload' && args.at(-1) === 'scripts/' + process.env.TEST_NODE_PAYLOAD) process.exit(1);
   } else process.exit(81);
 } else if (name === 'sha256sum') {
+  if (args.length === 0) process.stdout.write(crypto.createHash('sha256').update(fs.readFileSync(0)).digest('hex') + '  -\\n');
   for (const filename of args) {
     const hash = scenario === 'invalid-payload-hash' && filename.endsWith(process.env.TEST_SHELL_PAYLOAD)
       ? 'not-a-hash' : crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
@@ -2582,6 +2749,7 @@ if (name === 'git') {
 } else process.exit(82);
 `
 		for (const name of ['git', 'sha256sum', 'ssh-keygen', 'ssh']) writeFileSync(join(bin, name), shim, { mode: 0o700 })
+		if (scope === gatewayTildaScope) symlinkSync(process.execPath, join(bin, 'node'))
 		const identity = join(directory, 'synthetic-key')
 		const knownHosts = join(directory, 'synthetic-known-hosts')
 		writeFileSync(identity, 'synthetic fixture, not a private key\n', { mode: 0o600 })
@@ -2653,6 +2821,20 @@ test('actual transport sends both exact tracked payloads through one pinned SSH 
 	assert.ok(stdin.includes('scoped_deploy_main'))
 	assert.ok(stdin.includes('Scoped payload checksum mismatch'))
 	assert.ok(!stdin.includes('FRONTEND_CONTROLLER'))
+})
+
+test('Tilda Gateway transport carries only its bounded helper envelope and rejects missing or untracked code before SSH', () => {
+	const result = runTransport('success', gatewayTildaScope)
+	assert.equal(result.status, 0, result.stderr); assert.equal(result.calls.length, 1)
+	const encoded = result.calls[0].args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
+	assert.ok(encoded)
+	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
+	assert.equal(parameters[5], gatewayTildaScope)
+	const bytes = gunzipSync(Buffer.from(parameters[13], 'base64'))
+	assert.equal(sha256(bytes), parameters[12]); validateGatewayTildaPayload(bytes)
+	for (const scenario of ['missing-payload', 'untracked-payload', 'oversized-payload', 'forbidden-frontend']) {
+		const rejected = runTransport(scenario, gatewayTildaScope); assert.notEqual(rejected.status, 0, scenario); assert.deepEqual(rejected.calls, [])
+	}
 })
 
 test('actual transport rejects missing/untracked/malformed payload and optional frontend before SSH', () => {

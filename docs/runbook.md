@@ -1345,6 +1345,41 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   43 routes; остальные 42 ordered records должны совпадать. Identity и фаза A
   могут завершиться, пока старая запись ещё существует. Общий `all` contract
   остаётся на 42 маршрутах; этот scoped шаг не ослабляет его.
+- `gateway-tilda-upgrade` — отдельный code-only выпуск только `api-gateway`.
+  Не использовать `gateway-remove-notes`, `all` или повтор CRM/SLA activation.
+  Прежний source Bearer endpoint сохраняется; новый exact POST
+  `/api/v1/crm/intake/ingest/:UUIDv4/tilda` использует один raw
+  `X-WinCRM-Source-Token`, без JWT/Bearer fallback, OPTIONS или query credentials.
+  Маршрут уже покрыт существующим `crm-source` prefix: route JSON, CORS,
+  private ingress, env-файлы, broker и SQL не изменяются.
+  Controller ограничивает Gateway source точной reviewed hash-парой
+  `server.ts`, остальные runtime source/build files неизменны. Образы сравниваются
+  по всем шести compiled JS: меняется только exact `server.js`.
+  Отдельный `gateway-tilda-release.mjs` упаковывается только для этого scope
+  вместе с прежним scoped-validator: exact двухфайловый hash envelope, 256 KiB
+  decoded, helper ≤32 KiB, общий validator ≤144 KiB, прежние 90000 bytes SSH.
+  Это не меняет состав, decoder или budgets reminders/SLA activation payloads.
+  Сначала зафиксировать свежие live Gateway revision/image и полные env hashes,
+  healthy inventory всех Docker projects, диск/RAM. Параметры pinned reusable
+  workflow: `release_scope=gateway-tilda-upgrade`, immutable green
+  `services_revision`, `expected_live_revision` работающего Gateway и
+  `expected_service_env_sha256`, равный canonical `BACKEND_PRODUCTION_ENV_SHA256`.
+  Gateway использует `/opt/winwidget/deploy/backend/.env.production`; отдельный
+  `apps/api-gateway/.env.production` не нужен и не читается. Все дополнительные
+  CRM/Operations baseline/companion/destructive inputs оставить пустыми.
+  Под существующим global lock controller сверяет неизменность canonical,
+  всех owner env и полного CRM env, exact 21 CRM/companion role с четырьмя БД,
+  reminders/SLA markers и всех остальных контейнеров. Только Gateway получает
+  новый image/APP_REVISION; sealed rollback сохраняет его старые image/env.
+  Остановка — TERM с bounded ожиданием, без force-kill; read-only HTTP smoke
+  использует только health и отрицательные auth/path запросы без source token,
+  user JWT, business body или реального обращения. При ошибке автоматический
+  rollback разрешён лишь на точные сохранённые Gateway image/config при
+  подтверждённой неизменности env/соседей и завершённом graceful stop; иначе
+  `RECOVERY_REQUIRED`, protected snapshots сохраняются. После Gateway выпуска
+  сформировать новый 21-role `crmUpgradeBaseline` с новой Gateway revision для
+  отдельного `crm-upgrade`. Публичный успешный Tilda form/replay smoke и
+  авторизованный browser-сценарий не заменяются отрицательной проверкой ingress.
 
 Локальный proof producer не принимает production URL и не восстанавливает
 Operations поверх неё самой. Для проверенной копии backup, receipt и точной

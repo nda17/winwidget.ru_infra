@@ -89,7 +89,7 @@ scoped_set_image_variables() {
 
 scoped_source_compose() {
 	docker compose --profile '*' --project-name winwidget \
-		--env-file "$env_file" "${scoped_env_arguments[@]}" -f "$compose_file" "$@"
+		--env-file "$env_file" ${scoped_env_arguments[@]+"${scoped_env_arguments[@]}"} -f "$compose_file" "$@"
 }
 
 scoped_compose() {
@@ -102,6 +102,10 @@ scoped_compose() {
 scoped_verifier() {
 	local verification_revision="${operations_runtime_revision:-$services_revision}"
 	local -a verifier_mounts=(--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro")
+	if [[ "$release_scope" == gateway-tilda-upgrade ]]; then
+		verifier_mounts=(--volume "$scoped_payload_directory/gateway-tilda-release.mjs:/run/scoped-verifier.mjs:ro"
+			--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro")
+	fi
 	if [[ "$release_scope" == operations-backup-runtime && "${1:-}" == operations-backup-input ]]; then
 		verifier_mounts+=(--volume "$scoped_owner_env:/run/scoped-owner.env:ro")
 	fi
@@ -297,6 +301,140 @@ scoped_verify_target_images() {
 		fi
 		[[ "$image" == "$expected_image" && "$revision" == "$scoped_runtime_revision" ]] || return 1
 	done
+}
+
+scoped_gateway_unpack() {
+	docker run --rm --interactive --network none --read-only --log-driver none --cap-drop ALL \
+		--security-opt no-new-privileges --user 0:0 --memory 128m --cpus 0.5 --pids-limit 32 \
+		--volume "$scoped_payload_directory:/run/payload:rw" --entrypoint node "$scoped_image_id" --input-type=module <<'GATEWAY_TILDA_UNPACK'
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {readFileSync,writeFileSync} from 'node:fs';
+try {
+ const bytes=readFileSync('/run/payload/verifier.mjs'); assert.ok(bytes.length>0&&bytes.length<=262144);
+ const value=JSON.parse(bytes), names=['scoped-service-release.mjs','gateway-tilda-release.mjs'];
+ const exact=(item,keys)=>{assert.ok(item&&typeof item==='object'&&!Array.isArray(item));assert.deepEqual(Object.keys(item).sort(),keys.sort());};
+ exact(value,['schemaVersion','files']);assert.equal(value.schemaVersion,1);assert.ok(Array.isArray(value.files));
+ assert.deepEqual(value.files.map(item=>item.name).sort(),names.sort());
+ const files=value.files.map(item=>{exact(item,['name','sha256','content']);assert.equal(typeof item.content,'string');
+ const data=Buffer.from(item.content,'utf8');assert.ok(data.length>0&&data.length<=(item.name==='scoped-service-release.mjs'?147456:32768));
+ assert.equal(createHash('sha256').update(data).digest('hex'),item.sha256);return {...item,data};});
+ for(const file of files) writeFileSync('/run/payload/'+file.name,file.data,{flag:'wx',mode:0o444});
+} catch {process.stderr.write('Gateway payload rejected; private details suppressed.\n');process.exitCode=1;}
+GATEWAY_TILDA_UNPACK
+}
+
+scoped_gateway_source() {
+	local changes path
+	changes="$(git -C "$release_root" diff --name-only "$expected_live_revision" "$services_revision" -- apps/api-gateway)" || return 1
+	[[ -n "$changes" ]] || return 1
+	while IFS= read -r path; do
+		case "$path" in apps/api-gateway/src/server.ts|apps/api-gateway/test/crm-source.test.ts|apps/api-gateway/README.md) ;; *) return 1 ;; esac
+	done <<<"$changes"
+	git -C "$release_root" show "$expected_live_revision:apps/api-gateway/src/server.ts" >"$scoped_work_directory/gateway-source-before.ts" || return 1
+	install -m 600 "$release_root/apps/api-gateway/src/server.ts" "$scoped_work_directory/gateway-source-after.ts" || return 1
+	chmod 600 "$scoped_work_directory/gateway-source-before.ts" || return 1
+	scoped_verifier gateway-tilda-source || return 1
+}
+
+scoped_gateway_neighbors() {
+	local ids id result
+	local -a all_ids=()
+	ids="$(docker ps --all --no-trunc --format '{{.ID}}')" || return 1
+	while IFS= read -r id; do [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1; all_ids+=("$id"); done <<<"$ids"
+	docker inspect "${all_ids[@]}" >"$scoped_work_directory/gateway-neighbors.json" || return 1
+	chmod 600 "$scoped_work_directory/gateway-neighbors.json" || return 1
+	result="$(scoped_verifier gateway-tilda-neighbors)" || return 1
+	[[ "$result" =~ ^[a-f0-9]{64}$ ]] || return 1
+	printf '%s' "$result"
+}
+
+scoped_gateway_fence() {
+	local current
+	(scoped_assert_unchanged_neighbors && scoped_assert_hash "$scoped_gateway_crm_env" "$scoped_gateway_crm_hash") || return 1
+	current="$(scoped_gateway_neighbors)" || return 1
+	[[ "$current" == "$scoped_gateway_neighbors_before" ]] || return 1
+}
+
+scoped_gateway_http() {
+	docker run --rm --network host --read-only --cap-drop ALL --security-opt no-new-privileges \
+		--user node --memory 128m --cpus 0.5 --pids-limit 32 \
+		--env SCOPED_SCOPE=gateway-tilda-upgrade \
+		--volume "$scoped_payload_directory/gateway-tilda-release.mjs:/run/scoped-verifier.mjs:ro" \
+		--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro" \
+		--entrypoint timeout "$scoped_image_id" --signal=TERM --kill-after=5s 35s \
+		node /run/scoped-verifier.mjs gateway-tilda-http "$1" || return 1
+}
+
+scoped_gateway_rollback() {
+	local id image revision
+	id="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=api-gateway --format '{{.ID}}')" || return 1
+	[[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+	read -r image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
+	[[ "$image $revision" == "$scoped_image_id $services_revision" || "$image $revision" == "$scoped_gateway_previous_image $expected_live_revision" ]] || return 1
+	scoped_gateway_fence || return 1
+	scoped_workers_graceful_stop "$id" || return 1
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || return 1
+	scoped_gateway_fence || return 1
+	scoped_compose rollback up -d --no-build --no-deps --force-recreate api-gateway >/dev/null 2>&1 || return 1
+	scoped_wait_healthy || return 1
+	id="$(scoped_container_id api-gateway)" || return 1
+	[[ "$(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")" == "$scoped_gateway_previous_image $expected_live_revision" ]] || return 1
+	(scoped_gateway_http legacy && scoped_gateway_fence) || return 1
+}
+
+scoped_deploy_gateway_tilda() {
+	local image_tag image_revision key value count=0
+	scoped_gateway_previous_image="$1"; scoped_gateway_previous_id="$2"
+	[[ -z "$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_operations_api_revision$expected_support_env_sha256" ]] || die 'Gateway Tilda release accepts no foreign or destructive authority.'
+	[[ -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}" && "$(docker context inspect --format '{{.Endpoints.docker.Host}}')" == unix:///var/run/docker.sock ]] || die 'Gateway release requires the local production daemon.'
+	scoped_gateway_crm_env="$app_root/deploy/backend/crm/.env.production"
+	assert_root_owned_file "$scoped_gateway_crm_env"
+	scoped_gateway_crm_hash="$(sha256sum "$scoped_gateway_crm_env" | awk '{print $1}')"
+	scoped_assert_hash "$scoped_gateway_crm_env" "$scoped_gateway_crm_hash"
+	while IFS='=' read -r key value || [[ -n "$key" ]]; do
+		case "$key" in
+			CRM_RABBITMQ_CONTRACT) (( (count & 1) == 0 )) && [[ "$value" == mvp-v1 ]] || die 'Gateway requires one active CRM contract.'; count=$((count | 1)) ;;
+			CRM_REMINDERS_RABBITMQ_CONTRACT) (( (count & 2) == 0 )) && [[ "$value" == task-reminders-v1 ]] || die 'Gateway must preserve one reminders activation marker.'; count=$((count | 2)) ;;
+			CRM_INTAKE_SLA_RABBITMQ_CONTRACT) (( (count & 4) == 0 )) && [[ "$value" == intake-sla-v1 ]] || die 'Gateway must preserve one Intake SLA activation marker.'; count=$((count | 4)) ;;
+		esac
+	done <"$env_file"
+	[[ "$count" == 7 ]] || die 'Gateway activation markers are missing or duplicated.'
+	scoped_gateway_neighbors_before="$(scoped_gateway_neighbors)" || die 'Gateway requires the full healthy CRM/SLA and neighbor baseline.'
+	scoped_gateway_source || die 'Gateway source exceeds the exact reviewed Tilda-only change.'
+	scoped_gateway_http legacy || die 'Preserved Gateway auth/readiness contract is not ready.'
+	docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user node \
+		--env SCOPED_SCOPE=gateway-tilda-upgrade \
+		--volume "$scoped_payload_directory/gateway-tilda-release.mjs:/run/scoped-verifier.mjs:ro" \
+		--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro" \
+		--entrypoint node "$1" /run/scoped-verifier.mjs gateway-tilda-image >"$scoped_work_directory/gateway-image-before.json" || die 'Cannot inspect preserved Gateway code.'
+	image_tag="winwidget-api-gateway:git-$services_revision"
+	docker build --build-arg "APP_REVISION=$services_revision" --tag "$image_tag" "$release_root/apps/api-gateway" >/dev/null 2>&1 || die 'Gateway immutable image build failed.'
+	read -r scoped_image_id image_revision < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_tag")
+	[[ "$scoped_image_id" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" ]] || die 'Gateway image differs from the exact green revision.'
+	docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user node \
+		--env SCOPED_SCOPE=gateway-tilda-upgrade \
+		--volume "$scoped_payload_directory/gateway-tilda-release.mjs:/run/scoped-verifier.mjs:ro" \
+		--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro" \
+		--entrypoint node "$scoped_image_id" /run/scoped-verifier.mjs gateway-tilda-image >"$scoped_work_directory/gateway-image-after.json" || die 'Cannot inspect candidate Gateway code.'
+	chmod 600 "$scoped_work_directory/gateway-image-before.json" "$scoped_work_directory/gateway-image-after.json"
+	scoped_verifier gateway-tilda-images || die 'Gateway image changes code outside the exact Tilda adapter.'
+	export APP_VERSION="git-$services_revision" APP_REVISION="$services_revision"
+	scoped_source_compose config --format json >"$scoped_work_directory/compose.json"
+	docker inspect "$scoped_gateway_previous_id" >"$scoped_work_directory/live.json"
+	docker image inspect "$scoped_image_id" >"$scoped_work_directory/image.json"
+	chmod 600 "$scoped_work_directory/compose.json" "$scoped_work_directory/live.json" "$scoped_work_directory/image.json"
+	scoped_verifier prepare || die 'Gateway candidate changes routes, env or runtime configuration.'
+	scoped_gateway_fence || die 'Gateway preflight baseline drifted.'
+	[[ "$(scoped_container_id api-gateway)" == "$scoped_gateway_previous_id" ]] || die 'Gateway identity changed before stop.'
+	scoped_gateway_stop_started=true
+	scoped_workers_graceful_stop "$scoped_gateway_previous_id" || die 'Gateway graceful exit was not proven; no forced kill.'
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$scoped_gateway_previous_id")" == 'false 0' ]] || die 'Preserved Gateway is not physically stopped.'
+	scoped_gateway_fence || die 'Gateway post-stop baseline drifted.'
+	scoped_cutover_started=true
+	scoped_compose desired up -d --no-build --no-deps --force-recreate api-gateway >/dev/null 2>&1 || die 'Gateway replacement failed.'
+	(scoped_wait_healthy && scoped_verify_target_images && scoped_gateway_http tilda && scoped_gateway_fence) || die 'Gateway Tilda postflight failed.'
+	printf 'Gateway Tilda code-only release completed without env/routes/CRM changes: infra=%s services=%s\n' "$infra_revision" "$services_revision"
 }
 
 scoped_assert_worker_source() {
@@ -930,6 +1068,12 @@ scoped_cleanup() {
 		else
 			printf '%s\n' 'RECOVERY_REQUIRED: pre-DDL Operations restart needs operator verification.' >&2
 		fi
+	elif [[ "$exit_code" != 0 && "$release_scope" == gateway-tilda-upgrade && "${scoped_gateway_stop_started:-false}" == true ]]; then
+		if scoped_gateway_rollback; then
+			printf '%s\n' 'Gateway rollback restored its exact preserved image/config; routes, env and CRM/SLA neighbors are unchanged.' >&2
+		else
+			printf '%s\n' 'RECOVERY_REQUIRED: Gateway identity, graceful stop or unchanged baseline is unproven; no forced stop or unrelated replacement was attempted.' >&2
+		fi
 	elif [[ "$exit_code" != 0 && "$release_scope" == platform-marketing-runtime && "${scoped_cutover_started:-false}" == true ]]; then
 		if scoped_platform_rollback; then
 			printf '%s\n' 'Platform rollback restored the preserved API; content/version, database and all neighbors are unchanged.' >&2
@@ -987,7 +1131,7 @@ scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
-	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
+	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|gateway-tilda-upgrade|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'
 	[[ "$(stat -Lc '%d:%i' "/proc/self/fd/$deploy_lock_fd")" == "$(stat -c '%d:%i' "$deploy_lock")" ]] ||
@@ -1000,11 +1144,17 @@ scoped_deploy_main() {
 		identity-with-operations-manifest) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-runtime | operations-backup-runtime) scoped_owner=operations; scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-backlog-backup | operations-backlog-finalize) scoped_owner=operations; scoped_targets=() ;;
-		gateway-remove-notes) scoped_owner=api-gateway; scoped_targets=(api-gateway) ;;
+		gateway-remove-notes | gateway-tilda-upgrade) scoped_owner=api-gateway; scoped_targets=(api-gateway) ;;
 	esac
 	scoped_owner_env="$services_repository/apps/$scoped_owner/.env.production"
+	if [[ "$release_scope" == gateway-tilda-upgrade ]]; then
+		# Gateway is configured by the canonical backend env, not a domain-owner file.
+		scoped_owner_env="$env_file"
+		[[ "$expected_service_env_sha256" == "$expected_env_sha256" ]] || die 'Gateway owner hash must match the unchanged canonical env.'
+	fi
 	scoped_assert_hash "$scoped_owner_env" "$expected_service_env_sha256"
 	scoped_env_arguments=(--env-file "$scoped_owner_env")
+	if [[ "$release_scope" == gateway-tilda-upgrade ]]; then scoped_env_arguments=(); fi
 	if [[ "$release_scope" == workers-bootstrap-recovery ]]; then
 		[[ "$expected_operations_revision" == "$expected_live_revision" ]] || die 'Worker owners must share the approved live revision.'
 		scoped_assert_hash "$services_repository/apps/operations/.env.production" "$expected_operations_env_sha256"
@@ -1054,6 +1204,11 @@ scoped_deploy_main() {
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
+	if [[ "$release_scope" == gateway-tilda-upgrade ]]; then
+		scoped_gateway_unpack || die 'Gateway helper envelope is invalid.'
+		scoped_deploy_gateway_tilda "$old_image" "$id"
+		return
+	fi
 	if [[ "$release_scope" == operations-backup-runtime ]]; then
 		scoped_deploy_operations_backups
 		return

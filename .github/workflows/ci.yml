@@ -97,6 +97,7 @@ jobs:
           bash -n scripts/deploy-identity-operations-scoped.sh
           shellcheck -x scripts/deploy-identity-operations-scoped.sh
           node --check scripts/scoped-service-release.mjs
+          node --check scripts/gateway-tilda-release.mjs
           bash -n scripts/deploy-crm-scoped.sh
           shellcheck -x scripts/deploy-crm-scoped.sh
           node --check scripts/crm-release.mjs
