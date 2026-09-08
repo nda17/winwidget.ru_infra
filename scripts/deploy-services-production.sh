@@ -203,7 +203,8 @@ if [[ "$release_scope" == crm-reminders-activate || "$release_scope" == crm-inta
 	fi
 	scoped_envelope="$(REMINDERS_ACTIVATION_SCOPE="$release_scope" node "$scoped_node_file" pack)" || die 'Cannot package the bounded reminders payload.'
 	scoped_node_sha256="$(printf '%s' "$scoped_envelope" | sha256sum | awk '{print $1}')"
-	scoped_node_base64="$(printf '%s' "$scoped_envelope" | gzip -n -6 -c | base64 | tr -d '\n')"
+	# Preserve the existing SSH envelope limit as reviewed owner checks grow.
+	scoped_node_base64="$(printf '%s' "$scoped_envelope" | gzip -n -9 -c | base64 | tr -d '\n')"
 	unset scoped_envelope
 fi
 if [[ "$release_scope" == crm-customers-provider-config ]]; then

@@ -56,7 +56,7 @@ test('private parser and immutable payload refuse duplicates, traversal, altered
 		REMINDERS_PAYLOAD_FILES.length
 	)
 	assert.ok(
-		gzipSync(pack.stdout).toString('base64').length +
+		gzipSync(pack.stdout, { level: 9 }).toString('base64').length +
 			gzipSync(shell).toString('base64').length <=
 			112000
 	)
@@ -168,7 +168,7 @@ test('SLA packaging is bounded, kind-specific and its readiness cannot use Sales
 	)
 	assert.throws(() => validateRemindersPayload(pack.stdout))
 	assert.ok(
-		gzipSync(pack.stdout).toString('base64').length +
+		gzipSync(pack.stdout, { level: 9 }).toString('base64').length +
 			gzipSync(shell).toString('base64').length <=
 			116000
 	)
@@ -176,6 +176,14 @@ test('SLA packaging is bounded, kind-specific and its readiness cannot use Sales
 		new URL('./deploy-services-production.sh', import.meta.url),
 		'utf8'
 	)
+	const remindersPacking = router.slice(
+		router.indexOf('scoped_envelope="$(REMINDERS_ACTIVATION_SCOPE='),
+		router.indexOf(
+			'if [[ "$release_scope" == crm-customers-provider-config ]]; then',
+			router.indexOf('scoped_envelope="$(REMINDERS_ACTIVATION_SCOPE=')
+		)
+	)
+	assert.match(remindersPacking, /gzip -n -9 -c/)
 	const commandSource = router.slice(
 		router.indexOf("printf -v remote_controller_arguments ' %q'"),
 		router.indexOf('# Stage the complete controller')
@@ -188,7 +196,7 @@ test('SLA packaging is bounded, kind-specific and its readiness cannot use Sales
 	Object.assign(values, {
 		release_scope: 'crm-intake-sla-activate',
 		scoped_shell_base64: gzipSync(shell, { level: 6 }).toString('base64'),
-		scoped_node_base64: gzipSync(pack.stdout, { level: 6 }).toString(
+		scoped_node_base64: gzipSync(pack.stdout, { level: 9 }).toString(
 			'base64'
 		),
 		backend_nginx_base64: readFileSync(
