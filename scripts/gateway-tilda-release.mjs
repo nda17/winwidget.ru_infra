@@ -128,4 +128,3 @@ async function main() {
 	} else throw new Error('Unsupported Gateway verifier action');
 }
 if (process.argv[1] === fileURLToPath(import.meta.url)) main().catch(() => { process.stderr.write('Gateway release verification failed.\n'); process.exitCode = 1; });
-
