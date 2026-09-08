@@ -1479,6 +1479,12 @@ export async function verifyOperationsBackupTrustState(client, target, manifest)
 		assert.match(first.id ?? '', /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/);
 		identity = { kind: 'postgres-database-ledger-anchor.v1', host: '127.0.0.1', port: contract[2], database: session.database,
 			schema, databaseOid: database_oid, anchor: { id: first.id, migrationName: first.migration_name, checksum: first.checksum } };
+	} else if (target === 'widgets') {
+		// Widgets has its own identity shape: id='widgets-service', no service_name.
+		const rows = await client.$queryRawUnsafe('SELECT id, database_id::text AS database_id FROM widgets.service_identity');
+		assert.equal(rows.length, 1); assert.equal(rows[0].id, 'widgets-service');
+		assert.match(rows[0].database_id ?? '', /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+		identity = { kind: 'widgets-service-identity.v1', ...rows[0] };
 	} else {
 		const rows = await client.$queryRawUnsafe(`SELECT id, service_name, database_id::text AS database_id FROM "${schema}".service_identity`);
 		assert.equal(rows.length, 1); assert.equal(rows[0].id, 'singleton'); assert.equal(rows[0].service_name, `${target}-service`);

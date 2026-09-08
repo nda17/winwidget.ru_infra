@@ -281,7 +281,13 @@ test('owner ledger verification uses the ND database anchor and service identiti
 				return [{restricted:true,membership_contract:true,database_owner:true,schema_owner:true,connect:true,no_database_ddl:true,read_schema:true,no_dml:true,no_routine_execute:true}]
 			}
 			if(sql.includes('_prisma_migrations'))return ledger
-			if(sql.includes('service_identity'))return [{id:'singleton',service_name:`${target}-service`,database_id:'11111111-1111-4111-8111-111111111111'}]
+			if(sql.includes('service_identity')){
+				if(target==='widgets'){
+					assert.doesNotMatch(sql,/service_name/)
+					return [{id:'widgets-service',database_id:'11111111-1111-4111-8111-111111111111'}]
+				}
+				return [{id:'singleton',service_name:`${target}-service`,database_id:'11111111-1111-4111-8111-111111111111'}]
+			}
 			if(sql.includes('AS acl_sha256'))return [{acl_sha256:'d'.repeat(64)}]
 			throw Error('Unexpected SQL')
 		}}
