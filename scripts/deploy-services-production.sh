@@ -55,6 +55,7 @@ expected_live_revision="${EXPECTED_LIVE_REVISION:-}"
 expected_service_env_sha256="${EXPECTED_SERVICE_ENV_SHA256:-}"
 expected_crm_upgrade_baseline_sha256="${EXPECTED_CRM_UPGRADE_BASELINE_SHA256:-}"
 expected_crm_commerce_baseline_sha256="${EXPECTED_CRM_COMMERCE_BASELINE_SHA256:-}"
+expected_crm_reminders_baseline_sha256="${EXPECTED_CRM_REMINDERS_BASELINE_SHA256:-}"
 expected_operations_backup_baseline_sha256="${EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256:-}"
 expected_operations_revision="${EXPECTED_OPERATIONS_REVISION:-}"
 expected_operations_api_revision="${EXPECTED_OPERATIONS_API_REVISION:-}"
@@ -66,7 +67,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | billing-crm-commerce-acl)
+	identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | billing-crm-commerce-acl)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -88,6 +89,11 @@ if [[ "$release_scope" == crm-commerce-activate ]]; then
 	[[ "$expected_crm_commerce_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'CRM commerce activation requires an approved exact runtime/env baseline hash.'
 else
 	[[ -z "$expected_crm_commerce_baseline_sha256" ]] || die 'Commerce activation authorization cannot be reused by another scope.'
+fi
+if [[ "$release_scope" == crm-reminders-activate ]]; then
+	[[ "$expected_crm_reminders_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'CRM reminders activation requires an approved exact runtime/env baseline hash.'
+else
+	[[ -z "$expected_crm_reminders_baseline_sha256" ]] || die 'Reminders activation authorization cannot be reused by another scope.'
 fi
 if [[ "$release_scope" == operations-backup-runtime ]]; then
 	[[ "$expected_operations_backup_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Operations backup release requires a fresh approved runtime baseline hash.'
@@ -144,6 +150,9 @@ elif [[ "$release_scope" == billing-crm-commerce-acl ]]; then
 elif [[ "$release_scope" == crm-commerce-activate ]]; then
 	scoped_shell_file="$controller_root/scripts/deploy-crm-commerce-scoped.sh"
 	scoped_node_file="$controller_root/scripts/crm-commerce-activation-cli.mjs"
+elif [[ "$release_scope" == crm-reminders-activate ]]; then
+	scoped_shell_file="$controller_root/scripts/deploy-crm-reminders-scoped.sh"
+	scoped_node_file="$controller_root/scripts/crm-reminders-activation-cli.mjs"
 fi
 command -v gzip >/dev/null || die 'Scoped payload compression is unavailable.'
 for scoped_file in "$scoped_shell_file" "$scoped_node_file"; do
@@ -171,11 +180,26 @@ if [[ "$release_scope" == crm-commerce-activate ]]; then
 	scoped_node_base64="$(printf '%s' "$scoped_envelope" | gzip -n -6 -c | base64 | tr -d '\n')"
 	unset scoped_envelope
 fi
+if [[ "$release_scope" == crm-reminders-activate ]]; then
+	command -v node >/dev/null || die 'Reminders payload packaging requires Node.js.'
+	for scoped_name in crm-reminders-activation-cli.mjs crm-reminders-activation.mjs crm-release.mjs scoped-service-release.mjs crm-broker-bootstrap.mjs crm-broker-topology.mjs crm-reminders-broker-topology.mjs; do
+		git -C "$controller_root" ls-files --error-unmatch "scripts/$scoped_name" >/dev/null 2>&1 || die 'Reminders module is not tracked by immutable Infra.'
+	done
+	scoped_envelope="$(node "$scoped_node_file" pack)" || die 'Cannot package the bounded reminders payload.'
+	scoped_node_sha256="$(printf '%s' "$scoped_envelope" | sha256sum | awk '{print $1}')"
+	scoped_node_base64="$(printf '%s' "$scoped_envelope" | gzip -n -6 -c | base64 | tr -d '\n')"
+	unset scoped_envelope
+fi
 [[ "$scoped_shell_sha256" =~ ^[a-f0-9]{64}$ && "$scoped_node_sha256" =~ ^[a-f0-9]{64}$ &&
 	"$scoped_shell_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ && "$scoped_node_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
 	die 'Cannot encode the immutable scoped deployment payload.'
-(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 90000 )) ||
-	die 'Scoped payload exceeds the bounded SSH argument envelope.'
+if [[ "$release_scope" == crm-reminders-activate || "$release_scope" == crm-commerce-activate ]]; then
+	(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 112000 )) ||
+		die 'Activation payload exceeds the bounded SSH argument envelope.'
+else
+	(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 90000 )) ||
+		die 'Scoped payload exceeds the bounded SSH argument envelope.'
+fi
 
 backend_nginx_file="$controller_root/nginx/backend-api.conf"
 [[ -f "$backend_nginx_file" && ! -L "$backend_nginx_file" ]] ||
@@ -334,6 +358,8 @@ printf -v remote_controller_arguments ' %q' \
 	"$expected_operations_backup_baseline_sha256"
 if [[ "$release_scope" == crm-commerce-activate ]]; then
 	printf -v remote_controller_arguments '%s %q' "$remote_controller_arguments" "$expected_crm_commerce_baseline_sha256"
+elif [[ "$release_scope" == crm-reminders-activate ]]; then
+	printf -v remote_controller_arguments '%s %q %q' "$remote_controller_arguments" '' "$expected_crm_reminders_baseline_sha256"
 fi
 # The remote shell, not this local controller, must expand these variables.
 # shellcheck disable=SC2016
@@ -382,6 +408,7 @@ export expected_operations_api_revision="${18}"
 export expected_crm_upgrade_baseline_sha256="${19}"
 export expected_operations_backup_baseline_sha256="${20}"
 export expected_crm_commerce_baseline_sha256="${21:-}"
+export expected_crm_reminders_baseline_sha256="${22:-}"
 
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'
@@ -570,6 +597,12 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 				rm -f -- "$scoped_payload_directory/$name"
 			done
 		fi
+		if [[ "${release_scope:-all}" == crm-reminders-activate ]]; then
+			local name
+			for name in crm-reminders-activation-cli.mjs crm-reminders-activation.mjs crm-release.mjs scoped-service-release.mjs crm-broker-bootstrap.mjs crm-broker-topology.mjs crm-reminders-broker-topology.mjs; do
+				rm -f -- "$scoped_payload_directory/$name"
+			done
+		fi
 		rm -f -- "$scoped_payload_directory/controller.sh" "$scoped_payload_directory/verifier.mjs"
 		rmdir "$scoped_payload_directory"
 	}
@@ -578,8 +611,13 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		local encoded="$1" destination="$2" size
 		command -v gzip >/dev/null || die 'Scoped payload decompression is unavailable.'
 		[[ "$encoded" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || die 'Invalid compressed scoped payload.'
-		(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 90000 )) ||
-			die 'Invalid bounded compressed scoped payload.'
+		if [[ "${release_scope:-all}" == crm-reminders-activate || "${release_scope:-all}" == crm-commerce-activate ]]; then
+			(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 112000 )) ||
+				die 'Invalid bounded compressed activation payload.'
+		else
+			(( ${#scoped_shell_base64} + ${#scoped_node_base64} <= 90000 )) ||
+				die 'Invalid bounded compressed scoped payload.'
+		fi
 		# The sentinel caps output even for a decompression bomb. pipefail also
 		# rejects truncated archives and gzip errors before any code is exposed.
 		printf '%s' "$encoded" | base64 --decode | gzip -dc | head -c 131073 >"$destination" ||
@@ -591,12 +629,18 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 	}
 	scoped_decode_payload "$scoped_shell_base64" "$scoped_payload_directory/controller.sh"
 	if [[ "${release_scope:-all}" == crm-commerce-activate ]]; then
-		# Only this multi-file scope uses a larger decoded JSON envelope. Existing
-		# scopes retain their decoder, 128 KiB per-file and 90 KiB SSH limits.
+		# Commerce and reminders activation use 512 KiB decoded JSON envelopes
+		# and 112000-byte encoded SSH budgets; each file remains <= 128 KiB.
+		# Other scopes retain the existing decoder and 90000-byte SSH budget.
 		printf '%s' "$scoped_node_base64" | base64 --decode | gzip -dc | head -c 524289 >"$scoped_payload_directory/verifier.mjs" || die 'Commerce envelope decompression failed.'
 		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
 		[[ "$scoped_envelope_size" =~ ^[0-9]+$ ]] || die 'Commerce envelope size is invalid.'
 		(( scoped_envelope_size > 0 && scoped_envelope_size <= 524288 )) || die 'Commerce envelope exceeds its decoded limit.'
+	elif [[ "${release_scope:-all}" == crm-reminders-activate ]]; then
+		printf '%s' "$scoped_node_base64" | base64 --decode | gzip -dc | head -c 524289 >"$scoped_payload_directory/verifier.mjs" || die 'Reminders envelope decompression failed.'
+		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
+		[[ "$scoped_envelope_size" =~ ^[0-9]+$ ]] || die 'Reminders envelope size is invalid.'
+		(( scoped_envelope_size > 0 && scoped_envelope_size <= 524288 )) || die 'Reminders envelope exceeds its decoded limit.'
 	else
 		scoped_decode_payload "$scoped_node_base64" "$scoped_payload_directory/verifier.mjs"
 	fi

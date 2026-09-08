@@ -504,6 +504,34 @@ export function assertOperationsBackupImagePair(before, after) {
 	same(before, after);
 }
 
+// Exact public source pair: Operations 73b372fa/65025008 -> Services 4ca81e6c.
+// Existing APIs remain strict; only this backup-scope gate admits the reviewed
+// owner manifests, with independent live ledger evidence before admission.
+export const OPERATIONS_BACKUP_TRUST = Object.freeze({
+	before: '50bd4c57e04f59cf39239432fc5d949a9d8fedc8f2cee81f1579b31b071bc64e',
+	after: '7060c972da6f5f6c4f7b7f38a72037f208220fcd32dffd109180050e3801d8d0'
+});
+export const OPERATIONS_BACKUP_TRUST_TARGETS = Object.freeze([
+	['notification-delivery', 'NOTIFICATION_DELIVERY_BACKUP_URL', '55432', '6c5bf79e6daeb866f24052f060dd71553cbcbaf8f2fc0edeec139b41769afcd3'],
+	['widgets', 'WIDGETS_BACKUP_URL', '55436', 'fdfd10bc680b6d0692324d38fda39361bd5881f4e76eaca332bb9403f945e059'],
+	['identity', 'IDENTITY_BACKUP_URL', '55438', 'bbdaeb72f8dd8bcba866402a0de492fb7af2146ee6f34fd94a065fe3c29604f1']
+].map(Object.freeze));
+
+export function assertOperationsBackupManifestImages(before, after) {
+	const strip = value => {
+		const { restoreManifestText, ...inventory } = value;
+		assert.ok(typeof restoreManifestText === 'string' && Buffer.byteLength(restoreManifestText) <= 32768);
+		assert.equal(sha256(restoreManifestText), inventory.restoreManifestSha256);
+		return inventory;
+	};
+	const a = strip(before), b = strip(after);
+	if (a.restoreManifestSha256 === b.restoreManifestSha256) return assertOperationsBackupImagePair(a, b);
+	assert.equal(a.restoreManifestSha256, OPERATIONS_BACKUP_TRUST.before);
+	assert.equal(b.restoreManifestSha256, OPERATIONS_BACKUP_TRUST.after);
+	assertOperationsBackupImagePair(a, { ...b, restoreManifestSha256: a.restoreManifestSha256 });
+	// Whole-file hashes pin all seven entries, including the unchanged four.
+}
+
 export function assertOperationsBackupPostflight({ live, desired, image, revision }) {
 	const targets = SCOPED_SERVICES['operations-backup-runtime'];
 	assert.equal(live.length, targets.length); same(Object.keys(desired.services).sort(), [...targets].sort());
@@ -1328,6 +1356,132 @@ export async function verifyOperationsBackupDatabases(value) {
 	return { operations, crm };
 }
 
+export function validateOperationsBackupTrustInput(value) {
+	try {
+		backupProbeRecord(value, ['schemaVersion', 'urls']); assert.equal(value.schemaVersion, 1);
+		assert.ok(Buffer.byteLength(JSON.stringify(value)) <= 16384);
+		backupProbeRecord(value.urls, OPERATIONS_BACKUP_TRUST_TARGETS.map(row => row[0]));
+		for (const [target, , port] of OPERATIONS_BACKUP_TRUST_TARGETS) {
+			const raw = value.urls[target], schema = target.replaceAll('-', '_');
+			assert.ok(typeof raw === 'string' && raw.length > 0 && raw.length <= 4096 && !/[\s\0]/.test(raw));
+			const url = new URL(raw);
+			assert.equal(url.protocol, 'postgresql:'); assert.equal(url.hostname, '127.0.0.1'); assert.equal(url.port, port);
+			assert.equal(url.pathname, `/winwidget_${schema}`); assert.equal(url.hash, '');
+			assert.equal(decodeURIComponent(url.username), `winwidget_${schema}_backup`);
+			assert.ok(url.password && !/[\0\r\n]/.test(decodeURIComponent(url.password)));
+			same([...url.searchParams.keys()].sort(), ['schema', 'sslmode']);
+			assert.equal(url.searchParams.get('schema'), schema); assert.equal(url.searchParams.get('sslmode'), 'disable');
+		}
+		return structuredClone(value);
+	} catch { throw new Error('Invalid Operations trust input; private details suppressed'); }
+}
+
+export function createOperationsBackupTrustInput(desired) {
+	try {
+		const environment = desired.services['operations-worker'].environment;
+		for (const [, key] of OPERATIONS_BACKUP_TRUST_TARGETS) {
+			for (const [name, service] of Object.entries(desired.services))
+				assert.equal(Object.hasOwn(service.environment ?? {}, key), name === 'operations-worker');
+		}
+		return Buffer.from(JSON.stringify(validateOperationsBackupTrustInput({ schemaVersion: 1,
+			urls: Object.fromEntries(OPERATIONS_BACKUP_TRUST_TARGETS.map(([target, key]) => [target, environment[key]])) })));
+	} catch { throw new Error('Cannot prepare Operations trust input; private details suppressed'); }
+}
+
+export async function verifyOperationsBackupTrustState(client, target, manifest) {
+	const contract = OPERATIONS_BACKUP_TRUST_TARGETS.find(row => row[0] === target); assert.ok(contract);
+	const schema = target.replaceAll('-', '_'), principal = `winwidget_${schema}_backup`;
+	assert.equal(manifest.manifestSha256, contract[3]);
+	assert.equal(sha256(JSON.stringify({ schemaVersion: 1, target, migrations: manifest.migrations })), contract[3]);
+	assert.equal((await client.$queryRawUnsafe('SHOW transaction_read_only'))[0]?.transaction_read_only, 'on');
+	assert.match((await client.$queryRawUnsafe('SHOW server_version_num'))[0]?.server_version_num ?? '', /^18\d{4}$/);
+	const [session] = await client.$queryRawUnsafe(`SELECT current_database()::text AS database, current_user::text AS username,
+		session_user::text AS session_user, current_schema()::text AS schema, pg_is_in_recovery() AS recovery,
+		(SELECT oid::text FROM pg_database WHERE datname=current_database()) AS database_oid`);
+	assert.ok(session); const { database_oid, ...binding } = session;
+	same(binding, { database: `winwidget_${schema}`, username: principal, session_user: principal, schema, recovery: false });
+	assert.match(database_oid ?? '', /^[1-9][0-9]{0,9}$/); assert.ok(Number(database_oid) <= 4294967295);
+	const role = await client.$queryRawUnsafe(`SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+		AND NOT rolreplication AND NOT rolbypassrls AS restricted,
+		NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=current_user::regrole OR roleid=current_user::regrole) AS no_memberships,
+		(SELECT pg_get_userbyid(datdba)='winwidget_${schema}_admin' FROM pg_database WHERE datname=current_database()) AS database_owner,
+		(SELECT pg_get_userbyid(nspowner)='winwidget_${schema}_migration' FROM pg_namespace WHERE nspname='${schema}') AS schema_owner,
+		has_database_privilege(current_user,current_database(),'CONNECT') AS connect,
+		NOT has_database_privilege(current_user,current_database(),'CREATE') AS no_database_ddl,
+		has_schema_privilege(current_user,'${schema}','USAGE') AND NOT has_schema_privilege(current_user,'${schema}','CREATE') AS read_schema,
+		NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='${schema}' AND
+		((c.relkind IN ('r','p') AND (has_table_privilege(current_user,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') OR has_any_column_privilege(current_user,c.oid,'INSERT,UPDATE,REFERENCES')))
+		OR (c.relkind='S' AND has_sequence_privilege(current_user,c.oid,'USAGE,UPDATE')))) AS no_dml,
+		NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+		WHERE n.nspname='${schema}' AND has_function_privilege(current_user,p.oid,'EXECUTE')) AS no_routine_execute
+		FROM pg_roles WHERE rolname=current_user`);
+	same(role, [{ restricted: true, no_memberships: true, database_owner: true, schema_owner: true, connect: true, no_database_ddl: true, read_schema: true, no_dml: true, no_routine_execute: true }]);
+	const ledger = await client.$queryRawUnsafe(`SELECT id, migration_name, checksum, finished_at, rolled_back_at FROM "${schema}"._prisma_migrations ORDER BY migration_name`);
+	same(ledger.map(row => ({ name: row.migration_name, checksum: row.checksum })), manifest.migrations);
+	assert.ok(ledger.length && ledger.every(row => row.finished_at && !row.rolled_back_at));
+	let identity;
+	if (target === 'notification-delivery') {
+		// ND has no service_identity: never invent a service UUID. Bind the
+		// endpoint/OID and immutable earliest completed ledger receipt instead.
+		const first = ledger[0]; assert.equal(first.migration_name, '20260727000000_init_notification_delivery');
+		assert.match(first.id ?? '', /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/);
+		identity = { kind: 'postgres-database-ledger-anchor.v1', host: '127.0.0.1', port: contract[2], database: session.database,
+			schema, databaseOid: database_oid, anchor: { id: first.id, migrationName: first.migration_name, checksum: first.checksum } };
+	} else {
+		const rows = await client.$queryRawUnsafe(`SELECT id, service_name, database_id::text AS database_id FROM "${schema}".service_identity`);
+		assert.equal(rows.length, 1); assert.equal(rows[0].id, 'singleton'); assert.equal(rows[0].service_name, `${target}-service`);
+		assert.match(rows[0].database_id ?? '', /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+		identity = { kind: 'service-identity.v1', ...rows[0] };
+	}
+	const acl = await client.$queryRawUnsafe(`SELECT encode(sha256(convert_to(jsonb_build_object(
+		'role', (SELECT jsonb_build_array(rolname,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls) FROM pg_roles WHERE rolname=current_user),
+		'memberships', (SELECT jsonb_agg(jsonb_build_array(roleid::text,member::text,admin_option) ORDER BY roleid,member) FROM pg_auth_members WHERE member=current_user::regrole OR roleid=current_user::regrole),
+		'database', (SELECT jsonb_build_array(pg_get_userbyid(datdba),datacl::text) FROM pg_database WHERE datname=current_database()),
+		'schema', (SELECT jsonb_build_array(pg_get_userbyid(nspowner),nspacl::text) FROM pg_namespace WHERE nspname='${schema}'),
+		'relations', (SELECT jsonb_agg(jsonb_build_array(c.relname,pg_get_userbyid(c.relowner),c.relacl::text) ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='${schema}'),
+		'columns', (SELECT jsonb_agg(jsonb_build_array(c.relname,a.attname,a.attacl::text) ORDER BY c.relname,a.attnum) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='${schema}' AND a.attnum>0 AND NOT a.attisdropped),
+		'routines', (SELECT jsonb_agg(jsonb_build_array(p.oid::regprocedure::text,pg_get_userbyid(p.proowner),p.proacl::text) ORDER BY p.oid::regprocedure::text) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='${schema}'),
+		'defaults', (SELECT jsonb_agg(jsonb_build_array(d.defaclrole::text,d.defaclobjtype,d.defaclacl::text) ORDER BY d.defaclrole,d.defaclobjtype) FROM pg_default_acl d JOIN pg_namespace n ON n.oid=d.defaclnamespace WHERE n.nspname='${schema}')
+	)::text,'UTF8')),'hex') AS acl_sha256`);
+	assert.equal(acl.length, 1); assert.match(acl[0].acl_sha256 ?? '', /^[a-f0-9]{64}$/);
+	return { target, identitySha256: sha256(JSON.stringify(identity)), manifestSha256: manifest.manifestSha256, aclSha256: acl[0].acl_sha256 };
+}
+
+export function assertOperationsBackupTrustProof(value, before, now = Date.now()) {
+	backupProbeRecord(value, ['schemaVersion', 'checkedAt', 'manifestSha256', 'targets']); assert.equal(value.schemaVersion, 1);
+	assert.equal(value.manifestSha256, OPERATIONS_BACKUP_TRUST.after);
+	assert.ok(instant(value.checkedAt) <= now && now - instant(value.checkedAt) <= 60000);
+	same(value.targets.map(row => row.target), OPERATIONS_BACKUP_TRUST_TARGETS.map(row => row[0]));
+	for (const row of value.targets) {
+		backupProbeRecord(row, ['target', 'identitySha256', 'manifestSha256', 'aclSha256']);
+		for (const key of ['identitySha256', 'manifestSha256', 'aclSha256']) assert.match(row[key] ?? '', /^[a-f0-9]{64}$/);
+		assert.equal(row.manifestSha256, OPERATIONS_BACKUP_TRUST_TARGETS.find(item => item[0] === row.target)[3]);
+	}
+	if (before) same({ ...value, checkedAt: before.checkedAt }, before);
+}
+
+export async function verifyOperationsBackupTrustDatabases(value) {
+	const input = validateOperationsBackupTrustInput(value); assert.equal(process.getuid(), 1001);
+	const require = createRequire('/app/package.json'), { PrismaClient } = require('@prisma/operations-client');
+	const bytes = readFileSync('/app/restore-manifests/database-restore-migrations.json');
+	assert.equal(sha256(bytes), OPERATIONS_BACKUP_TRUST.after);
+	const manifests = JSON.parse(bytes).targets, checkedAt = new Date().toISOString(), targets = [];
+	for (const [target] of OPERATIONS_BACKUP_TRUST_TARGETS) {
+		const url = new URL(input.urls[target]);
+		url.searchParams.set('connection_limit', '1'); url.searchParams.set('connect_timeout', '5'); url.searchParams.set('pool_timeout', '5');
+		const client = new PrismaClient({ datasources: { db: { url: url.toString() } }, log: [] });
+		try {
+			targets.push(await client.$transaction(async tx => {
+				await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY'); await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'");
+				await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '1s'");
+				return verifyOperationsBackupTrustState(tx, target, manifests[target]);
+			}, { isolationLevel: 'RepeatableRead', timeout: 10000, maxWait: 5000 }));
+		} finally { await client.$disconnect(); }
+	}
+	const result = { schemaVersion: 1, checkedAt, manifestSha256: OPERATIONS_BACKUP_TRUST.after, targets };
+	assertOperationsBackupTrustProof(result); return result;
+}
+
 async function main() {
 	const action = process.argv[2];
 	if (action === 'operations-backup-fingerprint') {
@@ -1345,9 +1499,20 @@ async function main() {
 			const restore = JSON.parse(readFileSync('/app/restore-manifests/database-restore-migrations.json'));
 			for (const [target, value] of Object.entries(restore.targets)) same(backup.targets[target], value);
 		}
-		process.stdout.write(JSON.stringify(inventory));
+		process.stdout.write(JSON.stringify({ ...inventory, restoreManifestText: readFileSync('/app/restore-manifests/database-restore-migrations.json', 'utf8') }));
 	} else if (action === 'operations-backup-image-pair') {
-		assertOperationsBackupImagePair(JSON.parse(rootFileBytes('/run/scoped/backup-image-before.json')), JSON.parse(rootFileBytes('/run/scoped/backup-image-after.json')));
+		assertOperationsBackupManifestImages(JSON.parse(rootFileBytes('/run/scoped/backup-image-before.json')), JSON.parse(rootFileBytes('/run/scoped/backup-image-after.json')));
+	} else if (action === 'operations-backup-trust-input') {
+		process.stdout.write(createOperationsBackupTrustInput(JSON.parse(rootFileBytes('/run/scoped/desired.json', 4 * 1024 * 1024))));
+	} else if (action === 'operations-backup-trust-database') {
+		assert.equal(process.getuid(), 1001); assert.equal(process.getgid(), 1001);
+		let size = 0; const chunks = [];
+		for await (const chunk of process.stdin) { size += chunk.length; assert.ok(size <= 16384); chunks.push(chunk); }
+		process.stdout.write(JSON.stringify(await verifyOperationsBackupTrustDatabases(JSON.parse(Buffer.concat(chunks).toString('utf8')))));
+	} else if (action === 'operations-backup-trust-pair') {
+		assert.ok(['initial', 'quiet', 'active'].includes(process.argv[3]));
+		assertOperationsBackupTrustProof(JSON.parse(rootFileBytes('/run/scoped/backup-trust-current.json')),
+			process.argv[3] === 'initial' ? undefined : JSON.parse(rootFileBytes('/run/scoped/backup-trust-before.json')));
 	} else if (action === 'operations-backup-input') {
 		process.stdout.write(createOperationsBackupProbeInput(rootFileBytes('/run/scoped-owner.env'), JSON.parse(rootFileBytes('/run/scoped/desired.json', 4 * 1024 * 1024))));
 	} else if (action === 'operations-backup-database') {
@@ -1369,9 +1534,11 @@ async function main() {
 	} else if (action === 'operations-backup-admission') {
 		assert.match(process.env.SCOPED_REVISION ?? '', /^[a-f0-9]{40}$/); assert.match(process.env.SCOPED_INFRA_REVISION ?? '', /^[a-f0-9]{40}$/);
 		assert.equal(operationsBackupFingerprint(JSON.parse(rootFileBytes('/run/scoped/backup-baseline.json', 8 * 1024 * 1024))), process.env.SCOPED_OPERATIONS_BACKUP_BASELINE_SHA256);
+		const trust = JSON.parse(rootFileBytes('/run/scoped/backup-trust-current.json'));
+		assertOperationsBackupTrustProof(trust, JSON.parse(rootFileBytes('/run/scoped/backup-trust-before.json')));
 		const result = { schemaVersion: 1, kind: 'winwidget.operations.backup-runtime-admission.v1', revision: process.env.SCOPED_REVISION, infraRevision: process.env.SCOPED_INFRA_REVISION,
 			baselineSha256: process.env.SCOPED_OPERATIONS_BACKUP_BASELINE_SHA256, imageId: JSON.parse(rootFileBytes('/run/scoped/image.json'))[0].Id,
-			database: JSON.parse(rootFileBytes('/run/scoped/backup-database-current.json')), admittedAt: new Date().toISOString(), recovery: 'FORWARD_ONLY' };
+			database: JSON.parse(rootFileBytes('/run/scoped/backup-database-current.json')), trust, admittedAt: new Date().toISOString(), recovery: 'FORWARD_ONLY' };
 		writeFileSync('/run/scoped/backup-admission.json', JSON.stringify(result), { mode: 0o600, flag: 'wx' });
 	} else if (action === 'operations-backup-postflight') {
 		assertOperationsBackupPostflight({ live: JSON.parse(rootFileBytes('/run/scoped/backup-postflight.json', 4 * 1024 * 1024)), desired: JSON.parse(rootFileBytes('/run/scoped/desired.json', 4 * 1024 * 1024)), image: JSON.parse(rootFileBytes('/run/scoped/image.json'))[0], revision: process.env.SCOPED_REVISION });
@@ -1380,7 +1547,10 @@ async function main() {
 	} else if (action === 'operations-backup-complete') {
 		const admission = JSON.parse(rootFileBytes('/run/scoped/backup-admission.json'));
 		assert.equal(admission.revision, process.env.SCOPED_REVISION);
-		writeFileSync('/run/scoped/backup-completed.json', JSON.stringify({ ...admission, kind: 'winwidget.operations.backup-runtime-completed.v1', completedAt: new Date().toISOString() }), { mode: 0o600, flag: 'wx' });
+		const trust = JSON.parse(rootFileBytes('/run/scoped/backup-trust-current.json'));
+		assertOperationsBackupTrustProof(trust, admission.trust);
+		writeFileSync('/run/scoped/backup-completed.json', JSON.stringify({ ...admission, kind: 'winwidget.operations.backup-runtime-completed.v1',
+			postflight: { trust, database: JSON.parse(rootFileBytes('/run/scoped/backup-database-current.json')) }, completedAt: new Date().toISOString() }), { mode: 0o600, flag: 'wx' });
 	} else if (action === 'platform-image-inventory') platformImageInventory(process.argv[3]);
 	else if (action === 'platform-http') await verifyPlatformHttp(process.argv[3]);
 	else if (action === 'platform-database') await platformDatabaseAction();

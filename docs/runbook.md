@@ -1153,8 +1153,21 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   в inherited image ENV, API, publisher и restore worker. Остальная runtime
   конфигурация, включая root→gosu bootstrap maintenance-worker и его caps,
   сохраняется. Существующие семь restore targets/keyring, Operations schema,
-  generated schema и миграционные файлы должны совпадать до/после; новый
-  backup manifest подписывает 11 целей и сохраняет семь прежних записей.
+  generated schema и миграционные файлы должны совпадать до/после. Для restore
+  JSON разрешён только точный reviewed переход `50bd4c57…` → `7060c972…`:
+  две миграции Identity (workspace/приглашения), одна Widgets (CRM connector),
+  две Notification Delivery (приглашения/reminders); четыре других записи
+  неизменны. Новый backup manifest подписывает 11 целей, его прежние семь
+  записей совпадают с актуальным restore manifest. Это не новые restore права.
+  До первой остановки Operations требуется свежий (не старше 60 секунд)
+  READ ONLY proof трёх owner ledgers через уже существующие worker-only
+  `IDENTITY_BACKUP_URL`, `WIDGETS_BACKUP_URL`, `NOTIFICATION_DELIVERY_BACKUP_URL`.
+  Проверяются точные backup principals, БД/schema, завершённые миграции и ACL;
+  Identity/Widgets связаны service UUID, ND без service_identity — OID БД и
+  immutable first ledger receipt, без выдуманного UUID. Credentials передаются
+  только bounded private stdin, не нужны новые owner env или права. Proof
+  повторяется после остановки и после запуска, identity/ledger/ACL должны
+  совпасть; admission повторно проверяет свежесть и сохраняет proof.
   Один Operations image строится до остановки. Image inventories читаются
   UID1001 без сети/private mounts/capabilities. Root/no-network input probe
   выбирает только Operations migration URL и четыре backup URL; bounded

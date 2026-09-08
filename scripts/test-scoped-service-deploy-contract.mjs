@@ -838,6 +838,11 @@ scoped_backup_runtime_database() {
   [[ "$TEST_SCENARIO" != preflight-failure && "$TEST_SCENARIO" != resume-database-drift ]] || return 1
   printf '{}' >"$scoped_work_directory/backup-database-current.json"
 }
+scoped_backup_runtime_trust() {
+  event "trust $*"
+  [[ "$TEST_SCENARIO" != trust-failure && "$TEST_SCENARIO" != resume-trust-drift ]] || return 1
+  printf '{}' >"$scoped_work_directory/backup-trust-current.json"
+}
 scoped_workers_graceful_stop() { event "stop $*"; [[ "$TEST_SCENARIO" != stop-failure ]]; }
 if [[ "$TEST_RESUME_ONLY" != true ]]; then
   scoped_backup_runtime_resume_original() { event original-resume; [[ "$scoped_backup_admitted" == false ]]; }
@@ -897,6 +902,9 @@ test('backup runtime failures preserve forward recovery after API admission and 
 	const stopped = runBackupRuntimeShell('stop-failure')
 	assert.notEqual(stopped.status, 0); assert.equal(stopped.admission, false)
 	assert.ok(stopped.calls.includes('original-resume')); assert.ok(!stopped.calls.some(row => row.startsWith('compose')))
+	const trust = runBackupRuntimeShell('trust-failure')
+	assert.notEqual(trust.status, 0); assert.equal(trust.admission, false)
+	assert.ok(!trust.calls.some(row => row.startsWith('stop ') || row.startsWith('compose')))
 })
 
 test('backup DB probe uses two isolated processes and fails closed before target launch when input producer fails', () => {
@@ -919,7 +927,7 @@ test('backup original-resume shell starts only four preserved IDs after config, 
 	assert.deepEqual(starts, [`docker start ${[1, 2, 3, 4].map(value => String(value).padStart(64, '0')).join(' ')}`])
 	assert.ok(result.calls.indexOf('verifier operations-backup-original') < result.calls.indexOf(starts[0]))
 	assert.ok(!result.calls.some(row => row.startsWith('compose') || row.includes('--force')))
-	for (const scenario of ['resume-wrong-id', 'resume-config-drift', 'resume-database-drift', 'resume-neighbor-drift', 'resume-after-admission']) {
+	for (const scenario of ['resume-wrong-id', 'resume-config-drift', 'resume-database-drift', 'resume-trust-drift', 'resume-neighbor-drift', 'resume-after-admission']) {
 		const denied = runBackupRuntimeShell(scenario, false, true)
 		assert.notEqual(denied.status, 0, scenario)
 		assert.ok(!denied.calls.some(row => row.startsWith('docker start ') || row.startsWith('compose')), scenario)

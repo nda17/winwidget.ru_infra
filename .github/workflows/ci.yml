@@ -105,6 +105,10 @@ jobs:
           node --check scripts/crm-commerce-activation.mjs
           node --check scripts/crm-commerce-activation-cli.mjs
           node --check scripts/crm-commerce-database.mjs
+          bash -n scripts/deploy-crm-reminders-scoped.sh
+          shellcheck -x scripts/deploy-crm-reminders-scoped.sh
+          node --check scripts/crm-reminders-activation.mjs
+          node --check scripts/crm-reminders-activation-cli.mjs
           bash -n scripts/deploy-billing-crm-acl-scoped.sh
           shellcheck -x scripts/deploy-billing-crm-acl-scoped.sh
           node --check scripts/billing-crm-acl-release.mjs
@@ -166,6 +170,9 @@ jobs:
       - name: Verify CRM preparation and steady-state upgrade preservation contracts
         shell: bash
         run: node --test scripts/test-crm-release.mjs
+
+      - name: Verify isolated CRM reminders activation contracts
+        run: node --test scripts/test-crm-reminders-activation.mjs scripts/test-crm-reminders-controller.mjs
 
       - name: Verify isolated restore rehearsal contract
         shell: bash

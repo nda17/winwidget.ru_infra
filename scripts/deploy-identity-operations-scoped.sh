@@ -764,6 +764,20 @@ scoped_backup_runtime_database() {
 	scoped_verifier operations-backup-database-pair "${1:-quiet}"
 }
 
+scoped_backup_runtime_trust() {
+	local handoff
+	handoff="$(scoped_verifier operations-backup-trust-input)" || return 1
+	[[ -n "$handoff" && ${#handoff} -le 16384 ]] || return 1
+	printf '%s' "$handoff" | docker run --rm --interactive --network host --read-only --cap-drop ALL \
+		--security-opt no-new-privileges --user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 64 --ulimit core=0:0 \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint timeout "$scoped_image_id" --signal=TERM --kill-after=5s 45s \
+		node /run/scoped-verifier.mjs operations-backup-trust-database >"$scoped_work_directory/backup-trust-current.json" 2>/dev/null || return 1
+	unset handoff
+	chmod 600 "$scoped_work_directory/backup-trust-current.json" || return 1
+	scoped_verifier operations-backup-trust-pair "${1:-quiet}"
+}
+
 scoped_backup_runtime_resume_original() {
 	local id name
 	[[ "${scoped_backup_admitted:-false}" == false && "${scoped_cutover_started:-false}" == false ]] || return 1
@@ -777,7 +791,7 @@ scoped_backup_runtime_resume_original() {
 	docker inspect "${scoped_backup_previous_ids[@]}" >"$scoped_work_directory/backup-original.json" || return 1
 	chmod 600 "$scoped_work_directory/backup-original.json" || return 1
 	scoped_verifier operations-backup-original || return 1
-	(scoped_backup_runtime_database quiet && scoped_backup_runtime_neighbors) || return 1
+	(scoped_backup_runtime_database quiet && scoped_backup_runtime_trust quiet && scoped_backup_runtime_neighbors) || return 1
 	docker start "${scoped_backup_previous_ids[@]}" >/dev/null 2>&1 || return 1
 	scoped_wait_healthy || return 1
 	# Starting preserved IDs changes their StartedAt only. Neighbors must still
@@ -823,6 +837,8 @@ scoped_deploy_operations_backups() {
 	scoped_verifier prepare || die 'Operations backup candidate changes unapproved configuration.'
 	scoped_backup_runtime_database initial || die 'Operations/CRM read-only database preflight failed.'
 	install -m 600 "$scoped_work_directory/backup-database-current.json" "$scoped_work_directory/backup-database-before.json"
+	scoped_backup_runtime_trust initial || die 'Restore owner manifest/ledger preflight failed before Operations stop.'
+	install -m 600 "$scoped_work_directory/backup-trust-current.json" "$scoped_work_directory/backup-trust-before.json"
 	[[ "$(scoped_backup_runtime_inventory baseline)" == "$expected_operations_backup_baseline_sha256" ]] || die 'Runtime changed before Operations stop.'
 	scoped_backup_runtime_neighbors || die 'Backup rollout neighbors or env changed.'
 	for directory in "$app_root/deploy/backend/scoped-releases" "$app_root/deploy/backend/scoped-releases/operations-backup-runtime"; do
@@ -831,9 +847,10 @@ scoped_deploy_operations_backups() {
 	done
 	scoped_backup_state_directory="$app_root/deploy/backend/scoped-releases/operations-backup-runtime/$services_revision"
 	[[ ! -e "$scoped_backup_state_directory" && ! -L "$scoped_backup_state_directory" ]] || die 'Existing Operations backup admission requires explicit forward recovery.'
+	scoped_verifier operations-backup-trust-pair quiet || die 'Restore owner proof expired before Operations stop.'
 	scoped_workers_stop_started=true
 	scoped_workers_graceful_stop "${scoped_backup_previous_ids[@]}" || die 'Operations graceful stop is incomplete; no forced replacement.'
-	(scoped_backup_runtime_database quiet && scoped_backup_runtime_neighbors) || die 'Post-stop Operations/CRM proof changed.'
+	(scoped_backup_runtime_database quiet && scoped_backup_runtime_trust quiet && scoped_backup_runtime_neighbors) || die 'Post-stop Operations/CRM/restore owner proof changed.'
 	# API can admit new manual CRM backup jobs too: persist the forward-only
 	# boundary BEFORE the first new process, not merely before the scheduler.
 	install -d -m 700 "$scoped_backup_state_directory"
@@ -855,7 +872,7 @@ scoped_deploy_operations_backups() {
 	docker inspect "${scoped_target_ids[@]}" >"$scoped_work_directory/backup-postflight.json"
 	chmod 600 "$scoped_work_directory/backup-postflight.json"
 	scoped_verifier operations-backup-postflight || die 'Effective Operations configuration differs from approved backup rollout.'
-	(scoped_backup_runtime_database active && scoped_backup_runtime_neighbors) || die 'Operations backup postflight proof failed.'
+	(scoped_backup_runtime_database active && scoped_backup_runtime_trust active && scoped_backup_runtime_neighbors) || die 'Operations backup postflight proof failed.'
 	scoped_verifier operations-backup-complete || die 'Cannot create completed Operations backup receipt.'
 	install -m 600 "$scoped_work_directory/backup-completed.json" "$scoped_backup_state_directory/completed.json"
 	sync -f "$scoped_backup_state_directory/completed.json"

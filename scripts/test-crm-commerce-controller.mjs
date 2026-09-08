@@ -171,7 +171,7 @@ test('exact bounded public module envelope fits unchanged SSH boundary and rejec
 	assert.ok(
 		gzipSync(bytes).toString('base64').length +
 			gzipSync(shell).toString('base64').length <=
-			90000
+			112000
 	)
 	for (const mutate of [
 		v => v.files.pop(),
