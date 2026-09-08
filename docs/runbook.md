@@ -1683,6 +1683,47 @@ tests и read-only replay полного prepare на сохранённом pro
 прошли. Четыре исходных Operations-процесса остались healthy; продолжение —
 только новым green Infra/Services SHA, без повторного запуска старого failed SHA.
 
+Совместимый forward-выпуск `operations-backup-runtime` завершён 08.09.2026:
+Services `3113f4175aa5912c68fd9d9a7e02206003bafab9`, Infra
+`992e85c562dc1e65d383ff295b350ccd5e982849`, production `34240193173` — SUCCESS.
+Обновлены четыре Operations-процесса и CRM backup migration manifests после
+успешного `crm-upgrade` Services `6eab2581089a90ccb88ca08ba9bae0481d483d1e`
+(production `34235994499`) и frontend
+`c193d5bf6d03225c463e6b170617dc9015cb68bf` (production `34237253888`).
+Этот runtime-выпуск не расширяет restore registry и не доказывает внешнюю доставку новых
+CRM-уведомлений или новые авторизованные browser-сценарии.
+
+Отдельная конфигурационная активация `crm-intake-sla-activate` завершена
+08.09.2026 на Services `779da5dfb5e8f421f9d317f5f97531e31428ba4e`,
+pinned Infra `992e85c562dc1e65d383ff295b350ccd5e982849`:
+feature CI `34241736825`, production `34247514494` — SUCCESS.
+Последовательно обновлены ND worker, Intake SLA worker/publisher и Intake API;
+runtime images сохранили revision `6eab2581089a90ccb88ca08ba9bae0481d483d1e`.
+Post-deploy проверка подтвердила healthy CRM-процессы; соседние сервисы,
+платёжные настройки и базовые task reminders сохранены. Правила клиентов
+автоматически не включались, реальная внешняя доставка этим не доказана.
+
+Полные canonical/CRM/ND env синхронизированы локально и на VPS с обратным
+скачиванием и побайтовой проверкой. SHA-256 соответственно:
+`2dbb73cd420be18899a350c6375bac07857c245a48b0937267a7ccdcd4bcff73`,
+`a3c3b245a2fe17bb8f59d4e3baea72cb624d3a7ec838abffff72289b25704f51`,
+`bc8f2e90eaade1120dfe54a4fbb95de9faa83aa4645923a365890616b25ec808`.
+GitHub `BACKEND_PRODUCTION_ENV_SHA256` обновлён на canonical hash.
+Write-once `crm/intake-sla-activation-baseline.json` имеет SHA-256
+`623e94de4212b876017b388f43a7af71c4ca8c97950edde5154823fd41f4fe04`;
+его нельзя перезаписывать или использовать для повторного initial provisioning.
+Следующий code-only CRM upgrade должен сохранять все 21 CRM/companion role,
+включая активные task reminders и Intake SLA.
+
+Локальный frontend checkout переименован в `winwidget.ru_frontends` без
+нового клона, копии или изменения production paths. HEAD/upstream/origin prod
+совпали с `c193d5bf6d03225c463e6b170617dc9015cb68bf`, worktree clean;
+три старых localhost smoke-сервера завершены до перемещения. GitHub API
+08.09.2026 вернул 404 для старого repository ID `1351670384` и обоих
+исторических frontend-имён; в списке доступных репозиториев владельца остались
+только Frontends, Services и Infra. Это проверка отсутствия старого репозитория,
+а не утверждение об успешности ранее отклонённого DELETE.
+
 Первые четыре задания созданы штатным расписанием в 08:52 UTC, не вручную.
 Read-only проверка durable результатов Operations подтвердила `SUCCEEDED`
 для Sales (86 213 bytes), Customers (31 452), Intake (113 412) и Access
