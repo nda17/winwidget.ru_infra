@@ -266,6 +266,83 @@ function harness(sla = false) {
 	}
 }
 
+for (const sla of [false, true]) {
+	const scope = sla ? 'Intake SLA' : 'Sales reminders'
+	const selected = sla
+		? crmIntakeSlaBrokerContract()
+		: crmRemindersBrokerContract()
+	const validate = sla
+		? assertCrmIntakeSlaBrokerSnapshot
+		: assertCrmRemindersBrokerSnapshot
+	const expectedHash = sla
+		? '4a442f4e14e81d272410268059f27484c17076264480ac7c25e4b5b57f2eee71'
+		: '5108568519ff40f5206e99bea4b6baf110ae504d320d31b2df460b095684d8dd'
+	const materialize = topology => {
+		const result = structuredClone(topology)
+		for (const row of result.queues)
+			if (selected.queues.some(queue => queue.name === row.name))
+				row.arguments['x-queue-type'] = 'classic'
+		return result
+	}
+	test(`${scope} accepts materialized classic default and replays the fully provisioned contract unchanged`, async () => {
+		const h = harness(sla)
+		const report = await h.run({
+			readSnapshot: async () => materialize(h.topology)
+		})
+		assert.equal(report.contractSha256, expectedHash)
+		h.topology.queues = materialize(h.topology).queues
+		const before = structuredClone({
+			state: h.state,
+			topology: h.topology
+		})
+		const puts = h.putStates.length
+		assert.equal(validate(h.topology, true).contractSha256, expectedHash)
+		assert.deepEqual(await h.run(), report)
+		assert.equal(h.putStates.length, puts)
+		assert.deepEqual({ state: h.state, topology: h.topology }, before)
+	})
+	test(`${scope} still rejects wrong type, TTL, DLX, extra arguments and non-queue normalization`, async () => {
+		const h = harness(sla)
+		await h.run()
+		const baseline = materialize(h.topology)
+		const queue = topology =>
+			topology.queues.find(row => row.name === selected.queues[0].name)
+		const retry = topology =>
+			topology.queues.find(row =>
+				selected.queues.some(
+					item =>
+						item.name === row.name &&
+						Object.hasOwn(item.arguments, 'x-message-ttl')
+				)
+			)
+		for (const mutate of [
+			topology => (queue(topology).type = 'quorum'),
+			topology => (queue(topology).arguments['x-queue-type'] = 'quorum'),
+			topology => (queue(topology).arguments['x-queue-type'] = null),
+			topology => (queue(topology).arguments = []),
+			topology => retry(topology).arguments['x-message-ttl']++,
+			topology =>
+				(retry(topology).arguments['x-dead-letter-exchange'] = 'wrong'),
+			topology => (queue(topology).arguments['x-max-length'] = 10),
+			topology =>
+				(topology.exchanges[0].arguments['x-queue-type'] = 'classic'),
+			topology =>
+				(topology.bindings.find(
+					row => row.destination === selected.queues[0].name
+				).arguments['x-queue-type'] = 'classic')
+		]) {
+			const changed = structuredClone(baseline)
+			mutate(changed)
+			assert.throws(() => validate(changed, true))
+		}
+		if (!sla) {
+			const changed = structuredClone(baseline)
+			delete queue(changed).arguments['x-queue-type']
+			assert.throws(() => validate(changed, true))
+		}
+	})
+}
+
 test('Intake SLA exact additive topology preserves sixteen kinds and isolates two principals', async () => {
 	const contract = crmIntakeSlaBrokerContract(),
 		h = harness(true)

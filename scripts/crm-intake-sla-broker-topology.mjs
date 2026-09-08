@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from 'node:util'
 import {
 	CRM_REMINDERS_BROKER_VERSION,
 	CRM_REMINDERS_PRINCIPAL,
+	assertClassicQueueArguments,
 	crmReminderBrokerInputs,
 	crmReminderExactPattern,
 	crmReminderNotificationTopology,
@@ -259,13 +260,15 @@ export function assertCrmIntakeSlaBrokerSnapshot(
 		)) {
 			const expected = queues.find(item => item.name === row.name)
 			assert.ok(expected)
+			const { arguments: expectedArguments, ...expectedQueue } = expected
 			for (const [key, value] of Object.entries({
-				...expected,
+				...expectedQueue,
 				type: 'classic',
 				exclusive: false,
 				consumers: 0
 			}))
 				assert.deepEqual(row[key], value)
+			assertClassicQueueArguments(row, expectedArguments)
 			assert.deepEqual(row.effective_policy_definition ?? {}, {})
 		}
 		const actual = []

@@ -359,6 +359,24 @@ export async function readCrmRemindersBrokerSnapshot(
 	throw new Error('CRM reminder broker observation is incomplete')
 }
 
+// Management may materialize the broker's classic default even when assertQueue
+// omitted it. Accept only that exact representation, never other arguments.
+export function assertClassicQueueArguments(row, expected) {
+	assert.equal(row.type, 'classic')
+	assert.ok(
+		row.arguments &&
+			typeof row.arguments === 'object' &&
+			!Array.isArray(row.arguments)
+	)
+	const actual = { ...row.arguments }
+	if (
+		!Object.hasOwn(expected, 'x-queue-type') &&
+		actual['x-queue-type'] === 'classic'
+	)
+		delete actual['x-queue-type']
+	assert.deepEqual(actual, expected)
+}
+
 export function assertCrmRemindersBrokerSnapshot(
 	snapshot,
 	complete = false
@@ -395,7 +413,7 @@ export function assertCrmRemindersBrokerSnapshot(
 		assert.equal(row.exclusive, false)
 		assert.equal(row.auto_delete, false)
 		assert.equal(row.consumers, 0)
-		assert.deepEqual(row.arguments, expected.arguments)
+		assertClassicQueueArguments(row, expected.arguments)
 		assert.deepEqual(row.effective_policy_definition ?? {}, {})
 	}
 	if (complete)
