@@ -40,7 +40,14 @@ Telegram bridge VPS
 Внутренние API, PostgreSQL и RabbitMQ слушают только loopback/private network.
 Публичными являются frontend, system Nginx API и согласованный Telegram relay.
 
-### WinCRM: рабочее приложение в production, платные продажи закрыты
+### WinCRM: рабочее приложение и оплата в production
+
+На 08.09.2026 `BILLING_WINCRM_PAYMENTS_ENABLED`,
+`BILLING_WINCRM_RECONCILIATION_ENABLED` и `CRM_ACCESS_BILLING_ENABLED`
+включены согласованной commerce-активацией. Widgets billing не менялся.
+Это не доказательство реального списания, автопродления или фискализации:
+денежные тестовые платежи агент не выполнял. Ниже указана история первоначального
+закрытого запуска; её значения `false` не являются текущими настройками.
 
 07.09.2026 рабочее приложение открыто на `https://crm.winwidget.ru`.
 Авторизованный browser smoke подтвердил явный запуск Trial на 5 дней
@@ -55,7 +62,8 @@ Native Widgets проверен на собственном тестовом к�
 помечены в названиях и оставлены в рабочем пространстве, реальных рассылок,
 приглашений и платежей не выполнялось. Это не доказательство всех ролей,
 остальных типов виджетов, платных сценариев или мобильной адаптивности.
-Оставшиеся проверки находятся в service backlog; все три paid gates закрыты.
+Оставшиеся проверки находятся в service backlog; в этом первоначальном smoke
+все три paid gates ещё были закрыты.
 
 В `winwidget.ru_services/deploy/docker-compose.crm.yml` описан отдельный
 Compose project `winwidget-crm`. Он не объединяется через `-f` с действующим
@@ -162,8 +170,8 @@ worker/publisher/API, Widgets producer и Identity invitation producer.
 Шесть полных env-файлов повторно скачаны и побайтово совпадают с локальными;
 canonical SHA-256 — `7686a0459809851044ed96d69c44006c226c31354502b925771144640701e325`,
 CRM env — `667977d5260de85dcfbc17ccac618446168773f67af5735ab7003bdbe36b4be1`.
-CI canonical hash обновлён. `BILLING_WINCRM_PAYMENTS_ENABLED` и
-`CRM_ACCESS_BILLING_ENABLED` остаются false. Активация не подключает виджеты
+CI canonical hash обновлён. На этом этапе `BILLING_WINCRM_PAYMENTS_ENABLED` и
+`CRM_ACCESS_BILLING_ENABLED` оставались false. Активация не подключает виджеты
 клиентов автоматически и не импортирует историю.
 
 Первичная цепочка `crm-prepare -> crm-databases -> crm-runtime` уже не подходит
@@ -211,6 +219,59 @@ Services overlays и точную effective-конфигурацию уже ра
 изменения env/ACL блокируют upgrade. При `disabled` сохраняются прежние
 18 процессов и формат baseline без нового поля. Этот вариант не выполняет
 первоначальное включение напоминаний и не создаёт нового broker principal.
+
+### Отдельная активация Intake SLA
+
+`crm-intake-sla-activate` — второй закрытый вариант того же activation controller,
+не общий rollout. Перед ним выполнить code-only `crm-upgrade`: readers Access,
+Intake и Notification Delivery должны уже содержать SLA-контракты. У Intake
+требуется применённая `20260908150000_add_intake_sla` и exact runtime grants.
+При pending этой миграции controller останавливает старую Intake owner-группу
+до SQL/grants, чтобы acceptance-trigger не получил окно `42501`; retry использует
+тот же forward switching marker. Sales task-trigger migrations имеют тот же gate.
+
+Базовые reminders должны уже работать. SLA не включает правила пользователей,
+не импортирует историю и не отправляет provider smoke автоматически. Подготовить
+полные двусторонне синхронизированные canonical/CRM/ND env:
+
+- canonical marker `CRM_INTAKE_SLA_RABBITMQ_CONTRACT=intake-sla-v1` при прежних
+  `CRM_RABBITMQ_CONTRACT=mvp-v1` и `CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1`;
+- CRM `CRM_INTAKE_SLA_ENABLED=true`, отдельные
+  `CRM_INTAKE_SLA_WORKER_DATABASE_URL` (pool 2) и
+  `CRM_INTAKE_SLA_PUBLISHER_DATABASE_URL` (pool 1), тот же собственный Intake DB
+  principal/schema/password, без чужих таблиц;
+- отдельные `CRM_INTAKE_SLA_WORKER_RABBITMQ_URL` и
+  `CRM_INTAKE_SLA_PUBLISHER_RABBITMQ_URL` с различными credentials;
+- парные `CRM_INTAKE_NOTIFICATION_DELIVERY_TOKEN` и
+  `NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN` в соответствующих трёх env,
+  ND `CRM_INTAKE_INTERNAL_BASE_URL=http://127.0.0.1:5310` и прежние 14 kinds
+  плюс `wincrm-intake-sla-email,wincrm-intake-sla-telegram` (ровно 16).
+
+После подготовки вызвать `crmRemindersBaseline(live, gatewayRevision, hashes,
+'winwidget.crm.intake-sla-activation.v1')`. Fresh root-owned `0600` baseline:
+`/opt/winwidget/deploy/backend/crm/intake-sla-activation-baseline.json`.
+Он фиксирует два новых процесса как absent, текущие ND worker и Intake API,
+все неизменные соседние runtime и три полных env hash. Workflow scope —
+`crm-intake-sla-activate`; hash передаётся в существующий
+`expected_crm_reminders_baseline_sha256`. Kind, scope и отдельный journal
+`crm/intake-sla-activations/<services-SHA>/` не допускают повторного использования
+baseline обычных reminders.
+
+Под глобальным lock выполняются read-only DB/ledger/ACL preflight, durable admission,
+additive exact broker provisioning (2 direct exchanges, 12 queues, 18 bindings,
+2 новых principals), затем только ND worker → SLA worker `5317` → SLA publisher
+`5318` → Intake API. Worker только читает свою очередь, publisher пишет только
+свои exchanges и два ND topics; прежние credentials, очереди, содержимое и
+consumers не удаляются. Готовность 16-kind ND проверяется приватным GET до producer.
+Unknown create outcome сохраняет start receipt и допускает только наблюдение,
+не повторный create/rollback. Контроллер не делает HTTP provider sends.
+
+Следующий `crm-upgrade` сохраняет marker и оба overlay, обновляет ровно 21 процесс.
+Baseline требует пятый аргумент `'intake-sla-v1'` после `'task-reminders-v1'`.
+Два SLA процесса входят в существующую Intake owner-группу, выключенный путь
+по-прежнему содержит 18 процессов (19 только с reminders). Нельзя убрать marker,
+overlays или credentials ради прохождения upgrade. Реальные доставка/отмена и
+доступность мобильного UI проверяются отдельно на согласованных пользователях.
 
 Перед запуском нужны свежие read-only свидетельства, не ревизии из исторического
 раздела этого документа:
@@ -1286,7 +1347,25 @@ Backup copies сохраняются до обычного retention; удале
 
 ### Frontend
 
-Текущая production-ревизия четырёх frontend-приложений:
+08.09.2026 четыре frontend-приложения выпущены на
+`73a797a295199b1503d56a823b21286c7ec56db2`: feature CI `34193823444`,
+production deploy `34207115542` — SUCCESS. Выпуск выполнен после Operations
+`3c09cc535256d54519997514e693f0b43c8de143`, который возвращает новые поля
+расписания и 13 backup-целей. Подготовлены UI административных дней/цен CRM,
+`/planner` с переходом со старого `/my-day`, реквизиты/поиск ИНН и часы звонков
+контакта. Авторизованная desktop/mobile проверка именно этой версии,
+формы расписания и lookup выполняется отдельно от зелёного deploy.
+08.09.2026 авторизованный Chrome smoke подтвердил `/planner`, мобильную
+шапку/вертикальную доску на 390×844, mobile company lookup по публичному ИНН
+и явное заполнение реквизитов DaData без сохранения лишней компании.
+Мобильная форма контакта проверена в тёмной теме: выбор Владивостока из списка,
+раздельные часы звонка, доступные footer-кнопки; тема и viewport затем возвращены.
+`/admin/crm` показал редактор цен/двух мест и ручное начисление дней собственной
+CRM; подписки и цены не менялись. `/admin/databases` вернул 13 целей и
+расписание четырёх CRM-баз 05:00/05:15/05:30/05:45 МСК; новые копии не запускались.
+Это не проверка сохранения реквизитов/часов, всех ролей или денежных операций.
+
+Ранее 07.09.2026 была выпущена production-ревизия:
 `d010a3aa67f7290776c2783d82d86e3d0a0ed8ea`, CI `34082138618`, успешный
 deploy `34082579545` от 07.09.2026. Выпуск уточняет только подпись закрытой
 оплаты CRM: «Оплата скоро», отдельно от уже работающего приложения.
@@ -1522,10 +1601,28 @@ trailing slash или дополнительным suffix отклоняются
 
 ## Backup и restore
 
+08.09.2026 scope `operations-backup-runtime` завершён на Services
+`3c09cc535256d54519997514e693f0b43c8de143`, Infra
+`b96e9acd876087edf2a4a37aa1bcf2efdfe77d99`: feature CI `34206229917`,
+production deploy `34206570376` — SUCCESS. Четыре Operations process roles
+обновлены без изменения соседних сервисов и без активации restore.
+Registry содержит 13 backup-целей, 11 подписываемых целей и только семь
+прежних restore-целей; четыре CRM-цели остаются backup-only.
+
+Первые четыре задания созданы штатным расписанием в 08:52 UTC, не вручную.
+Read-only проверка durable результатов Operations подтвердила `SUCCEEDED`
+для Sales (86 213 bytes), Customers (31 452), Intake (113 412) и Access
+(68 433). У каждой записи `archiveDelivered`, `signatureCreated` и
+`signatureDelivered` — `true`: архив и отдельный Ed25519 sidecar отправлены
+в существующий Telegram-канал. Дополнительные dumps или локальные копии
+для этой проверки не создавались. Это доказательство штатной доставки,
+а не destructive restore, crash-recovery или достаточности PITR.
+
 - Плановые backup jobs и policy принадлежат Operations.
 - `maintenance-worker` запускает `pg_dump` read-only backup role.
 - Telegram-копия — временный off-VPS logical backup, не PITR.
-- Для семи restore-targets `maintenance-worker` отправляет рядом с dump
+- Для 11 подписываемых целей (семь restore-targets и четыре CRM backup-only)
+  `maintenance-worker` отправляет рядом с dump
   отдельный `.provenance.json`: exact evidence содержит backup job ID, target,
   имя/размер/SHA-256 artifact, services revision и trusted migration manifest,
   а envelope подписан Ed25519. Старый unsigned dump не является разрешённым
@@ -1649,8 +1746,8 @@ trailing slash или дополнительным suffix отклоняются
   только после выноса control ledger в отдельную невосстанавливаемую границу.
 - Billing временно не является restore target: его backup остаётся активным, а
   restore/ACL rehearsal выполняются только в отдельном платёжном scope.
-- Registry содержит семь остальных active service-owned targets, а каждый
-  target имеет актуальный успешный плановый backup job.
+- Restore registry содержит семь прежних service-owned targets. Четыре CRM
+  backup-only цели не добавляются в permit/restore registry автоматически.
 - Размер dump контролируется до 20 МБ: официальный
   [Telegram Bot API](https://core.telegram.org/bots/api#getfile) может отправить
   до 50 МБ, но стандартный `getFile` автоматически возвращает не более 20 МБ.
@@ -1931,6 +2028,19 @@ frontend Nginx, но не устанавливает bridge-конфигурац
 
 ### Configuration-only подключение DaData после выпуска Customers
 
+08.09.2026 scope завершён на Services
+`db1620642d24252f71f94c9f216149b4d1d1dc1d`, pinned Infra
+`b96e9acd876087edf2a4a37aa1bcf2efdfe77d99`: feature CI `34207420064`,
+production deploy `34210156045` — SUCCESS. Customers API сохранил image
+revision `6bce89bbb202be91cbb94915b4b396ae257c2926`; read-only runtime proof
+вернул только `keyConfigured: true`, без значения ключа. Базовый snapshot
+`crm/customers-provider-baseline.json` имеет SHA-256
+`929843c3776d0d5f02e2f6ac7d139c10416be93525513317b578bf4d13b08086`.
+Повторная первичная активация и перезапись baseline не нужны. Последующий
+авторизованный browser smoke подтвердил поиск ПАО СБЕРБАНК по ИНН 7707083893
+и явное заполнение полей формы; новую компанию не сохраняли.
+Сам config-only deploy не выполнял provider HTTP или бизнес-команды.
+
 Scope `crm-customers-provider-config` применяется только после успешного
 `crm-upgrade` с реализованным server-side adapter. Это не повторный запуск
 `crm-commerce-activate` и не изменение правил code-only upgrade. Единственная
@@ -1944,6 +2054,10 @@ mounts, ports, limits, security, команд или соседних конте
 Закрытые JSON bundles `crm-commerce-activate`, `crm-reminders-activate` и
 `crm-customers-provider-config` ограничены 144 KiB на public-code файл,
 512 KiB на полный decoded envelope и 112000 bytes на encoded SSH payload.
+Закрытый `crm-intake-sla-activate` добавляет один exact topology module: decoded
+лимит прежний, encoded лимит только этого scope — 116000 bytes. Дополнительно
+проверяется полный SSH command с Nginx payload и всеми hashes: меньше 131072 bytes.
+Лимиты остальных scopes не меняются.
 Точные имена файлов, их SHA-256, pinned Infra/Services SHA и scope-specific
 approval обязательны. Приватные env-файлы, shell и остальные одиночные Node
 payloads ограничены прежними 128 KiB. Только точный общий

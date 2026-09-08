@@ -93,10 +93,58 @@ export function crmUpgradeRemindersContractFromEnv(source) {
 	assert.ok(match)
 	return crmUpgradeRemindersContract(match[1].replace(/^['"]|['"]$/g, ''))
 }
-export function crmUpgradeGroups(contract = 'disabled') {
-	return crmUpgradeRemindersContract(contract) === 'disabled'
-		? CRM_UPGRADE_GROUPS
-		: reminderUpgradeGroups
+export function crmUpgradeIntakeSlaContract(
+	value = 'disabled',
+	reminders = 'disabled'
+) {
+	assert.ok(['disabled', 'intake-sla-v1'].includes(value))
+	if (value !== 'disabled')
+		assert.equal(
+			crmUpgradeRemindersContract(reminders),
+			'task-reminders-v1'
+		)
+	return value
+}
+export function crmUpgradeIntakeSlaContractFromEnv(source) {
+	const reminders = crmUpgradeRemindersContractFromEnv(source)
+	const lines = source
+		.split(/\r?\n/)
+		.filter(line =>
+			/^\s*(?:export\s+)?CRM_INTAKE_SLA_RABBITMQ_CONTRACT\b/.test(line)
+		)
+	assert.ok(lines.length <= 1)
+	if (!lines.length) return 'disabled'
+	const match =
+		/^CRM_INTAKE_SLA_RABBITMQ_CONTRACT=(disabled|intake-sla-v1|"(?:disabled|intake-sla-v1)"|'(?:disabled|intake-sla-v1)')$/.exec(
+			lines[0]
+		)
+	assert.ok(match)
+	return crmUpgradeIntakeSlaContract(
+		match[1].replace(/^['"]|['"]$/g, ''),
+		reminders
+	)
+}
+export function crmUpgradeGroups(
+	contract = 'disabled',
+	intakeSlaContract = 'disabled'
+) {
+	const groups =
+		crmUpgradeRemindersContract(contract) === 'disabled'
+			? CRM_UPGRADE_GROUPS
+			: reminderUpgradeGroups
+	return crmUpgradeIntakeSlaContract(intakeSlaContract, contract) ===
+		'disabled'
+		? groups
+		: groups.map(group =>
+				group[0] === 'crm-intake'
+					? Object.freeze([
+							...group.slice(0, -1),
+							'crm-intake-sla-worker',
+							'crm-intake-sla-publisher',
+							group.at(-1)
+						])
+					: group
+			)
 }
 export const CRM_UPGRADE_MIGRATIONS = Object.freeze({
 	identity: {},
@@ -134,17 +182,27 @@ export const CRM_UPGRADE_MIGRATIONS = Object.freeze({
 		'20260907230000_add_reminder_delivery':
 			'd05634a4704c8947cb48a9bf379436e519417545d09ddec6833b1bb692491190',
 		'20260908090000_allow_task_reopen_after_deal_close':
-			'7e5c9fb33cc6451ef5d2fb974e9bf1b018827bbdd0d0d518d60015220280a650'
+			'7e5c9fb33cc6451ef5d2fb974e9bf1b018827bbdd0d0d518d60015220280a650',
+		'20260908120000_add_recurring_task_series':
+			'9a03d38db5037068c19c606d16a2515e3088d51c3e2bd88d60aa8270c87eb318',
+		'20260908130000_add_task_assignment_notifications':
+			'c26b5649ceaace470fcfbe10d76013a7edb7d20192d71669eb999f114fc7c87e',
+		'20260908140000_add_task_notification_center':
+			'799490bcf980d282ef48041934b8728dc6554d0db267455051b145fb0b7eef8a'
 	},
-	'crm-intake': {}
+	'crm-intake': {
+		'20260908150000_add_intake_sla':
+			'589b0303e2153e90d5a2edf6dc9655a1a4d96f59ade4f7057d17419bcd7b3234'
+	}
 })
 const upgradeProject = owner =>
 	owner.startsWith('crm-') ? 'winwidget-crm' : 'winwidget'
 const upgradeKey = item =>
 	`${item.Config?.Labels?.['com.docker.compose.project']}/${item.Config?.Labels?.['com.docker.compose.service']}`
-const upgradeTargetsFor = contract =>
-	crmUpgradeGroups(contract).flatMap(([owner, ...names]) =>
-		names.map(name => `${upgradeProject(owner)}/${name}`)
+const upgradeTargetsFor = (contract, intakeSlaContract) =>
+	crmUpgradeGroups(contract, intakeSlaContract).flatMap(
+		([owner, ...names]) =>
+			names.map(name => `${upgradeProject(owner)}/${name}`)
 	)
 const envObject = entries => {
 	const result = {}
@@ -205,9 +263,13 @@ export function crmUpgradeBaseline(
 	live,
 	gatewayRevision,
 	environmentHashes,
-	remindersContract = 'disabled'
+	remindersContract = 'disabled',
+	intakeSlaContract = 'disabled'
 ) {
-	const upgradeTargets = upgradeTargetsFor(remindersContract)
+	const upgradeTargets = upgradeTargetsFor(
+		remindersContract,
+		intakeSlaContract
+	)
 	assert.ok(Array.isArray(live) && live.length <= 200)
 	assert.equal(new Set(live.map(upgradeKey)).size, live.length)
 	assert.equal(new Set(live.map(item => item.Id)).size, live.length)
@@ -269,14 +331,32 @@ export function crmUpgradeBaseline(
 				'subscription-expiry-telegram',
 				'wincrm-invitation-email',
 				'wincrm-task-reminder-email',
-				'wincrm-task-reminder-telegram'
+				'wincrm-task-reminder-telegram',
+				...(intakeSlaContract === 'disabled'
+					? []
+					: ['wincrm-intake-sla-email', 'wincrm-intake-sla-telegram'])
 			].sort()
 		)
+	}
+	if (intakeSlaContract !== 'disabled') {
+		for (const [name, role] of [
+			['crm-intake-api', 'api'],
+			['crm-intake-sla-worker', 'sla-worker'],
+			['crm-intake-sla-publisher', 'sla-publisher']
+		]) {
+			const env = envObject(
+				live.find(item => upgradeKey(item) === `winwidget-crm/${name}`)
+					.Config.Env
+			)
+			assert.equal(env.CRM_INTAKE_SLA_ENABLED, 'true')
+			assert.equal(env.CRM_INTAKE_PROCESS_ROLE, role)
+		}
 	}
 	return {
 		schemaVersion: 1,
 		kind: 'winwidget.crm.upgrade-baseline.v1',
 		...(remindersContract === 'disabled' ? {} : { remindersContract }),
+		...(intakeSlaContract === 'disabled' ? {} : { intakeSlaContract }),
 		gatewayRevision,
 		environmentHashes,
 		neighborsSha256: crmNeighborFingerprint(
@@ -373,7 +453,10 @@ export function crmUpgradeImageSource(prismaRoot) {
 
 export function crmUpgradeOldImages(baseline, owner) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
-	const group = crmUpgradeGroups(baseline.remindersContract)
+	const group = crmUpgradeGroups(
+		baseline.remindersContract,
+		baseline.intakeSlaContract
+	)
 		.find(([name]) => name === owner)
 		.slice(1)
 	const values = [
@@ -492,7 +575,9 @@ export function crmUpgradeLedger(owner, files, rows, complete = false) {
 	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
 	if (
 		owner === 'notification-delivery' &&
-		rows.some(row => CRM_NOTIFICATION_RECOVERY_ROWS.some(known => known.id === row.id))
+		rows.some(row =>
+			CRM_NOTIFICATION_RECOVERY_ROWS.some(known => known.id === row.id)
+		)
 	)
 		assertNotificationRecovery(files, rows)
 	const applied = new Set()
@@ -541,6 +626,27 @@ export function crmUpgradeLedger(owner, files, rows, complete = false) {
 	return pending
 }
 
+export function crmUpgradeTaskWriterStop(owner, pending) {
+	assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
+	assert.ok(Array.isArray(pending))
+	assert.ok(
+		pending.every(name =>
+			Object.hasOwn(CRM_UPGRADE_MIGRATIONS[owner], name)
+		)
+	)
+	return (
+		(owner === 'crm-intake' &&
+			pending.includes('20260908150000_add_intake_sla')) ||
+		(owner === 'crm-sales' &&
+			pending.some(name =>
+				[
+					'20260908130000_add_task_assignment_notifications',
+					'20260908140000_add_task_notification_center'
+				].includes(name)
+			))
+	)
+}
+
 export function crmUpgradeFence(
 	live,
 	baseline,
@@ -549,8 +655,14 @@ export function crmUpgradeFence(
 ) {
 	assert.equal(baseline.kind, 'winwidget.crm.upgrade-baseline.v1')
 	assert.equal(baseline.schemaVersion, 1)
-	const groups = crmUpgradeGroups(baseline.remindersContract)
-	const upgradeTargets = upgradeTargetsFor(baseline.remindersContract)
+	const groups = crmUpgradeGroups(
+		baseline.remindersContract,
+		baseline.intakeSlaContract
+	)
+	const upgradeTargets = upgradeTargetsFor(
+		baseline.remindersContract,
+		baseline.intakeSlaContract
+	)
 	assert.deepEqual(
 		Object.keys(baseline.targets).sort(),
 		[...upgradeTargets].sort()
@@ -745,6 +857,30 @@ function upgradeCompanionConfiguration(service, live, image) {
 	)
 }
 
+// canonical ND env already contains sixteen kinds. The base Compose reads that
+// same variable, while its reminder-only overlay explicitly selects fourteen.
+// Reconstruct only this known intermediate field; final desired env still must
+// equal the captured runtime byte-for-byte apart from APP_REVISION below.
+export function crmUpgradeSlaNotificationBase(base, reminders, final) {
+	const copy = structuredClone(base)
+	const environment = config =>
+		config.services['notification-delivery-worker'].environment
+	const before = environment(copy),
+		middle = environment(reminders),
+		after = environment(final)
+	assert.equal(
+		before.NOTIFICATION_DELIVERY_KINDS,
+		after.NOTIFICATION_DELIVERY_KINDS
+	)
+	assert.equal(
+		after.NOTIFICATION_DELIVERY_KINDS,
+		middle.NOTIFICATION_DELIVERY_KINDS +
+			',wincrm-intake-sla-email,wincrm-intake-sla-telegram'
+	)
+	before.NOTIFICATION_DELIVERY_KINDS = middle.NOTIFICATION_DELIVERY_KINDS
+	return copy
+}
+
 export function crmUpgradeDesired(
 	{
 		crm,
@@ -753,14 +889,32 @@ export function crmUpgradeDesired(
 		live,
 		baseline,
 		servicesRevision,
-		reminderBase
+		reminderBase,
+		intakeSlaBase
 	},
 	validateCrmCompose,
-	validateCrmReminderDeployment
+	validateCrmReminderDeployment,
+	validateCrmIntakeSlaDeployment
 ) {
 	assert.ok(revision(servicesRevision))
 	const contract = crmUpgradeRemindersContract(baseline.remindersContract)
-	const groups = crmUpgradeGroups(contract)
+	const slaContract = crmUpgradeIntakeSlaContract(
+		baseline.intakeSlaContract,
+		contract
+	)
+	const groups = crmUpgradeGroups(contract, slaContract)
+	if (slaContract === 'disabled') assert.equal(intakeSlaBase, undefined)
+	else {
+		assert.ok(
+			intakeSlaBase && typeof validateCrmIntakeSlaDeployment === 'function'
+		)
+		validateCrmIntakeSlaDeployment({
+			crmBefore: intakeSlaBase.crm,
+			crmAfter: crm,
+			notificationBefore: intakeSlaBase.notification,
+			notificationAfter: reminderBase.notificationAfter
+		})
+	}
 	if (contract === 'disabled') {
 		assert.equal(reminderBase, undefined)
 		validateCrmCompose(crm)
@@ -771,9 +925,10 @@ export function crmUpgradeDesired(
 		validateCrmCompose(reminderBase.crm)
 		validateCrmReminderDeployment({
 			crmBefore: reminderBase.crm,
-			crmAfter: crm,
+			crmAfter: intakeSlaBase?.crm ?? crm,
 			notificationBefore: reminderBase.notification,
-			notificationAfter: reminderBase.notificationAfter
+			notificationAfter:
+				intakeSlaBase?.notification ?? reminderBase.notificationAfter
 		})
 		assert.deepEqual(
 			companions.services['notification-delivery-worker'],
@@ -847,7 +1002,14 @@ export function crmUpgradeDesired(
 				)
 				candidate.Config.Labels['org.opencontainers.image.revision'] =
 					servicesRevision
-				crmRuntimeContainer(candidate, config, images, name, contract)
+				crmRuntimeContainer(
+					candidate,
+					config,
+					images,
+					name,
+					contract,
+					slaContract
+				)
 			} else upgradeCompanionConfiguration(service, current, image)
 			delete service.build
 			delete service.depends_on
@@ -1359,13 +1521,26 @@ async function crmUpgradeCommand(mode) {
 				process.env.CRM_REMINDERS_RABBITMQ_CONTRACT
 			)
 		)
+		assert.equal(
+			crmUpgradeIntakeSlaContract(
+				baseline.intakeSlaContract,
+				baseline.remindersContract
+			),
+			crmUpgradeIntakeSlaContract(
+				process.env.CRM_INTAKE_SLA_RABBITMQ_CONTRACT,
+				process.env.CRM_REMINDERS_RABBITMQ_CONTRACT
+			)
+		)
 		return baseline
 	}
-	if (mode === 'upgrade-contract') {
+	if (mode === 'upgrade-contract' || mode === 'upgrade-sla-contract') {
 		const file = '/run/crm/canonical.env'
 		assert.ok(lstatSync(file).size <= 1048576)
 		process.stdout.write(
-			crmUpgradeRemindersContractFromEnv(readFileSync(file, 'utf8')) + '\n'
+			(mode === 'upgrade-contract'
+				? crmUpgradeRemindersContractFromEnv
+				: crmUpgradeIntakeSlaContractFromEnv)(readFileSync(file, 'utf8')) +
+				'\n'
 		)
 		return undefined
 	}
@@ -1375,6 +1550,10 @@ async function crmUpgradeCommand(mode) {
 			process.env.CRM_GATEWAY_REVISION,
 			JSON.parse(process.env.CRM_UPGRADE_ENV_HASHES),
 			crmUpgradeRemindersContract(
+				process.env.CRM_REMINDERS_RABBITMQ_CONTRACT
+			),
+			crmUpgradeIntakeSlaContract(
+				process.env.CRM_INTAKE_SLA_RABBITMQ_CONTRACT,
 				process.env.CRM_REMINDERS_RABBITMQ_CONTRACT
 			)
 		)
@@ -1436,7 +1615,11 @@ async function crmUpgradeCommand(mode) {
 	if (mode === 'upgrade-pending') {
 		const owner = process.argv[3]
 		assert.ok(Object.hasOwn(CRM_UPGRADE_MIGRATIONS, owner))
-		return json(`${owner}-database-after`).pending.length
+		const pending = json(`${owner}-database-after`).pending
+		if (process.argv[4] === 'task-writers')
+			return Number(crmUpgradeTaskWriterStop(owner, pending))
+		assert.ok(!process.argv[4])
+		return pending.length
 	}
 	if (mode === 'upgrade-grants') {
 		const owner = process.argv[3]
@@ -1503,9 +1686,37 @@ async function crmUpgradeCommand(mode) {
 			? (await import('/run/crm-reminders-compose-validator.mjs'))
 					.validateCrmReminderDeployment
 			: undefined
+		const sla =
+			crmUpgradeIntakeSlaContract(
+				baseline.intakeSlaContract,
+				baseline.remindersContract
+			) !== 'disabled'
+		const validateSla = sla
+			? (await import('/run/crm-intake-sla-compose-validator.mjs'))
+					.validateCrmIntakeSlaDeployment
+			: undefined
 		const billing = json('billing'),
 			identity = json('identity'),
 			notification = json('notification-delivery')
+		const intakeSlaBase = sla
+			? {
+					crm: json('crm-reminders'),
+					notification: json('notification-delivery-reminders')
+				}
+			: undefined
+		const reminderBase = enabled
+			? {
+					crm: json('crm-base'),
+					notification: sla
+						? crmUpgradeSlaNotificationBase(
+								json('notification-delivery-base'),
+								intakeSlaBase.notification,
+								notification
+							)
+						: json('notification-delivery-base'),
+					notificationAfter: notification
+				}
+			: undefined
 		const companions = {
 			name: 'winwidget',
 			services: {
@@ -1525,18 +1736,12 @@ async function crmUpgradeCommand(mode) {
 				live: json('live'),
 				baseline,
 				servicesRevision: process.env.CRM_SERVICES_REVISION,
-				...(enabled
-					? {
-							reminderBase: {
-								crm: json('crm-base'),
-								notification: json('notification-delivery-base'),
-								notificationAfter: notification
-							}
-						}
-					: {})
+				...(sla ? { intakeSlaBase } : {}),
+				...(enabled ? { reminderBase } : {})
 			},
 			validateCrmCompose,
-			validateReminders
+			validateReminders,
+			validateSla
 		)
 		return {
 			schemaVersion: 1,
@@ -1549,7 +1754,10 @@ async function crmUpgradeCommand(mode) {
 	}
 	if (mode === 'upgrade-fence') {
 		const baseline = baselineInput()
-		const upgradeTargets = upgradeTargetsFor(baseline.remindersContract)
+		const upgradeTargets = upgradeTargetsFor(
+			baseline.remindersContract,
+			baseline.intakeSlaContract
+		)
 		const plan = json('plan')
 		assert.equal(plan.schemaVersion, 1)
 		assert.equal(plan.servicesRevision, process.env.CRM_SERVICES_REVISION)
@@ -1589,8 +1797,14 @@ async function crmUpgradeCommand(mode) {
 		)
 		const group =
 			process.argv[3] === 'all'
-				? upgradeTargetsFor(baseline.remindersContract)
-				: crmUpgradeGroups(baseline.remindersContract)
+				? upgradeTargetsFor(
+						baseline.remindersContract,
+						baseline.intakeSlaContract
+					)
+				: crmUpgradeGroups(
+						baseline.remindersContract,
+						baseline.intakeSlaContract
+					)
 						.find(([owner]) => owner === process.argv[3])
 						?.slice(1)
 						.map(name => `${upgradeProject(process.argv[3])}/${name}`)
@@ -1730,13 +1944,21 @@ export function crmRuntimeContainer(
 	config,
 	images,
 	name,
-	remindersContract = 'disabled'
+	remindersContract = 'disabled',
+	intakeSlaContract = 'disabled'
 ) {
 	assert.ok(
 		CRM_RUNTIME_NAMES.includes(name) ||
 			(crmUpgradeRemindersContract(remindersContract) ===
 				'task-reminders-v1' &&
-				name === 'crm-sales-reminders')
+				name === 'crm-sales-reminders') ||
+			(crmUpgradeIntakeSlaContract(
+				intakeSlaContract,
+				remindersContract
+			) === 'intake-sla-v1' &&
+				['crm-intake-sla-worker', 'crm-intake-sla-publisher'].includes(
+					name
+				))
 	)
 	const expected = config.services[name]
 	const image = images.find(item => item.Id === expected.image)

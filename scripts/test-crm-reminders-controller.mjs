@@ -8,6 +8,8 @@ import { gzipSync } from 'node:zlib'
 import { test } from 'node:test'
 import {
 	REMINDERS_PAYLOAD_FILES,
+	INTAKE_SLA_PAYLOAD_FILES,
+	crmActivationKind,
 	validateRemindersPayload,
 	parseReminderEnv,
 	verifyReminderReadiness
@@ -142,6 +144,94 @@ test('readiness is a bounded authenticated GET on fixed loopback and cannot beco
 	assert.equal(result.stdout, '')
 	assert.equal(result.stderr.includes('synthetic-private'), false)
 })
+test('SLA packaging is bounded, kind-specific and its readiness cannot use Sales credentials path', async () => {
+	const kind = crmActivationKind('crm-intake-sla-activate')
+	const pack = spawnSync(
+		process.execPath,
+		[
+			new URL('./crm-reminders-activation-cli.mjs', import.meta.url)
+				.pathname,
+			'pack'
+		],
+		{
+			encoding: 'utf8',
+			env: {
+				...process.env,
+				REMINDERS_ACTIVATION_SCOPE: 'crm-intake-sla-activate'
+			}
+		}
+	)
+	assert.equal(pack.status, 0, pack.stderr)
+	assert.deepEqual(
+		validateRemindersPayload(pack.stdout, kind).map(row => row.name),
+		INTAKE_SLA_PAYLOAD_FILES
+	)
+	assert.throws(() => validateRemindersPayload(pack.stdout))
+	assert.ok(
+		gzipSync(pack.stdout).toString('base64').length +
+			gzipSync(shell).toString('base64').length <=
+			116000
+	)
+	const router = readFileSync(
+		new URL('./deploy-services-production.sh', import.meta.url),
+		'utf8'
+	)
+	const commandSource = router.slice(
+		router.indexOf("printf -v remote_controller_arguments ' %q'"),
+		router.indexOf('# Stage the complete controller')
+	)
+	const values = Object.fromEntries(
+		[...commandSource.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)/g)].map(
+			([, name]) => [name, 'a'.repeat(64)]
+		)
+	)
+	Object.assign(values, {
+		release_scope: 'crm-intake-sla-activate',
+		scoped_shell_base64: gzipSync(shell, { level: 6 }).toString('base64'),
+		scoped_node_base64: gzipSync(pack.stdout, { level: 6 }).toString(
+			'base64'
+		),
+		backend_nginx_base64: readFileSync(
+			new URL('../nginx/backend-api.conf', import.meta.url)
+		).toString('base64')
+	})
+	const transport = spawnSync('/bin/bash', ['-s'], {
+		encoding: 'utf8',
+		env: { PATH: process.env.PATH, ...values },
+		input: `set -euo pipefail\ndie(){ exit 1; }\n${commandSource}\nprintf '%s' "\${#remote_controller_command}"\n`
+	})
+	assert.equal(transport.status, 0, transport.stderr)
+	assert.ok(Number(transport.stdout) < 131072)
+	assert.match(
+		router,
+		/elif \[\[ "\$release_scope" == crm-reminders-activate[^\n]+\n\s*\(\( \$\{#scoped_shell_base64\} \+ \$\{#scoped_node_base64\} <= 112000/
+	)
+	assert.match(router, /scoped_shell_base64.*scoped_node_base64.*<= 90000/)
+	assert.throws(() => crmActivationKind('all'))
+	const result = {
+		schemaVersion: 1,
+		ready: true,
+		checkedAt: new Date().toISOString(),
+		channels: ['EMAIL', 'TELEGRAM']
+	}
+	await verifyReminderReadiness(
+		{ token: 'a'.repeat(64) },
+		async (url, init) => {
+			assert.equal(
+				url,
+				'http://127.0.0.1:4401/internal/v1/crm-intake/sla/readiness'
+			)
+			assert.equal(init.headers['x-winwidget-service'], 'crm-intake')
+			assert.equal(init.method, 'GET')
+			assert.equal(init.body, undefined)
+			return new Response(JSON.stringify(result), {
+				headers: { 'cache-control': 'no-store' }
+			})
+		},
+		Date.now(),
+		kind
+	)
+})
 test('actual probe argv isolates owner DB credentials on stdin and keeps three whole envs on root-only reader', () => {
 	const source = shell.slice(
 		shell.indexOf('reminders_probe()'),
@@ -154,6 +244,9 @@ test('actual probe argv isolates owner DB credentials on stdin and keeps three w
 reminders_files=(${REMINDERS_PAYLOAD_FILES.join(' ')})
 scoped_payload_directory=/public/payload
 reminders_directory=/private/state
+release_scope=crm-reminders-activate
+reminders_owner=crm-sales
+reminders_validator=validate-crm-reminders-compose.mjs
 reminders_probe_image=sha256:${'a'.repeat(64)}
 reminders_notification_env=/private/notification.env
 reminders_crm_env=/private/crm.env
@@ -219,6 +312,7 @@ test('failed secret handoff producer cannot launch a database probe after partia
 		encoding: 'utf8',
 		input: `set -euo pipefail
 reminders_directory=/must-not-write
+reminders_owner=crm-sales
 reminders_inputs(){ return 0; }
 reminders_probe(){ case "$1" in owner-image) printf 'sha256:${'a'.repeat(64)}';; source) return 0;; database-input) printf '{"migrationUrl":"synthetic"}';return 1;; database) printf 'UNSAFE PROBE';; esac; }
 ${source}
@@ -236,7 +330,8 @@ function loopHarness(
 		missing = false,
 		syncFailure = false,
 		brokerFailure = false,
-		readiness = true
+		readiness = true,
+		sla = false
 	} = {}
 ) {
 	const publication = shell.slice(
@@ -253,16 +348,26 @@ function loopHarness(
 		shell.indexOf('\twhile true; do'),
 		shell.indexOf('\tif ! reminders_databases ||')
 	)
-	const key = [
-		'winwidget/notification-delivery-worker',
-		'winwidget-crm/crm-sales-reminders',
-		'winwidget-crm/crm-sales-api'
-	][index]
+	const key = (
+		sla
+			? [
+					'winwidget/notification-delivery-worker',
+					'winwidget-crm/crm-intake-sla-worker',
+					'winwidget-crm/crm-intake-sla-publisher',
+					'winwidget-crm/crm-intake-api'
+				]
+			: [
+					'winwidget/notification-delivery-worker',
+					'winwidget-crm/crm-sales-reminders',
+					'winwidget-crm/crm-sales-api'
+				]
+	)[index]
 	return spawnSync('/bin/bash', ['-s'], {
 		encoding: 'utf8',
 		input: `set -euo pipefail
 umask 077
 reminders_directory='${temp}'
+reminders_owner=${sla ? 'crm-intake' : 'crm-sales'}
 die(){ printf '%s\\n' "$1" >&2;exit 1; }
 reminders_private(){ [[ -f "$1" && ! -L "$1" ]]; }
 sync(){ if [[ "$2" == "$reminders_directory/admission.json" && '${syncFailure}' == true ]];then return 1;fi; }
@@ -274,7 +379,7 @@ reminders_broker(){ printf 'broker\\n' >>"$reminders_directory/actions"; [[ '${b
 reminders_probe(){ case "$1" in
 admit|begin|start) printf '{}';;
 broker-check) [[ -e "$reminders_directory/broker.json" ]];;
-select) if [[ -e "$reminders_directory/done" ]];then printf complete;else printf '${index} ${key} ${index === 1 ? 'absent' : 'a'.repeat(64)}';fi;;
+select) if [[ -e "$reminders_directory/done" ]];then printf complete;else printf '${index} ${key} ${index === 1 || (sla && index === 2) ? 'absent' : 'a'.repeat(64)}';fi;;
 observe) [[ '${missing}' != true ]] || return 1;printf '{}';;
 complete) printf done >"$reminders_directory/done";printf '{}';;
 *) return 1;;esac; }
@@ -342,6 +447,31 @@ test('actual admission fsync and broker failure cannot start targets; failed ND 
 		}
 	}
 })
+test('SLA actual shell loop starts exactly two new roles and retains unknown-create receipts', () => {
+	for (const index of [0, 1, 2, 3]) {
+		const temp = mkdtempSync(join(tmpdir(), 'crm-intake-sla-loop-'))
+		try {
+			const failed = loopHarness(temp, { index, sla: true, unknown: true })
+			assert.equal(failed.status, 1)
+			assert.match(failed.stderr, /outcome is unknown/)
+			const resumed = loopHarness(temp, { index, sla: true })
+			assert.equal(resumed.status, 0, resumed.stderr)
+			const actions = readFileSync(join(temp, 'actions'), 'utf8')
+				.trim()
+				.split('\n')
+			assert.equal(
+				actions.filter(line => line.startsWith('compose ')).length,
+				1
+			)
+			assert.equal(
+				actions.filter(line => line.startsWith('stop ')).length,
+				index === 1 || index === 2 ? 0 : 1
+			)
+		} finally {
+			rmSync(temp, { recursive: true, force: true })
+		}
+	}
+})
 test('controller has forward-only cleanup, complete owner probes and no build/migration/provider mutation command', () => {
 	const cleanup = shell.slice(
 		shell.indexOf('reminders_cleanup()'),
@@ -358,6 +488,8 @@ test('controller has forward-only cleanup, complete owner probes and no build/mi
 			shell.indexOf('reminders_compose "$project" "$name"')
 	)
 	assert.ok(shell.includes('args=(upgrade-database "$argument" complete)'))
-	assert.ok(shell.includes('for owner in crm-sales notification-delivery'))
+	assert.ok(
+		shell.includes('for owner in "$reminders_owner" notification-delivery')
+	)
 	assert.ok(shell.includes('CRM_BOOTSTRAP_CONTROLLER_PROTOCOL=stdio-v1'))
 })

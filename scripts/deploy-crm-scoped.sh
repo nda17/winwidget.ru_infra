@@ -513,7 +513,7 @@ crm_upgrade_probe() {
 	export -n crm_upgrade_handoff
 	local -a mounts=() command=()
 	case "$mode" in
-		upgrade-contract) mounts=(--volume "$env_file:/run/crm/canonical.env:ro") ;;
+		upgrade-contract|upgrade-sla-contract) mounts=(--volume "$env_file:/run/crm/canonical.env:ro") ;;
 		upgrade-source) user=1001:1001 ;;
 		upgrade-database) user=1001:1001; network=host ;;
 		upgrade-database-input)
@@ -530,6 +530,9 @@ crm_upgrade_probe() {
 	if [[ "${crm_upgrade_reminders_contract:-disabled}" == task-reminders-v1 && "$mode" == upgrade-prepare ]]; then
 		mounts+=(--volume "$release_root/.github/scripts/validate-crm-reminders-compose.mjs:/run/crm-reminders-compose-validator.mjs:ro")
 	fi
+	if [[ "${crm_upgrade_sla_contract:-disabled}" == intake-sla-v1 && "$mode" == upgrade-prepare ]]; then
+		mounts+=(--volume "$release_root/.github/scripts/validate-crm-intake-sla-compose.mjs:/run/crm-intake-sla-compose-validator.mjs:ro")
+	fi
 	if [[ "$owner" == notification-delivery && ( "$mode" == upgrade-source || "$mode" == upgrade-database ) ]]; then user=1000:1000; fi
 	# The image owns Prisma/package files as UID 1001, including historical
 	# 0600/0700 files. Do not add DAC capabilities or widen private artifact ACLs.
@@ -540,6 +543,7 @@ crm_upgrade_probe() {
 		--env "CRM_INFRA_REVISION=$infra_revision" --env "CRM_UPGRADE_ENV_HASHES=$crm_upgrade_env_hashes" \
 		--env "CRM_UPGRADE_SWITCHING_OWNER=${crm_upgrade_switching_owner:-}" \
 		--env "CRM_REMINDERS_RABBITMQ_CONTRACT=${crm_upgrade_reminders_contract:-disabled}" \
+		--env "CRM_INTAKE_SLA_RABBITMQ_CONTRACT=${crm_upgrade_sla_contract:-disabled}" \
 		--volume "$scoped_payload_directory/verifier.mjs:/run/crm-release.mjs:ro"
 		${mounts[@]+"${mounts[@]}"}
 		--entrypoint node "$selected" /run/crm-release.mjs "$mode" "$owner" "$phase")
@@ -590,8 +594,21 @@ crm_upgrade_compose() {
 		--env-file /dev/null --profile '*' -f "$crm_work_directory/$unit-runtime.json" "$@"
 }
 
+crm_upgrade_stop_owner() {
+	local unit="$1" owner="$2" name id; shift 2
+	printf '%s\n' "$owner" >"$crm_work_directory/switching-owner.pending"
+	mv -- "$crm_work_directory/switching-owner.pending" "$crm_work_directory/switching-owner"
+	crm_upgrade_switching_owner="$owner"
+	crm_upgrade_compose "$unit" stop --timeout 90 "$@" </dev/null >/dev/null 2>&1 || die 'CRM group failed to stop; do not start a mixed group.'
+	for name in "$@"; do
+		id="$(docker ps -aq --no-trunc --filter "label=com.docker.compose.project=$([[ "$unit" == crm ]] && printf winwidget-crm || printf winwidget)" --filter "label=com.docker.compose.service=$name")"
+		[[ -z "$id" || "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Duplicate CRM upgrade target.'
+		if [[ -n "$id" ]]; then [[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || die 'Old CRM group still has a live process.'; fi
+	done
+}
+
 crm_upgrade_main() {
-	local owner prefix tag image revision title gateway_id before before_images file hash name id attempt state unit
+	local owner prefix tag image revision title gateway_id before before_images file hash name id attempt state unit task_writers_stopped task_writer_stop_required
 	local -a images=() image_env=() base_image_env=() names=()
 	umask 077
 	[[ -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}" && "$(docker context inspect --format '{{.Endpoints.docker.Host}}')" == unix:///var/run/docker.sock ]] || die 'CRM upgrade requires the local production daemon.'
@@ -608,6 +625,8 @@ crm_upgrade_main() {
 	crm_upgrade_env_hashes='{}'
 	crm_upgrade_reminders_contract="$(crm_upgrade_probe upgrade-contract)" || die 'Cannot read CRM reminder contract.'
 	case "$crm_upgrade_reminders_contract" in disabled|task-reminders-v1) ;; *) die 'Unknown CRM reminder contract.' ;; esac
+	crm_upgrade_sla_contract="$(crm_upgrade_probe upgrade-sla-contract)" || die 'Cannot read CRM Intake SLA contract.'
+	case "$crm_upgrade_sla_contract" in disabled) ;; intake-sla-v1) [[ "$crm_upgrade_reminders_contract" == task-reminders-v1 ]] || die 'SLA requires active reminder contract.' ;; *) die 'Unknown CRM Intake SLA contract.' ;; esac
 	file="$app_root/deploy/backend/crm/upgrades"
 	[[ -e "$file" ]] || install -d -m 700 "$file"
 	assert_root_owned_directory "$file"
@@ -687,6 +706,13 @@ crm_upgrade_main() {
 					--env-file "$env_file" --env-file "$services_repository/apps/$owner/.env.production" \
 					-f "$release_root/deploy/docker-compose.prod.yml" -f "$release_root/deploy/docker-compose.notification-reminders.yml" config --format json \
 					>"$crm_work_directory/$owner.json" 2>/dev/null || die 'CRM reminder reader Compose cannot be materialized safely.'
+				if [[ "$crm_upgrade_sla_contract" == intake-sla-v1 ]]; then
+					mv -- "$crm_work_directory/$owner.json" "$crm_work_directory/$owner-reminders.json"
+					env -i PATH="$PATH" "${base_image_env[@]}" "${image_env[@]}" docker compose --project-name winwidget --profile '*' \
+						--env-file "$env_file" --env-file "$services_repository/apps/$owner/.env.production" \
+						-f "$release_root/deploy/docker-compose.prod.yml" -f "$release_root/deploy/docker-compose.notification-reminders.yml" -f "$release_root/deploy/docker-compose.notification-intake-sla.yml" config --format json \
+						>"$crm_work_directory/$owner.json" 2>/dev/null || die 'CRM SLA reader Compose cannot be materialized safely.'
+				fi
 			fi
 		done
 		env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$crm_env_file" \
@@ -696,6 +722,12 @@ crm_upgrade_main() {
 			env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$crm_env_file" \
 				-f "$release_root/deploy/docker-compose.crm.yml" -f "$release_root/deploy/docker-compose.crm-reminders.yml" config --format json \
 				>"$crm_work_directory/crm.json" 2>/dev/null || die 'CRM reminder Sales Compose cannot be materialized safely.'
+			if [[ "$crm_upgrade_sla_contract" == intake-sla-v1 ]]; then
+				mv -- "$crm_work_directory/crm.json" "$crm_work_directory/crm-reminders.json"
+				env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$crm_env_file" \
+					-f "$release_root/deploy/docker-compose.crm.yml" -f "$release_root/deploy/docker-compose.crm-reminders.yml" -f "$release_root/deploy/docker-compose.crm-intake-sla.yml" config --format json \
+					>"$crm_work_directory/crm.json" 2>/dev/null || die 'CRM Intake SLA Compose cannot be materialized safely.'
+			fi
 		fi
 		crm_upgrade_probe upgrade-prepare >"$crm_work_directory/plan.pending" || die 'CRM upgrade configuration changes more than the approved code/images.'
 		mv -- "$crm_work_directory/plan.pending" "$crm_work_directory/plan.json"
@@ -731,8 +763,29 @@ crm_upgrade_main() {
 		crm_upgrade_fence
 		image="winwidget-$owner:git-$services_revision"
 		unit=companions; [[ "$owner" != crm-* ]] || unit=crm
+		task_writers_stopped=false
 		crm_upgrade_probe upgrade-database "$owner" "$image" >"$crm_work_directory/$owner-database-after.json" || die 'CRM owner changed after preflight.'
 		crm_upgrade_probe upgrade-database-check "$owner" '' pending >/dev/null || die 'CRM database continuity failed before owner upgrade.'
+		# New invoker task triggers need their table grants before any old writer
+		# can execute them. Reuse the sealed forward-recovery switching marker.
+		if [[ "$owner" == crm-sales || "$owner" == crm-intake ]]; then
+			task_writer_stop_required="$(crm_upgrade_probe upgrade-pending "$owner" '' task-writers)" || die 'Cannot verify Sales task-trigger migration boundary.'
+			[[ "$task_writer_stop_required" == 0 || "$task_writer_stop_required" == 1 ]] || die 'Invalid Sales task-trigger migration boundary.'
+			if [[ "$task_writer_stop_required" == 1 ]]; then
+				if [[ "$owner" == crm-sales ]]; then
+					names=(crm-sales-api)
+					[[ "$crm_upgrade_reminders_contract" != task-reminders-v1 ]] || names=(crm-sales-reminders crm-sales-api)
+				else
+					names=(crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher)
+					[[ "$crm_upgrade_sla_contract" != intake-sla-v1 ]] || names+=(crm-intake-sla-worker crm-intake-sla-publisher)
+					names+=(crm-intake-api)
+				fi
+				crm_upgrade_fence
+				crm_runtime_memory_check before-start
+				crm_upgrade_stop_owner "$unit" "$owner" "${names[@]}"
+				task_writers_stopped=true
+			fi
+		fi
 		if [[ "$owner" != identity && "$(crm_upgrade_probe upgrade-pending "$owner")" != 0 ]]; then
 			crm_upgrade_compose "$unit" run --rm --no-deps --pull never --interactive=false -T "$owner-migrate" </dev/null >/dev/null 2>&1 || die 'CRM owner migration failed; inspect ledger before retry, never reset data.'
 		fi
@@ -763,19 +816,14 @@ crm_upgrade_main() {
 			crm-sales)
 				names=(crm-sales-api)
 				[[ "$crm_upgrade_reminders_contract" != task-reminders-v1 ]] || names=(crm-sales-reminders crm-sales-api) ;;
-			crm-intake) names=(crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher crm-intake-api) ;;
+			crm-intake)
+				names=(crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher)
+				[[ "$crm_upgrade_sla_contract" != intake-sla-v1 ]] || names+=(crm-intake-sla-worker crm-intake-sla-publisher)
+				names+=(crm-intake-api) ;;
 		esac
 		unit=companions; [[ "$owner" != crm-* ]] || unit=crm
 		crm_runtime_memory_check before-start
-		printf '%s\n' "$owner" >"$crm_work_directory/switching-owner.pending"
-		mv -- "$crm_work_directory/switching-owner.pending" "$crm_work_directory/switching-owner"
-		crm_upgrade_switching_owner="$owner"
-		crm_upgrade_compose "$unit" stop --timeout 90 "${names[@]}" </dev/null >/dev/null 2>&1 || die 'CRM group failed to stop; do not start a mixed group.'
-		for name in "${names[@]}"; do
-			id="$(docker ps -aq --no-trunc --filter "label=com.docker.compose.project=$([[ "$unit" == crm ]] && printf winwidget-crm || printf winwidget)" --filter "label=com.docker.compose.service=$name")"
-			[[ -z "$id" || "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Duplicate CRM upgrade target.'
-			if [[ -n "$id" ]]; then [[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || die 'Old CRM group still has a live process.'; fi
-		done
+		if [[ "$task_writers_stopped" != true ]]; then crm_upgrade_stop_owner "$unit" "$owner" "${names[@]}"; fi
 		for name in "${names[@]}"; do
 			crm_upgrade_fence
 			crm_upgrade_compose "$unit" up --detach --no-deps --no-build --pull never --force-recreate "$name" </dev/null >/dev/null 2>&1 || die 'CRM replacement failed; retain desired image/SQL and retry the same release.'
@@ -804,5 +852,6 @@ crm_upgrade_main() {
 	crm_upgrade_fence
 	local process_count=18
 	[[ "$crm_upgrade_reminders_contract" != task-reminders-v1 ]] || process_count=19
+	[[ "$crm_upgrade_sla_contract" != intake-sla-v1 ]] || process_count=21
 	printf '%s\n' "CRM steady-state code upgrade verified: $process_count processes; existing database identities/ACL, neighbors and env preserved. No broker or product-gate mutations; queue and browser/payment checks remain separate."
 }

@@ -34,12 +34,16 @@ import {
 	crmUpgradeGroups,
 	crmUpgradeRemindersContract,
 	crmUpgradeRemindersContractFromEnv,
+	crmUpgradeIntakeSlaContract,
+	crmUpgradeIntakeSlaContractFromEnv,
+	crmUpgradeSlaNotificationBase,
 	CRM_UPGRADE_MIGRATIONS,
 	crmUpgradeNotificationDatabaseIdentity,
 	crmUpgradeBaseline,
 	crmUpgradeFence,
 	crmUpgradeSource,
 	crmUpgradeLedger,
+	crmUpgradeTaskWriterStop,
 	CRM_NOTIFICATION_RECOVERY_ROWS,
 	crmUpgradeDatabasePreserved,
 	crmUpgradeDesired,
@@ -324,9 +328,27 @@ const neighbors = () =>
 
 const reminderKinds =
 	'email,telegram,payment-email,payment-telegram,limit-email,limit-telegram,campaign-email,campaign-telegram,daily-summary-delivery-telegram,subscription-expiry-email,subscription-expiry-telegram,wincrm-invitation-email,wincrm-task-reminder-email,wincrm-task-reminder-telegram'
-function reminderEnvironment(name) {
+function reminderEnvironment(name, sla = 'disabled') {
 	if (name === 'notification-delivery-worker')
-		return { NOTIFICATION_DELIVERY_KINDS: reminderKinds }
+		return {
+			NOTIFICATION_DELIVERY_KINDS:
+				reminderKinds +
+				(sla === 'disabled'
+					? ''
+					: ',wincrm-intake-sla-email,wincrm-intake-sla-telegram')
+		}
+	if (
+		sla !== 'disabled' &&
+		[
+			'crm-intake-api',
+			'crm-intake-sla-worker',
+			'crm-intake-sla-publisher'
+		].includes(name)
+	)
+		return {
+			CRM_INTAKE_SLA_ENABLED: 'true',
+			CRM_INTAKE_PROCESS_ROLE: name.slice('crm-intake-'.length)
+		}
 	if (['crm-sales-api', 'crm-sales-reminders'].includes(name))
 		return {
 			CRM_TASK_REMINDERS_ENABLED: 'true',
@@ -335,13 +357,13 @@ function reminderEnvironment(name) {
 		}
 	return {}
 }
-function upgradeFixture(contract = 'disabled') {
+function upgradeFixture(contract = 'disabled', sla = 'disabled') {
 	const names = [
 		['winwidget', 'api-gateway'],
 		['winwidget', 'billing-postgres'],
 		['winwidget', 'identity-worker'],
 		...owners.map(owner => ['winwidget-crm', owner + '-postgres']),
-		...crmUpgradeGroups(contract).flatMap(([owner, ...services]) =>
+		...crmUpgradeGroups(contract, sla).flatMap(([owner, ...services]) =>
 			services.map(name => [
 				owner.startsWith('crm-') ? 'winwidget-crm' : 'winwidget',
 				name
@@ -357,7 +379,7 @@ function upgradeFixture(contract = 'disabled') {
 		item.Config.Env.push(`APP_REVISION=${previous}`)
 		if (contract !== 'disabled')
 			item.Config.Env.push(
-				...Object.entries(reminderEnvironment(name)).map(
+				...Object.entries(reminderEnvironment(name, sla)).map(
 					([key, value]) => `${key}=${value}`
 				)
 			)
@@ -376,10 +398,79 @@ function upgradeFixture(contract = 'disabled') {
 			identity: hash,
 			'notification-delivery': hash
 		},
-		contract
+		contract,
+		sla
 	)
 	return { live, baseline }
 }
+
+test('SLA upgrade marker requires reminders and preserves exact 21-process inventory', () => {
+	assert.equal(crmUpgradeIntakeSlaContract(), 'disabled')
+	assert.equal(
+		crmUpgradeIntakeSlaContractFromEnv(
+			'CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1\n'
+		),
+		'disabled'
+	)
+	assert.equal(
+		crmUpgradeIntakeSlaContractFromEnv(
+			'CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1\nCRM_INTAKE_SLA_RABBITMQ_CONTRACT=intake-sla-v1\n'
+		),
+		'intake-sla-v1'
+	)
+	assert.throws(() => crmUpgradeIntakeSlaContract('intake-sla-v1'))
+	for (const source of [
+		'CRM_INTAKE_SLA_RABBITMQ_CONTRACT=intake-sla-v1',
+		'CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1\nCRM_INTAKE_SLA_RABBITMQ_CONTRACT=true',
+		'CRM_REMINDERS_RABBITMQ_CONTRACT=task-reminders-v1\nCRM_INTAKE_SLA_RABBITMQ_CONTRACT=disabled\nCRM_INTAKE_SLA_RABBITMQ_CONTRACT=intake-sla-v1'
+	])
+		assert.throws(() => crmUpgradeIntakeSlaContractFromEnv(source))
+	const { live, baseline } = upgradeFixture(
+		'task-reminders-v1',
+		'intake-sla-v1'
+	)
+	assert.equal(Object.keys(baseline.targets).length, 21)
+	assert.equal(crmUpgradeFence(live, baseline), true)
+	assert.throws(() =>
+		crmUpgradeBaseline(
+			live,
+			previous,
+			baseline.environmentHashes,
+			'task-reminders-v1'
+		)
+	)
+	assert.throws(() =>
+		crmUpgradeFence(live, { ...baseline, intakeSlaContract: undefined })
+	)
+	assert.equal(
+		crmUpgradeTaskWriterStop('crm-intake', [
+			'20260908150000_add_intake_sla'
+		]),
+		true
+	)
+	assert.equal(crmUpgradeTaskWriterStop('crm-intake', []), false)
+	const config = kinds => ({
+		services: {
+			'notification-delivery-worker': {
+				environment: {
+					NOTIFICATION_DELIVERY_KINDS: kinds,
+					OTHER: 'unchanged'
+				}
+			}
+		}
+	})
+	const final = config(
+			reminderKinds + ',wincrm-intake-sla-email,wincrm-intake-sla-telegram'
+		),
+		middle = config(reminderKinds)
+	assert.deepEqual(
+		crmUpgradeSlaNotificationBase(final, middle, final),
+		middle
+	)
+	assert.throws(() =>
+		crmUpgradeSlaNotificationBase(config('changed'), middle, final)
+	)
+})
 
 test('upgrade reminder marker is explicit, bounded and never guessed from the running process', () => {
 	assert.equal(crmUpgradeRemindersContract(), 'disabled')
@@ -621,6 +712,96 @@ test('upgrade source permits only reviewed expansion SQL and proves Identity sch
 			...next,
 			'20260907120100_expand_workday_tasks': hash
 		})
+	)
+})
+
+test('Sales recurring, assignment and in-app upgrades accept only their exact reviewed SQL', () => {
+	const additions = {
+		'20260908120000_add_recurring_task_series':
+			'9a03d38db5037068c19c606d16a2515e3088d51c3e2bd88d60aa8270c87eb318',
+		'20260908130000_add_task_assignment_notifications':
+			'c26b5649ceaace470fcfbe10d76013a7edb7d20192d71669eb999f114fc7c87e',
+		'20260908140000_add_task_notification_center':
+			'799490bcf980d282ef48041934b8728dc6554d0db267455051b145fb0b7eef8a'
+	}
+	const before = {
+		'schema.prisma': hash,
+		'database-access.json': hash,
+		'20260101000000_initial': hash
+	}
+	const after = {
+		...before,
+		...additions,
+		'schema.prisma': 'd'.repeat(64),
+		'database-access.json': 'e'.repeat(64)
+	}
+	assert.equal(crmUpgradeSource('crm-sales', before, after), true)
+	for (const [name, checksum] of Object.entries(additions)) {
+		assert.equal(CRM_UPGRADE_MIGRATIONS['crm-sales'][name], checksum)
+		assert.throws(() =>
+			crmUpgradeSource('crm-sales', before, { ...after, [name]: hash })
+		)
+	}
+	const applied = [
+		{
+			id: 'initial',
+			migration_name: '20260101000000_initial',
+			checksum: hash,
+			finished_at: '2026-01-01',
+			rolled_back_at: null
+		}
+	]
+	assert.deepEqual(
+		crmUpgradeLedger('crm-sales', after, applied),
+		Object.keys(additions)
+	)
+	assert.throws(() => crmUpgradeLedger('crm-sales', after, applied, true))
+	const complete = [
+		...applied,
+		...Object.entries(additions).map(([name, checksum]) => ({
+			id: name,
+			migration_name: name,
+			checksum,
+			finished_at: '2026-09-08',
+			rolled_back_at: null
+		}))
+	]
+	assert.deepEqual(
+		crmUpgradeLedger('crm-sales', after, complete, true),
+		[]
+	)
+	assert.throws(() =>
+		crmUpgradeLedger('crm-sales', after, [...complete, complete[1]], true)
+	)
+	assert.throws(() => crmUpgradeSource('crm-intake', before, after))
+	assert.equal(
+		crmUpgradeTaskWriterStop('crm-sales', Object.keys(additions)),
+		true
+	)
+	assert.equal(
+		crmUpgradeTaskWriterStop('crm-sales', [Object.keys(additions)[0]]),
+		false
+	)
+	assert.equal(crmUpgradeTaskWriterStop('crm-sales', []), false)
+	assert.equal(crmUpgradeTaskWriterStop('crm-intake', []), false)
+	assert.throws(() =>
+		crmUpgradeTaskWriterStop('crm-sales', ['20260908150000_unreviewed'])
+	)
+})
+
+test('enabled Sales upgrade retains Access and ND readers before its reminders producer', () => {
+	const starts = crmUpgradeGroups('task-reminders-v1').flatMap(
+		([, ...names]) => names
+	)
+	const producer = starts.indexOf('crm-sales-reminders')
+	assert.ok(starts.indexOf('crm-access-api') >= 0)
+	assert.ok(starts.indexOf('crm-access-api') < producer)
+	assert.ok(starts.indexOf('notification-delivery-worker') >= 0)
+	assert.ok(starts.indexOf('notification-delivery-worker') < producer)
+	assert.ok(producer < starts.indexOf('crm-sales-api'))
+	assert.equal(
+		crmUpgradeGroups('disabled').flat().includes('crm-sales-reminders'),
+		false
 	)
 })
 
@@ -1793,8 +1974,8 @@ test('upgrade database proof preserves UUID, roles, memberships and existing ACL
 	}
 })
 
-function upgradeDesiredFixture(contract = 'disabled') {
-	const { live } = upgradeFixture(contract)
+function upgradeDesiredFixture(contract = 'disabled', sla = 'disabled') {
+	const { live } = upgradeFixture(contract, sla)
 	const crm = { name: 'winwidget-crm', services: {} }
 	const companions = { name: 'winwidget', services: {} }
 	const images = CRM_UPGRADE_GROUPS.map(([owner], index) => ({
@@ -1816,7 +1997,8 @@ function upgradeDesiredFixture(contract = 'disabled') {
 		}
 	}))
 	for (const [index, [owner, ...names]] of crmUpgradeGroups(
-		contract
+		contract,
+		sla
 	).entries()) {
 		const config = owner.startsWith('crm-') ? crm : companions
 		const candidate = images[index]
@@ -1834,7 +2016,9 @@ function upgradeDesiredFixture(contract = 'disabled') {
 				environment: {
 					APP_REVISION: revision,
 					SYNTHETIC_SECRET: 'fixture-only',
-					...(contract === 'disabled' ? {} : reminderEnvironment(name))
+					...(contract === 'disabled'
+						? {}
+						: reminderEnvironment(name, sla))
 				},
 				network_mode: 'host',
 				read_only: true,
@@ -1939,13 +2123,30 @@ function upgradeDesiredFixture(contract = 'disabled') {
 			identity: hash,
 			'notification-delivery': hash
 		},
-		contract
+		contract,
+		sla
 	)
+	const intakeSlaBase =
+		sla === 'disabled'
+			? undefined
+			: {
+					crm: structuredClone(crm),
+					notification: structuredClone(companions)
+				}
+	if (intakeSlaBase) {
+		delete intakeSlaBase.crm.services['crm-intake-sla-worker']
+		delete intakeSlaBase.crm.services['crm-intake-sla-publisher']
+		delete intakeSlaBase.crm.services['crm-intake-api'].environment
+			.CRM_INTAKE_SLA_ENABLED
+		intakeSlaBase.notification.services[
+			'notification-delivery-worker'
+		].environment.NOTIFICATION_DELIVERY_KINDS = reminderKinds
+	}
 	const reminderBase =
 		contract === 'disabled'
 			? undefined
 			: {
-					crm: structuredClone(crm),
+					crm: structuredClone(intakeSlaBase?.crm ?? crm),
 					notification: structuredClone(companions),
 					notificationAfter: structuredClone(companions)
 				}
@@ -1967,9 +2168,61 @@ function upgradeDesiredFixture(contract = 'disabled') {
 		companions,
 		images,
 		servicesRevision: revision,
+		...(intakeSlaBase ? { intakeSlaBase } : {}),
 		...(reminderBase ? { reminderBase } : {})
 	}
 }
+
+test('SLA upgrade desired validates both overlay layers and retains exact Intake runtime configuration', () => {
+	const input = upgradeDesiredFixture('task-reminders-v1', 'intake-sla-v1')
+	const calls = []
+	const desired = crmUpgradeDesired(
+		input,
+		base => {
+			calls.push('base')
+			assert.deepEqual(base, input.reminderBase.crm)
+		},
+		reminder => {
+			calls.push('reminders')
+			assert.deepEqual(reminder.crmAfter, input.intakeSlaBase.crm)
+			assert.deepEqual(
+				reminder.notificationAfter,
+				input.intakeSlaBase.notification
+			)
+		},
+		sla => {
+			calls.push('sla')
+			assert.deepEqual(sla.crmBefore, input.intakeSlaBase.crm)
+			assert.deepEqual(sla.crmAfter, input.crm)
+			assert.deepEqual(
+				sla.notificationAfter,
+				input.reminderBase.notificationAfter
+			)
+		}
+	)
+	assert.deepEqual(calls, ['sla', 'base', 'reminders'])
+	assert.equal(Object.keys(desired.replacements).length, 21)
+	assert.ok(desired.desired.crm.services['crm-intake-sla-worker'])
+	assert.ok(desired.desired.crm.services['crm-intake-sla-publisher'])
+	assert.throws(() =>
+		crmUpgradeDesired(
+			input,
+			() => {},
+			() => {}
+		)
+	)
+	input.crm.services[
+		'crm-intake-sla-worker'
+	].environment.CRM_INTAKE_SLA_ENABLED = 'false'
+	assert.throws(() =>
+		crmUpgradeDesired(
+			input,
+			() => {},
+			() => {},
+			() => {}
+		)
+	)
+})
 
 test('upgrade enabled reminder desired preserves both owner overlays, exact credentials/config and legacy disabled output', () => {
 	const disabled = upgradeDesiredFixture()
@@ -2383,7 +2636,8 @@ test('upgrade desired rejects changed or invalid durations instead of rounding o
 function runUpgradeController(
 	scenario = 'success',
 	replay = false,
-	contract = 'disabled'
+	contract = 'disabled',
+	sla = 'disabled'
 ) {
 	const directory = mkdtempSync(join(tmpdir(), 'wincrm-upgrade-contract-'))
 	try {
@@ -2437,7 +2691,7 @@ owner_names() {
     crm-customers) printf 'crm-customers-api' ;;
     notification-delivery) printf 'notification-delivery-worker' ;;
     crm-sales) if [[ "$TEST_CONTRACT" == task-reminders-v1 ]]; then printf 'crm-sales-reminders crm-sales-api'; else printf 'crm-sales-api'; fi ;;
-    crm-intake) printf 'crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher crm-intake-api' ;;
+    crm-intake) printf 'crm-intake-worker crm-intake-widget-control-worker crm-intake-widget-transfer-worker crm-intake-publisher crm-intake-widget-control-publisher crm-intake-widget-transfer-publisher '; if [[ "$TEST_SLA_CONTRACT" == intake-sla-v1 ]]; then printf 'crm-intake-sla-worker crm-intake-sla-publisher '; fi; printf 'crm-intake-api' ;;
   esac
 }
 crm_upgrade_probe() {
@@ -2447,6 +2701,7 @@ crm_upgrade_probe() {
     upgrade-contract)
       [[ "$TEST_SCENARIO" != contract-read-failed ]] || return 9
       if [[ "$TEST_SCENARIO" == invalid-contract ]]; then printf 'unknown\\n'; else printf '%s\\n' "$TEST_CONTRACT"; fi ;;
+    upgrade-sla-contract) printf '%s\\n' "\${TEST_SLA_CONTRACT:-disabled}" ;;
     upgrade-baseline-check|upgrade-fence)
       while IFS= read -r line; do :; done
       [[ "$TEST_SCENARIO" != baseline-drift ]] || return 10
@@ -2460,7 +2715,10 @@ crm_upgrade_probe() {
     upgrade-database-check)
       [[ "$TEST_SCENARIO" != uuid-drift || "$owner" != crm-access || ! -f "$TEST_DIRECTORY/migrated-crm-access" ]] || return 12 ;;
     upgrade-pending)
-      if [[ "$owner" == billing || "$owner" == crm-access || "$owner" == crm-sales || "$owner" == notification-delivery ]] && [[ ! -f "$TEST_DIRECTORY/migrated-$owner" ]]; then printf '1\\n'; else printf '0\\n'; fi ;;
+      if [[ "\${4:-}" == task-writers ]]; then
+        [[ "$TEST_SCENARIO" != task-writer-probe-failed ]] || return 24
+        if [[ ( "$TEST_SCENARIO" == sales-task-triggers* && "$owner" == crm-sales || "$TEST_SCENARIO" == intake-sla-triggers && "$owner" == crm-intake ) && ! -f "$TEST_DIRECTORY/migrated-$owner" ]]; then printf '1\\n'; else printf '0\\n'; fi
+      elif [[ "$owner" == billing || "$owner" == crm-access || "$owner" == crm-sales || "$owner" == notification-delivery || ( "$owner" == crm-intake && "$TEST_SCENARIO" == intake-sla-triggers ) ]] && [[ ! -f "$TEST_DIRECTORY/migrated-$owner" ]]; then printf '1\\n'; else printf '0\\n'; fi ;;
     upgrade-grants)
       [[ "$TEST_SCENARIO" != grants-failed || "$owner" != crm-access ]] || return 13
       printf 'PRIVATE_SQL_SENTINEL\\n' ;;
@@ -2481,6 +2739,7 @@ crm_upgrade_compose() {
     run)
       [[ "$last" != identity-migrate && "$*" == *'--rm --no-deps --pull never'* ]] || return 16
       [[ "$TEST_SCENARIO" != migration-failed || "$last" != crm-sales-migrate ]] || return 17
+      if [[ "$TEST_SCENARIO" == sales-task-triggers-failed && "$last" == crm-sales-migrate && ! -f "$TEST_DIRECTORY/failure-observed" ]]; then touch "$TEST_DIRECTORY/failure-observed"; return 17; fi
       touch "$TEST_DIRECTORY/migrated-\${last%-migrate}" ;;
     stop)
       for arg in "$@"; do
@@ -2536,13 +2795,14 @@ scoped_deploy_main
 					TEST_LIBRARY: join(root, 'deploy-crm-scoped.sh'),
 					TEST_SCENARIO: scenario,
 					TEST_CONTRACT: contract,
+					TEST_SLA_CONTRACT: sla,
 					TEST_REVISION: revision,
 					TEST_PREVIOUS: previous,
 					TEST_HASH: hash,
 					TEST_IMAGE: image(900),
 					TEST_OLD_IMAGE: image(901),
 					TEST_ID: id(900),
-					TEST_TARGETS: crmUpgradeGroups(contract)
+					TEST_TARGETS: crmUpgradeGroups(contract, sla)
 						.flatMap(([, ...names]) => names)
 						.join(' ')
 				}
@@ -2564,6 +2824,80 @@ scoped_deploy_main
 		rmSync(directory, { recursive: true, force: true })
 	}
 }
+
+test('Intake SLA migration stops its old acceptance writers before SQL and grants', () => {
+	const result = runUpgradeController(
+		'intake-sla-triggers',
+		true,
+		'task-reminders-v1'
+	)
+	assert.equal(result.first.status, 0, result.first.stderr)
+	assert.equal(result.second.status, 0, result.second.stderr)
+	const names = crmUpgradeGroups('task-reminders-v1')
+		.find(([owner]) => owner === 'crm-intake')
+		.slice(1)
+	const stop = result.firstCalls.indexOf(
+		'COMPOSE crm stop --timeout 90 ' + names.join(' ')
+	)
+	const migration = result.firstCalls
+		.split('\n')
+		.find(
+			line =>
+				line.startsWith('COMPOSE crm run ') &&
+				line.endsWith('crm-intake-migrate')
+		)
+	assert.ok(migration)
+	assert.ok(stop >= 0 && stop < result.firstCalls.indexOf(migration))
+	assert.ok(
+		result.firstCalls.indexOf(migration) <
+			result.firstCalls.indexOf('PROBE upgrade-grants crm-intake')
+	)
+	assert.equal(
+		result.calls
+			.split('\n')
+			.filter(
+				line => line === 'COMPOSE crm stop --timeout 90 ' + names.join(' ')
+			).length,
+		1
+	)
+})
+
+test('SLA upgraded coordinator retains both Intake roles and overlays without provisioning broker', () => {
+	const result = runUpgradeController(
+		'success',
+		true,
+		'task-reminders-v1',
+		'intake-sla-v1'
+	)
+	assert.equal(result.first.status, 0, result.first.stderr)
+	assert.equal(result.second.status, 0, result.second.stderr)
+	const starts = result.firstCalls
+		.split('\n')
+		.filter(line => line.startsWith('COMPOSE ') && line.includes(' up '))
+		.map(line => line.split(' ').at(-1))
+	assert.deepEqual(
+		starts,
+		crmUpgradeGroups('task-reminders-v1', 'intake-sla-v1').flatMap(
+			([, ...names]) => names
+		)
+	)
+	assert.ok(
+		result.firstCalls.includes('docker-compose.crm-intake-sla.yml')
+	)
+	assert.ok(
+		result.firstCalls.includes(
+			'docker-compose.notification-intake-sla.yml'
+		)
+	)
+	assert.equal(
+		result.calls
+			.split('\n')
+			.filter(line => line.startsWith('COMPOSE ') && line.includes(' up '))
+			.length,
+		21
+	)
+	assert.equal(result.calls.includes('broker'), false)
+})
 
 test('upgrade coordinator validates both old Billing image sources before its first mutation', () => {
 	const result = runUpgradeController('mixed-old-images')
@@ -2661,6 +2995,70 @@ test('upgrade coordinator fails closed before unsafe mutation and retains exact 
 	assert.equal(
 		secondCalls.includes('--force-recreate crm-intake-api'),
 		true
+	)
+})
+
+test('Sales task-trigger upgrade stops only its old writers before migration/grants and recovers forward', () => {
+	for (const scenario of [
+		'sales-task-triggers',
+		'sales-task-triggers-failed'
+	]) {
+		const result = runUpgradeController(
+			scenario,
+			true,
+			'task-reminders-v1'
+		)
+		assert.equal(result.second.status, 0, result.second.stderr)
+		const failed = scenario.endsWith('-failed')
+		assert.equal(result.first.status === 0, !failed, result.first.stderr)
+		const trace = failed
+			? result.calls.slice(result.firstCalls.length)
+			: result.firstCalls
+		const stop = trace.indexOf(
+			'stop --timeout 90 crm-sales-reminders crm-sales-api'
+		)
+		const migrate = trace.indexOf('crm-sales-migrate')
+		const grants = trace.indexOf('PROBE upgrade-grants crm-sales')
+		const start = trace.indexOf('--force-recreate crm-sales-reminders')
+		assert.ok(
+			stop >= 0 && stop < migrate && migrate < grants && grants < start
+		)
+		assert.equal(
+			(
+				trace.match(
+					/stop --timeout 90 crm-sales-reminders crm-sales-api/g
+				) ?? []
+			).length,
+			1
+		)
+		if (failed) {
+			assert.ok(
+				result.firstCalls.includes(
+					'stop --timeout 90 crm-sales-reminders crm-sales-api'
+				)
+			)
+			assert.equal(
+				result.firstCalls.includes('--force-recreate crm-sales-reminders'),
+				false
+			)
+			assert.equal(
+				trace.includes('--force-recreate notification-delivery-worker'),
+				false
+			)
+		}
+	}
+	const failedProbe = runUpgradeController(
+		'task-writer-probe-failed',
+		false,
+		'task-reminders-v1'
+	)
+	assert.notEqual(failedProbe.first.status, 0)
+	assert.equal(failedProbe.calls.includes('crm-sales-migrate'), false)
+	assert.equal(
+		failedProbe.calls.includes(
+			'stop --timeout 90 crm-sales-reminders crm-sales-api'
+		),
+		false
 	)
 })
 

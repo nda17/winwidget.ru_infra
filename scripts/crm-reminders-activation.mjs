@@ -8,8 +8,31 @@ export const CRM_REMINDERS_TARGETS = Object.freeze([
 	'winwidget-crm/crm-sales-reminders',
 	'winwidget-crm/crm-sales-api'
 ])
-const NEW = CRM_REMINDERS_TARGETS[1]
 const KIND = 'winwidget.crm.reminders-activation.v1'
+export const CRM_INTAKE_SLA_ACTIVATION_KIND =
+	'winwidget.crm.intake-sla-activation.v1'
+export const CRM_INTAKE_SLA_TARGETS = Object.freeze([
+	'winwidget/notification-delivery-worker',
+	'winwidget-crm/crm-intake-sla-worker',
+	'winwidget-crm/crm-intake-sla-publisher',
+	'winwidget-crm/crm-intake-api'
+])
+// Exactly two reviewed workflows, not an extensible activation framework.
+export function crmActivationSpec(value = KIND) {
+	const kind = value.endsWith('.baseline') ? value.slice(0, -9) : value
+	assert.ok([KIND, CRM_INTAKE_SLA_ACTIVATION_KIND].includes(kind))
+	const sla = kind === CRM_INTAKE_SLA_ACTIVATION_KIND
+	const targets = sla ? CRM_INTAKE_SLA_TARGETS : CRM_REMINDERS_TARGETS
+	return {
+		kind,
+		targets,
+		newTargets: targets.slice(1, -1),
+		owner: sla ? 'crm-intake' : 'crm-sales',
+		api: targets.at(-1),
+		flag: sla ? 'CRM_INTAKE_SLA_ENABLED' : 'CRM_TASK_REMINDERS_ENABLED',
+		prefix: sla ? 'wincrm-intake-sla-' : 'wincrm-task-reminder-'
+	}
+}
 const stable = value =>
 	JSON.stringify(value, (_, item) =>
 		item && typeof item === 'object' && !Array.isArray(item)
@@ -121,12 +144,21 @@ function inventory(live) {
 		)
 	}
 }
-const neighbors = (live, revision) =>
+const neighbors = (live, revision, kind = KIND) =>
 	crmNeighborFingerprint(
-		live.filter(row => !CRM_REMINDERS_TARGETS.includes(keyOf(row))),
+		live.filter(
+			row => !crmActivationSpec(kind).targets.includes(keyOf(row))
+		),
 		revision
 	)
 function baselineShape(value) {
+	const {
+		kind: KIND,
+		targets: CRM_REMINDERS_TARGETS,
+		newTargets,
+		api
+	} = crmActivationSpec(value?.kind)
+
 	exact(value, [
 		'schemaVersion',
 		'kind',
@@ -145,41 +177,65 @@ function baselineShape(value) {
 	for (const [key, row] of Object.entries(value.targets)) {
 		exact(
 			row,
-			key === NEW
+			newTargets.includes(key)
 				? ['absent', 'image', 'revision']
 				: ['id', 'image', 'revision', 'startedAt', 'configurationSha256']
 		)
 		assert.match(row.image, /^sha256:[a-f0-9]{64}$/)
 		assert.ok(isRevision(row.revision))
-		if (key === NEW) assert.equal(row.absent, true)
+		if (newTargets.includes(key)) assert.equal(row.absent, true)
 		else {
 			assert.ok(isHash(row.id) && isHash(row.configurationSha256))
 			assert.ok(Number.isFinite(Date.parse(row.startedAt)))
 		}
 	}
-	assert.equal(
-		value.targets[NEW].image,
-		value.targets[CRM_REMINDERS_TARGETS[2]].image
-	)
-	assert.equal(
-		value.targets[NEW].revision,
-		value.targets[CRM_REMINDERS_TARGETS[2]].revision
-	)
+	for (const key of newTargets) {
+		assert.equal(value.targets[key].image, value.targets[api].image)
+		assert.equal(value.targets[key].revision, value.targets[api].revision)
+	}
 }
 export function crmRemindersBaseline(
 	live,
 	gatewayRevision,
-	environmentHashes
+	environmentHashes,
+	kind = KIND
 ) {
 	return protectedCall(() => {
+		const {
+			kind: KIND,
+			targets: CRM_REMINDERS_TARGETS,
+			newTargets,
+			api
+		} = crmActivationSpec(kind)
 		inventory(live)
 		hashes(environmentHashes)
+		if (KIND === CRM_INTAKE_SLA_ACTIVATION_KIND) {
+			for (const [name, role] of [
+				['crm-sales-api', 'api'],
+				['crm-sales-reminders', 'reminders']
+			]) {
+				const row = live.find(
+					row => keyOf(row) === 'winwidget-crm/' + name
+				)
+				running(row)
+				assert.equal(
+					environment(row.Config.Env).CRM_TASK_REMINDERS_ENABLED,
+					'true'
+				)
+				assert.equal(
+					environment(row.Config.Env).CRM_SALES_PROCESS_ROLE,
+					role
+				)
+			}
+		}
 		assert.equal(
-			live.some(row => keyOf(row) === NEW),
+			live.some(row => newTargets.includes(keyOf(row))),
 			false
 		)
 		const targets = {}
-		for (const key of CRM_REMINDERS_TARGETS.filter(key => key !== NEW)) {
+		for (const key of CRM_REMINDERS_TARGETS.filter(
+			key => !newTargets.includes(key)
+		)) {
 			const row = live.find(row => keyOf(row) === key)
 			running(row)
 			const revision = environment(row.Config.Env).APP_REVISION
@@ -196,17 +252,18 @@ export function crmRemindersBaseline(
 				configurationSha256: digest(configuration(row))
 			}
 		}
-		targets[NEW] = {
-			absent: true,
-			image: targets[CRM_REMINDERS_TARGETS[2]].image,
-			revision: targets[CRM_REMINDERS_TARGETS[2]].revision
-		}
+		for (const key of newTargets)
+			targets[key] = {
+				absent: true,
+				image: targets[api].image,
+				revision: targets[api].revision
+			}
 		const result = {
 			schemaVersion: 1,
 			kind: KIND + '.baseline',
 			gatewayRevision,
 			environmentHashes: hashes(environmentHashes),
-			neighborsSha256: neighbors(live, gatewayRevision),
+			neighborsSha256: neighbors(live, gatewayRevision, KIND),
 			targets
 		}
 		baselineShape(result)
@@ -223,6 +280,7 @@ function serviceConfiguration(service, row, image) {
 		'labels',
 		'user',
 		'network_mode',
+		'extra_hosts',
 		'read_only',
 		'privileged',
 		'pid',
@@ -255,7 +313,7 @@ function serviceConfiguration(service, row, image) {
 	assert.equal(
 		row.HostConfig.MemorySwap,
 		service.memswap_limit === undefined
-			? 2 * Number(service.mem_limit)
+			? 2 * Number(service.mem_limit ?? 0)
 			: Number(service.memswap_limit)
 	)
 	assert.equal(row.Config.WorkingDir, image.Config.WorkingDir)
@@ -298,6 +356,10 @@ function imageShape(image, owner, previous) {
 			'winwidget-' + owner
 		)
 	for (const key of [
+		'CRM_INTAKE_SLA_ENABLED',
+		'CRM_INTAKE_NOTIFICATION_DELIVERY_TOKEN',
+		'NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN',
+		'CRM_INTAKE_SLA_RABBITMQ_URL',
 		'CRM_TASK_REMINDERS_ENABLED',
 		'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
 		'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN',
@@ -316,12 +378,15 @@ export function prepareCrmRemindersActivation(
 ) {
 	return protectedCall(() => {
 		baselineShape(baseline)
+		const spec = crmActivationSpec(baseline.kind)
+		const { kind: KIND, targets: CRM_REMINDERS_TARGETS, newTargets } = spec
 		assert.equal(
 			stable(
 				crmRemindersBaseline(
 					live,
 					baseline.gatewayRevision,
-					environmentHashes
+					environmentHashes,
+					KIND
 				)
 			),
 			stable(baseline)
@@ -350,7 +415,7 @@ export function prepareCrmRemindersActivation(
 				previous = baseline.targets[key]
 			const image = images.find(row => row.Id === previous.image),
 				owner =
-					project === 'winwidget' ? 'notification-delivery' : 'crm-sales'
+					project === 'winwidget' ? 'notification-delivery' : spec.owner
 			imageShape(image, owner, previous)
 			const prefix = project === 'winwidget' ? 'notification' : 'crm',
 				before = configs[prefix + 'Before'],
@@ -364,7 +429,7 @@ export function prepareCrmRemindersActivation(
 				...environment(image.Config.Env ?? []),
 				...service.environment
 			}
-			if (key !== NEW) {
+			if (!newTargets.includes(key)) {
 				const row = live.find(row => keyOf(row) === key),
 					oldService = before.services[name]
 				assert.equal(oldService.image, previous.image)
@@ -376,18 +441,16 @@ export function prepareCrmRemindersActivation(
 					}),
 					stable(environment(row.Config.Env))
 				)
-				if (owner === 'crm-sales')
+				if (owner === spec.owner)
 					assert.equal(
-						oldService.environment.CRM_TASK_REMINDERS_ENABLED ?? 'false',
+						oldService.environment[spec.flag] ?? 'false',
 						'false'
 					)
 				else
 					assert.equal(
 						oldService.environment.NOTIFICATION_DELIVERY_KINDS.split(
 							','
-						).some(kind =>
-							kind.trim().startsWith('wincrm-task-reminder-')
-						),
+						).some(kind => kind.trim().startsWith(spec.prefix)),
 						false
 					)
 				const candidate = structuredClone(row)
@@ -418,6 +481,8 @@ export function prepareCrmRemindersActivation(
 }
 export function crmRemindersPlanDigest(plan) {
 	return protectedCall(() => {
+		const { kind: KIND, targets: CRM_REMINDERS_TARGETS } =
+			crmActivationSpec(plan?.kind)
 		exact(plan, [
 			'schemaVersion',
 			'kind',
@@ -435,10 +500,10 @@ export function crmRemindersPlanDigest(plan) {
 		return digest(plan)
 	})
 }
-function newConfiguration(row, plan) {
+function newConfiguration(row, plan, key) {
 	const service =
-			plan.desired['winwidget-crm'].services['crm-sales-reminders'],
-		image = plan.images.find(image => image.Id === plan.targets[NEW].image)
+			plan.desired['winwidget-crm'].services[key.split('/')[1]],
+		image = plan.images.find(image => image.Id === plan.targets[key].image)
 	serviceConfiguration(service, row, image)
 	assert.equal(
 		stable(environment(row.Config.Env)),
@@ -447,7 +512,7 @@ function newConfiguration(row, plan) {
 			...service.environment
 		})
 	)
-	assert.equal(row.Name, '/winwidget-crm-crm-sales-reminders-1')
+	assert.equal(row.Name, '/winwidget-crm-' + key.split('/')[1] + '-1')
 	assert.equal(row.Config.Labels['com.docker.compose.oneoff'], 'False')
 	assert.equal(
 		row.Config.Labels['com.docker.compose.container-number'],
@@ -458,11 +523,17 @@ export function assertCrmRemindersProgress(live, baseline, plan, state) {
 	return protectedCall(() => {
 		inventory(live)
 		baselineShape(baseline)
+		const {
+			kind: KIND,
+			targets: CRM_REMINDERS_TARGETS,
+			newTargets
+		} = crmActivationSpec(baseline.kind)
+		assert.equal(plan.kind, KIND)
 		const planSha256 = crmRemindersPlanDigest(plan)
 		assert.equal(plan.baselineSha256, digest(baseline))
 		exact(state, ['admission', 'completed', 'switching'])
 		assert.equal(
-			neighbors(live, baseline.gatewayRevision),
+			neighbors(live, baseline.gatewayRevision, KIND),
 			baseline.neighborsSha256
 		)
 		const done = Object.keys(state.completed)
@@ -489,7 +560,7 @@ export function assertCrmRemindersProgress(live, baseline, plan, state) {
 				complete = Object.hasOwn(state.completed, key),
 				switching = key === state.switching
 			if (!row) {
-				assert.ok(!complete && (key === NEW || switching))
+				assert.ok(!complete && (newTargets.includes(key) || switching))
 				continue
 			}
 			assert.equal(row.Image, old.image)
@@ -498,16 +569,16 @@ export function assertCrmRemindersProgress(live, baseline, plan, state) {
 				row.Config.Labels['org.opencontainers.image.revision'],
 				old.revision
 			)
-			if (key === NEW) {
+			if (newTargets.includes(key)) {
 				assert.ok(complete || switching)
-				newConfiguration(row, plan)
+				newConfiguration(row, plan, key)
 			}
 			if (complete) {
 				exact(state.completed[key], ['id', 'startedAt'])
 				assert.notEqual(row.Id, old.id)
 				assert.equal(row.Id, state.completed[key].id)
 				assert.equal(row.State.StartedAt, state.completed[key].startedAt)
-				if (key !== NEW)
+				if (!newTargets.includes(key))
 					assert.equal(
 						digest(configuration(row)),
 						plan.targets[key].desiredConfigurationSha256
@@ -515,7 +586,7 @@ export function assertCrmRemindersProgress(live, baseline, plan, state) {
 				running(row)
 			} else if (switching) {
 				running(row, false)
-				if (key !== NEW) {
+				if (!newTargets.includes(key)) {
 					assert.equal(
 						digest(configuration(row)),
 						row.Id === old.id

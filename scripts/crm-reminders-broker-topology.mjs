@@ -318,8 +318,15 @@ const bindingKey = value =>
 
 export async function readCrmRemindersBrokerSnapshot(
 	request,
-	timeoutMs = 15000
+	timeoutMs = 15000,
+	activation = 'reminders'
 ) {
+	assert.ok(['reminders', 'intake-sla'].includes(activation))
+	const owns =
+		activation === 'intake-sla'
+			? (await import('./crm-intake-sla-broker-topology.mjs'))
+					.crmIntakeSlaBrokerOwns
+			: owned
 	assert.ok(
 		Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 30000
 	)
@@ -336,7 +343,7 @@ export async function readCrmRemindersBrokerSnapshot(
 				row =>
 					row &&
 					typeof row.name === 'string' &&
-					(!owned(row.name) ||
+					(!owns(row.name) ||
 						(Number.isSafeInteger(row.consumers) && row.consumers >= 0))
 			)
 		)
@@ -431,21 +438,33 @@ export async function provisionCrmRemindersBroker({
 	credentials,
 	legacyPrincipals,
 	readSnapshot,
-	assertReleaseFence
+	assertReleaseFence,
+	activation = 'reminders'
 }) {
 	let stage = 'preflight'
 	try {
+		assert.ok(['reminders', 'intake-sla'].includes(activation))
+		const sla = activation === 'intake-sla'
+		const module = sla
+			? await import('./crm-intake-sla-broker-topology.mjs')
+			: null
+		const selected = sla ? module.crmIntakeSlaBrokerContract() : contract
+		const principals = sla ? selected.principals : [principal]
+		const names = principals.map(row => row.name)
+		const owns = sla ? module.crmIntakeSlaBrokerOwns : owned
+		const assertSnapshot = sla
+			? module.assertCrmIntakeSlaBrokerSnapshot
+			: assertCrmRemindersBrokerSnapshot
 		assert.equal(typeof assertReleaseFence, 'function')
-		assert.deepEqual(Object.keys(credentials), [CRM_REMINDERS_PRINCIPAL])
-		assert.match(
-			credentials[CRM_REMINDERS_PRINCIPAL],
-			/^[a-f0-9]{48,128}$/
-		)
-		assert.equal(legacyPrincipals.length, 25)
-		assert.equal(new Set(legacyPrincipals).size, 25)
+		assert.deepEqual(Object.keys(credentials).sort(), [...names].sort())
+		for (const name of names)
+			assert.match(credentials[name], /^[a-f0-9]{48,128}$/)
+		assert.equal(new Set(Object.values(credentials)).size, names.length)
+		assert.equal(legacyPrincipals.length, sla ? 26 : 25)
+		assert.equal(new Set(legacyPrincipals).size, legacyPrincipals.length)
 		assert.ok(
 			legacyPrincipals.includes('winwidget-notification-delivery') &&
-				!legacyPrincipals.includes(CRM_REMINDERS_PRINCIPAL)
+				names.every(name => !legacyPrincipals.includes(name))
 		)
 		credentials = { ...credentials }
 		legacyPrincipals = [...legacyPrincipals]
@@ -458,7 +477,7 @@ export async function provisionCrmRemindersBroker({
 			assert.ok([users, permissions, topics].every(Array.isArray))
 			assert.deepEqual(
 				users
-					.filter(user => user.name !== CRM_REMINDERS_PRINCIPAL)
+					.filter(user => !names.includes(user.name))
 					.map(user => user.name)
 					.sort(),
 				[...legacyPrincipals].sort()
@@ -488,41 +507,33 @@ export async function provisionCrmRemindersBroker({
 				...topic
 			}))
 		const validate = (state, complete) => {
-			const user = state.users.find(
-				user => user.name === CRM_REMINDERS_PRINCIPAL
-			)
-			if (complete) assert.ok(user)
-			if (user) {
-				assert.deepEqual(user.tags, [])
-				assert.deepEqual(user.limits ?? {}, {})
+			for (const principal of principals) {
+				const name = principal.name
+				const user = state.users.find(user => user.name === name)
+				if (complete) assert.ok(user)
+				if (user) {
+					assert.deepEqual(user.tags, [])
+					assert.deepEqual(user.limits ?? {}, {})
+				}
+				const resource = state.permissions.filter(row => row.user === name)
+				assert.ok(resource.length <= 1)
+				if (resource.length || complete)
+					assert.deepEqual(resource, [grant(name, principal)])
+				const topics = state.topics.filter(row => row.user === name)
+				assert.ok(topics.length <= principal.topics.length)
+				if (topics.length || resource.length || complete)
+					assert.deepEqual(topics, grants(name, principal))
+				if (!user) assert.equal(resource.length + topics.length, 0)
 			}
-			const resource = state.permissions.filter(
-				row => row.user === CRM_REMINDERS_PRINCIPAL
-			)
-			assert.ok(resource.length <= 1)
-			if (resource.length || complete)
-				assert.deepEqual(resource, [
-					grant(CRM_REMINDERS_PRINCIPAL, principal)
-				])
-			const topics = state.topics.filter(
-				row => row.user === CRM_REMINDERS_PRINCIPAL
-			)
-			assert.ok(topics.length <= 1)
-			if (topics.length || resource.length || complete)
-				assert.deepEqual(
-					topics,
-					grants(CRM_REMINDERS_PRINCIPAL, principal)
-				)
-			if (!user) assert.equal(resource.length + topics.length, 0)
 			const notification = 'winwidget-notification-delivery'
 			const nd = state.permissions.filter(row => row.user === notification)
 			assert.ok(
 				isDeepStrictEqual(nd, [
-					grant(notification, contract.notificationAfter)
+					grant(notification, selected.notificationAfter)
 				]) ||
 					(!complete &&
 						isDeepStrictEqual(nd, [
-							grant(notification, contract.notificationBefore)
+							grant(notification, selected.notificationBefore)
 						]))
 			)
 			const nt = state.topics.filter(row => row.user === notification)
@@ -530,21 +541,18 @@ export async function provisionCrmRemindersBroker({
 			assert.equal(new Set(nt.map(row => row.exchange)).size, 2)
 			for (const topic of nt)
 				assert.ok(
-					grants(notification, contract.notificationAfter).some(row =>
+					grants(notification, selected.notificationAfter).some(row =>
 						isDeepStrictEqual(row, topic)
 					) ||
 						(!complete &&
-							grants(notification, contract.notificationBefore).some(row =>
+							grants(notification, selected.notificationBefore).some(row =>
 								isDeepStrictEqual(row, topic)
 							))
 				)
 		}
-		const authenticate = async () => {
+		const authenticate = async name => {
 			await assertReleaseFence()
-			const connection = await connect(
-				CRM_REMINDERS_PRINCIPAL,
-				credentials[CRM_REMINDERS_PRINCIPAL]
-			)
+			const connection = await connect(name, credentials[name])
 			try {
 				const probe = await connection.createChannel()
 				await probe.close()
@@ -556,13 +564,21 @@ export async function provisionCrmRemindersBroker({
 		const before = await read()
 		validate(before, false)
 		const topologyBefore = await readSnapshot()
-		assertCrmRemindersBrokerSnapshot(topologyBefore)
-		if (
-			before.permissions.some(row => row.user === CRM_REMINDERS_PRINCIPAL)
-		)
-			await authenticate()
+		assertSnapshot(topologyBefore)
+		for (const name of names)
+			if (before.permissions.some(row => row.user === name))
+				await authenticate(name)
 		stage = 'topology'
-		for (const queue of queues) {
+		for (const exchange of selected.exchanges ?? []) {
+			await assertReleaseFence()
+			await channel.assertExchange(exchange.name, exchange.type, {
+				durable: true,
+				autoDelete: false,
+				internal: false,
+				arguments: exchange.arguments
+			})
+		}
+		for (const queue of selected.queues) {
 			await assertReleaseFence()
 			await channel.assertQueue(queue.name, {
 				durable: true,
@@ -571,7 +587,7 @@ export async function provisionCrmRemindersBroker({
 				arguments: queue.arguments
 			})
 		}
-		for (const row of bindings) {
+		for (const row of selected.bindings) {
 			await assertReleaseFence()
 			await channel.bindQueue(
 				row.destination,
@@ -581,42 +597,42 @@ export async function provisionCrmRemindersBroker({
 			)
 		}
 		stage = 'principal'
-		if (
-			!before.users.some(user => user.name === CRM_REMINDERS_PRINCIPAL)
-		) {
-			await assertReleaseFence()
-			await request(`/api/users/${CRM_REMINDERS_PRINCIPAL}`, 'PUT', {
-				password: credentials[CRM_REMINDERS_PRINCIPAL],
-				tags: ''
-			})
-		}
-		// A missing topic grant is unrestricted in RabbitMQ. Establish its exact
-		// restriction before allowing any write to the shared topic exchange.
-		if (!before.topics.some(row => row.user === CRM_REMINDERS_PRINCIPAL)) {
-			await assertReleaseFence()
-			await request(
-				`/api/topic-permissions/winwidget/${CRM_REMINDERS_PRINCIPAL}`,
-				'PUT',
-				principal.topics[0]
-			)
-		}
-		if (
-			!before.permissions.some(row => row.user === CRM_REMINDERS_PRINCIPAL)
-		) {
-			await assertReleaseFence()
-			await request(
-				`/api/permissions/winwidget/${CRM_REMINDERS_PRINCIPAL}`,
-				'PUT',
-				{
+		for (const principal of principals) {
+			const name = principal.name
+			if (!before.users.some(user => user.name === name)) {
+				await assertReleaseFence()
+				await request(`/api/users/${name}`, 'PUT', {
+					password: credentials[name],
+					tags: ''
+				})
+			}
+			// A missing topic grant is unrestricted in RabbitMQ. Establish its exact
+			// restriction before allowing any write to the shared topic exchange.
+			for (const topic of principal.topics)
+				if (
+					!before.topics.some(
+						row => row.user === name && row.exchange === topic.exchange
+					)
+				) {
+					await assertReleaseFence()
+					await request(
+						`/api/topic-permissions/winwidget/${name}`,
+						'PUT',
+						topic
+					)
+				}
+			if (!before.permissions.some(row => row.user === name)) {
+				await assertReleaseFence()
+				await request(`/api/permissions/winwidget/${name}`, 'PUT', {
 					configure: principal.configure,
 					read: principal.read,
 					write: principal.write
-				}
-			)
+				})
+			}
 		}
 		stage = 'notification-acl'
 		const ndName = 'winwidget-notification-delivery',
-			acl = contract.notificationAfter
+			acl = selected.notificationAfter
 		if (
 			!isDeepStrictEqual(
 				before.permissions.find(row => row.user === ndName),
@@ -648,25 +664,21 @@ export async function provisionCrmRemindersBroker({
 				)
 			}
 		stage = 'verify'
-		await authenticate()
+		for (const name of names) await authenticate(name)
 		await assertReleaseFence()
 		const after = await read()
 		validate(after, true)
 		const stable = state => ({
 			users: state.users
-				.filter(row => row.name !== CRM_REMINDERS_PRINCIPAL)
+				.filter(row => !names.includes(row.name))
 				.sort((a, b) => a.name.localeCompare(b.name)),
 			permissions: state.permissions
-				.filter(
-					row => ![CRM_REMINDERS_PRINCIPAL, ndName].includes(row.user)
-				)
+				.filter(row => ![...names, ndName].includes(row.user))
 				.sort((a, b) =>
 					JSON.stringify(a).localeCompare(JSON.stringify(b))
 				),
 			topics: state.topics
-				.filter(
-					row => ![CRM_REMINDERS_PRINCIPAL, ndName].includes(row.user)
-				)
+				.filter(row => ![...names, ndName].includes(row.user))
 				.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
 		})
 		assert.deepEqual(stable(after), stable(before))
@@ -678,6 +690,7 @@ export async function provisionCrmRemindersBroker({
 		const topologyAfter = await readSnapshot()
 		const stableTopology = snapshot => ({
 			exchanges: snapshot.exchanges
+				.filter(row => !owns(row.name))
 				.map(
 					({
 						name,
@@ -697,7 +710,7 @@ export async function provisionCrmRemindersBroker({
 				)
 				.sort((a, b) => a.name.localeCompare(b.name)),
 			queues: snapshot.queues
-				.filter(row => !owned(row.name))
+				.filter(row => !owns(row.name))
 				.map(
 					({
 						name,
@@ -717,7 +730,7 @@ export async function provisionCrmRemindersBroker({
 				)
 				.sort((a, b) => a.name.localeCompare(b.name)),
 			bindings: snapshot.bindings
-				.filter(row => !owned(row.source) && !owned(row.destination))
+				.filter(row => !owns(row.source) && !owns(row.destination))
 				.map(bindingKey)
 				.sort()
 		})
@@ -726,12 +739,12 @@ export async function provisionCrmRemindersBroker({
 			stableTopology(topologyBefore)
 		)
 		return {
-			...assertCrmRemindersBrokerSnapshot(topologyAfter, true),
+			...assertSnapshot(topologyAfter, true),
 			credentialsProvisioned: true,
-			authenticatedPrincipals: 1,
-			legacyPrincipalsUnchanged: 24,
+			authenticatedPrincipals: names.length,
+			legacyPrincipalsUnchanged: legacyPrincipals.length - 1,
 			notificationAclVerified: true,
-			notificationKinds: 14
+			notificationKinds: sla ? 16 : 14
 		}
 	} catch {
 		throw new Error(

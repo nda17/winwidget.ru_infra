@@ -4,7 +4,8 @@ import { lstatSync, readFileSync, readSync } from 'node:fs'
 import { parseEnv } from 'node:util'
 import { pathToFileURL } from 'node:url'
 import {
-	CRM_REMINDERS_TARGETS,
+	crmActivationSpec,
+	CRM_INTAKE_SLA_ACTIVATION_KIND,
 	crmRemindersBaseline,
 	prepareCrmRemindersActivation,
 	crmRemindersPlanDigest,
@@ -26,12 +27,36 @@ export const REMINDERS_PAYLOAD_FILES = Object.freeze([
 	'crm-broker-topology.mjs',
 	'crm-reminders-broker-topology.mjs'
 ])
+export const INTAKE_SLA_PAYLOAD_FILES = Object.freeze([
+	...REMINDERS_PAYLOAD_FILES,
+	'crm-intake-sla-broker-topology.mjs'
+])
+export function crmActivationKind(
+	scope = process.env.REMINDERS_ACTIVATION_SCOPE ??
+		'crm-reminders-activate'
+) {
+	assert.ok(
+		['crm-reminders-activate', 'crm-intake-sla-activate'].includes(scope)
+	)
+	return scope === 'crm-intake-sla-activate'
+		? CRM_INTAKE_SLA_ACTIVATION_KIND
+		: 'winwidget.crm.reminders-activation.v1'
+}
+const slaKind = kind => kind === CRM_INTAKE_SLA_ACTIVATION_KIND
+const slaBroker = () => import('./crm-intake-sla-broker-topology.mjs')
 const sha = bytes => createHash('sha256').update(bytes).digest('hex')
 const exact = (value, keys) => {
 	assert.ok(value && typeof value === 'object' && !Array.isArray(value))
 	assert.deepEqual(Object.keys(value).sort(), [...keys].sort())
 }
-export function validateRemindersPayload(bytes) {
+export function validateRemindersPayload(
+	bytes,
+	kind = crmActivationKind('crm-reminders-activate')
+) {
+	crmActivationSpec(kind)
+	const files = slaKind(kind)
+		? INTAKE_SLA_PAYLOAD_FILES
+		: REMINDERS_PAYLOAD_FILES
 	assert.ok(
 		Buffer.byteLength(bytes) > 0 && Buffer.byteLength(bytes) <= 524288
 	)
@@ -41,7 +66,7 @@ export function validateRemindersPayload(bytes) {
 	assert.ok(Array.isArray(value.files))
 	assert.deepEqual(
 		value.files.map(row => row.name).sort(),
-		[...REMINDERS_PAYLOAD_FILES].sort()
+		[...files].sort()
 	)
 	return value.files.map(row => {
 		exact(row, ['name', 'sha256', 'content'])
@@ -92,7 +117,7 @@ export function remindersTransition(
 	const key = progress.next
 	if (action === 'progress') return progress
 	assert.ok(key && state.admission)
-	const index = CRM_REMINDERS_TARGETS.indexOf(key)
+	const index = crmActivationSpec(plan.kind).targets.indexOf(key)
 	const expectedStart = {
 		schemaVersion: 1,
 		planSha256: crmRemindersPlanDigest(plan),
@@ -215,7 +240,9 @@ const currentHashes = () => ({
 function binding(plan) {
 	return {
 		schemaVersion: 1,
-		scope: 'crm-reminders-activate',
+		scope: slaKind(plan.kind)
+			? 'crm-intake-sla-activate'
+			: 'crm-reminders-activate',
 		servicesRevision: process.env.REMINDERS_SERVICES_REVISION,
 		infraRevision: process.env.REMINDERS_INFRA_REVISION,
 		payloadSha256: process.env.REMINDERS_PAYLOAD_SHA256,
@@ -228,9 +255,11 @@ function binding(plan) {
 	}
 }
 function session() {
+	const approvedKind = crmActivationKind()
 	const plan = json('plan'),
 		baseline = json('baseline'),
 		expected = binding(plan)
+	assert.equal(plan.kind, approvedKind)
 	assert.deepEqual(json('binding'), expected)
 	assert.equal(
 		expected.baselineSha256,
@@ -252,30 +281,50 @@ function session() {
 		observed: optional('observed-' + index)
 	}
 }
-export function reminderOverlaySources(configs, live) {
+export function reminderOverlaySources(
+	configs,
+	live,
+	kind = crmActivationKind('crm-reminders-activate')
+) {
+	const spec = crmActivationSpec(kind),
+		sla = slaKind(kind)
 	// Prepared owner env contains the final flags. Reconstruct ONLY approved
 	// before-fields from the captured runtime; every other setting must still match.
 	const result = structuredClone(configs)
 	for (const [prefix, key, fields] of [
 		[
 			'notification',
-			CRM_REMINDERS_TARGETS[0],
-			[
-				'CRM_SALES_INTERNAL_BASE_URL',
-				'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
-				'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN',
-				'NOTIFICATION_DELIVERY_KINDS'
-			]
+			spec.targets[0],
+			sla
+				? [
+						'CRM_INTAKE_INTERNAL_BASE_URL',
+						'CRM_INTAKE_NOTIFICATION_DELIVERY_TOKEN',
+						'NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN',
+						'NOTIFICATION_DELIVERY_KINDS'
+					]
+				: [
+						'CRM_SALES_INTERNAL_BASE_URL',
+						'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
+						'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN',
+						'NOTIFICATION_DELIVERY_KINDS'
+					]
 		],
 		[
 			'crm',
-			CRM_REMINDERS_TARGETS[2],
-			[
-				'CRM_TASK_REMINDERS_ENABLED',
-				'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
-				'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN',
-				'NOTIFICATION_DELIVERY_INTERNAL_BASE_URL'
-			]
+			spec.api,
+			sla
+				? [
+						'CRM_INTAKE_SLA_ENABLED',
+						'CRM_INTAKE_NOTIFICATION_DELIVERY_TOKEN',
+						'NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN',
+						'NOTIFICATION_DELIVERY_INTERNAL_BASE_URL'
+					]
+				: [
+						'CRM_TASK_REMINDERS_ENABLED',
+						'CRM_SALES_NOTIFICATION_DELIVERY_TOKEN',
+						'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN',
+						'NOTIFICATION_DELIVERY_INTERNAL_BASE_URL'
+					]
 		]
 	]) {
 		const rows = live.filter(row => keyOf(row) === key)
@@ -296,7 +345,8 @@ export function reminderOverlaySources(configs, live) {
 	}
 	return result
 }
-function ownerFiles() {
+async function ownerFiles() {
+	const sla = slaKind(crmActivationKind())
 	const canonical = parseReminderEnv(
 		privateBytes('/run/canonical.env', 131072).toString('utf8')
 	)
@@ -312,6 +362,35 @@ function ownerFiles() {
 		'task-reminders-v1'
 	)
 	assert.equal(crm.CRM_TASK_REMINDERS_ENABLED, 'true')
+	if (sla) {
+		assert.equal(
+			canonical.CRM_INTAKE_SLA_RABBITMQ_CONTRACT,
+			'intake-sla-v1'
+		)
+		assert.equal(crm.CRM_INTAKE_SLA_ENABLED, 'true')
+		for (const field of [
+			'CRM_INTAKE_NOTIFICATION_DELIVERY_TOKEN',
+			'NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN'
+		]) {
+			assert.equal(canonical[field], crm[field])
+			assert.equal(notification[field], crm[field])
+		}
+		assert.equal(
+			notification.CRM_INTAKE_INTERNAL_BASE_URL,
+			'http://127.0.0.1:5310'
+		)
+		assert.equal(
+			notification.NOTIFICATION_DELIVERY_KINDS,
+			canonical.NOTIFICATION_DELIVERY_KINDS
+		)
+		const module = await slaBroker()
+		module.crmIntakeSlaBrokerInputs(
+			canonical,
+			crm,
+			module.crmIntakeSlaNotificationTopology()
+		)
+		return { canonical, crm, notification }
+	}
 	for (const field of [
 		'NOTIFICATION_DELIVERY_KINDS',
 		'CRM_SALES_INTERNAL_BASE_URL',
@@ -334,18 +413,23 @@ function ownerFiles() {
 export async function verifyReminderReadiness(
 	input,
 	fetcher = fetch,
-	now = Date.now()
+	now = Date.now(),
+	kind = crmActivationKind('crm-reminders-activate')
 ) {
+	const sla = slaKind(kind)
+	crmActivationSpec(kind)
 	exact(input, ['token'])
 	assert.match(input.token, /^[a-f0-9]{48,128}$/)
 	const response = await fetcher(
-		'http://127.0.0.1:4401/internal/v1/crm-sales/task-reminders/readiness',
+		sla
+			? 'http://127.0.0.1:4401/internal/v1/crm-intake/sla/readiness'
+			: 'http://127.0.0.1:4401/internal/v1/crm-sales/task-reminders/readiness',
 		{
 			method: 'GET',
 			redirect: 'error',
 			signal: AbortSignal.timeout(5000),
 			headers: {
-				'x-winwidget-service': 'crm-sales',
+				'x-winwidget-service': sla ? 'crm-intake' : 'crm-sales',
 				'x-winwidget-internal-token': input.token
 			}
 		}
@@ -383,10 +467,15 @@ export async function verifyReminderReadiness(
 	}
 }
 async function main() {
+	const kind = crmActivationKind(),
+		spec = crmActivationSpec(kind),
+		sla = slaKind(kind)
 	const [mode, argument] = process.argv.slice(2)
 	assert.ok(process.argv.length <= 4)
 	if (mode === 'pack') {
-		const files = REMINDERS_PAYLOAD_FILES.map(name => {
+		const files = (
+			sla ? INTAKE_SLA_PAYLOAD_FILES : REMINDERS_PAYLOAD_FILES
+		).map(name => {
 			const path = new URL(name, import.meta.url),
 				stat = lstatSync(path)
 			assert.ok(stat.isFile() && !stat.isSymbolicLink())
@@ -394,15 +483,32 @@ async function main() {
 			return { name, sha256: sha(bytes), content: bytes.toString('utf8') }
 		})
 		const result = JSON.stringify({ schemaVersion: 1, files })
-		validateRemindersPayload(result)
+		validateRemindersPayload(result, kind)
 		return result
 	}
 	if (mode === 'readiness')
-		return verifyReminderReadiness(JSON.parse(boundedStdin()))
+		return verifyReminderReadiness(
+			JSON.parse(boundedStdin()),
+			fetch,
+			Date.now(),
+			kind
+		)
 	if (mode === 'source') {
-		assert.ok(['crm-sales', 'notification-delivery'].includes(argument))
-		const paths =
-			argument === 'crm-sales'
+		assert.ok([spec.owner, 'notification-delivery'].includes(argument))
+		const paths = sla
+			? argument === 'crm-intake'
+				? [
+						'dist/src/sla/sla.worker.js',
+						'dist/src/sla/sla.publisher.js',
+						'dist/src/sla/sla-delivery.service.js',
+						'dist/src/sla/sla.controller.js'
+					]
+				: [
+						'dist/src/notification-delivery/wincrm-intake-sla-context.service.js',
+						'dist/src/notification-delivery/wincrm-intake-sla-readiness.controller.js',
+						'dist/src/messaging/wincrm-intake-sla.contract.js'
+					]
+			: argument === 'crm-sales'
 				? [
 						'dist/src/main-reminders.js',
 						'dist/src/reminders/reminder-readiness.service.js',
@@ -430,11 +536,14 @@ async function main() {
 	}
 	if (mode === 'readiness-input')
 		return {
-			token:
-				ownerFiles().notification.NOTIFICATION_DELIVERY_CRM_SALES_TOKEN
+			token: (await ownerFiles()).notification[
+				sla
+					? 'NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN'
+					: 'NOTIFICATION_DELIVERY_CRM_SALES_TOKEN'
+			]
 		}
 	if (mode === 'database-input') {
-		assert.ok(['crm-sales', 'notification-delivery'].includes(argument))
+		assert.ok([spec.owner, 'notification-delivery'].includes(argument))
 		return crmUpgradeDatabaseInput(
 			argument,
 			privateBytes('/run/owner.env', 131072).toString('utf8'),
@@ -445,7 +554,8 @@ async function main() {
 		return crmRemindersBaseline(
 			json('inventory'),
 			process.env.REMINDERS_GATEWAY_REVISION,
-			currentHashes()
+			currentHashes(),
+			kind
 		)
 	if (mode === 'target-images')
 		return [
@@ -454,11 +564,9 @@ async function main() {
 			)
 		].join('\n')
 	if (mode === 'owner-image') {
-		assert.ok(['crm-sales', 'notification-delivery'].includes(argument))
+		assert.ok([spec.owner, 'notification-delivery'].includes(argument))
 		return json('baseline').targets[
-			argument === 'crm-sales'
-				? CRM_REMINDERS_TARGETS[2]
-				: CRM_REMINDERS_TARGETS[0]
+			argument === spec.owner ? spec.api : spec.targets[0]
 		].image
 	}
 	if (mode === 'image-env') {
@@ -509,15 +617,19 @@ async function main() {
 		return result.join('\n')
 	}
 	if (mode === 'notification-topology') {
-		ownerFiles()
-		return crmReminderNotificationTopology()
+		await ownerFiles()
+		return sla
+			? (await slaBroker()).crmIntakeSlaNotificationTopology()
+			: crmReminderNotificationTopology()
 	}
 	if (mode === 'prepare') {
 		assert.equal(optional('admission'), null)
 		assert.equal(optional('plan'), null)
-		ownerFiles()
-		const { validateCrmReminderDeployment } =
-			await import('/run/crm-reminder-validator.mjs')
+		await ownerFiles()
+		const validator = await import('/run/crm-reminder-validator.mjs')
+		const validateCrmReminderDeployment = sla
+			? validator.validateCrmIntakeSlaDeployment
+			: validator.validateCrmReminderDeployment
 		const configs = reminderOverlaySources(
 			{
 				crmBefore: json('crm-before'),
@@ -525,7 +637,8 @@ async function main() {
 				notificationBefore: json('notification-before'),
 				notificationAfter: json('notification-after')
 			},
-			json('initial')
+			json('initial'),
+			kind
 		)
 		return prepareCrmRemindersActivation(
 			{
@@ -552,16 +665,23 @@ async function main() {
 	const input = session()
 	if (mode === 'broker-report' || mode === 'broker-check') {
 		const expected = {
-			contractSha256: sha(JSON.stringify(crmRemindersBrokerContract())),
+			contractSha256: sha(
+				JSON.stringify(
+					sla
+						? (await slaBroker()).crmIntakeSlaBrokerContract()
+						: crmRemindersBrokerContract()
+				)
+			),
 			topologyVerified: true,
+			...(sla ? { exchanges: 2 } : {}),
 			queues: 12,
 			bindings: 18,
 			releaseApproved: false,
 			credentialsProvisioned: true,
-			authenticatedPrincipals: 1,
-			legacyPrincipalsUnchanged: 24,
+			authenticatedPrincipals: sla ? 2 : 1,
+			legacyPrincipalsUnchanged: sla ? 25 : 24,
 			notificationAclVerified: true,
-			notificationKinds: 14
+			notificationKinds: sla ? 16 : 14
 		}
 		if (mode === 'broker-check') {
 			assert.deepEqual(json('broker'), {
@@ -593,7 +713,7 @@ async function main() {
 			input.plan,
 			remindersState(input.state, input.marker, input.plan)
 		)
-		for (const owner of ['crm-sales', 'notification-delivery']) {
+		for (const owner of [spec.owner, 'notification-delivery']) {
 			const before = json(owner + '-database-before'),
 				current = json(owner + '-database-current')
 			assert.deepEqual(before, current)
@@ -611,7 +731,7 @@ async function main() {
 		const progress = remindersTransition(input, 'progress')
 		return progress.complete
 			? 'complete'
-			: CRM_REMINDERS_TARGETS.indexOf(progress.next) +
+			: spec.targets.indexOf(progress.next) +
 					' ' +
 					progress.next +
 					' ' +

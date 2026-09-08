@@ -3,6 +3,8 @@ import { existsSync } from 'node:fs'
 import { test } from 'node:test'
 import {
 	CRM_REMINDERS_TARGETS as targets,
+	CRM_INTAKE_SLA_TARGETS as slaTargets,
+	CRM_INTAKE_SLA_ACTIVATION_KIND as slaKind,
 	crmRemindersBaseline,
 	prepareCrmRemindersActivation,
 	crmRemindersPlanDigest,
@@ -73,16 +75,18 @@ function rowFor(project, name, service, image, number) {
 			CapAdd: [],
 			SecurityOpt: service.security_opt,
 			RestartPolicy: { Name: 'unless-stopped', MaximumRetryCount: 0 },
-			Memory: service.mem_limit,
+			Memory: service.mem_limit ?? 0,
 			MemoryReservation: service.mem_reservation ?? 0,
-			MemorySwap: service.memswap_limit ?? service.mem_limit * 2,
-			NanoCpus: service.cpus * 1e9,
+			MemorySwap: service.memswap_limit ?? (service.mem_limit ?? 0) * 2,
+			NanoCpus: (service.cpus ?? 0) * 1e9,
 			PidsLimit: service.pids_limit,
 			LogConfig: {
 				Type: service.logging.driver,
 				Config: service.logging.options
 			},
-			ExtraHosts: [],
+			ExtraHosts: Object.entries(service.extra_hosts ?? {}).map(
+				([host, address]) => `${host}:${address}`
+			),
 			Tmpfs: Object.fromEntries(
 				(service.tmpfs ?? []).map(value => [
 					value.slice(0, value.indexOf(':')),
@@ -290,9 +294,10 @@ const stateFor = plan => ({
 	switching: null
 })
 function replace(f, plan, index) {
-	const [project, name] = targets[index].split('/'),
+	const selectedTargets = plan.kind === slaKind ? slaTargets : targets
+	const [project, name] = selectedTargets[index].split('/'),
 		image = f.images.find(
-			image => image.Id === plan.targets[targets[index]].image
+			image => image.Id === plan.targets[selectedTargets[index]].image
 		)
 	const row = rowFor(
 		project,
@@ -302,11 +307,198 @@ function replace(f, plan, index) {
 		100 + index
 	)
 	row.State.StartedAt = '2026-09-07T22:00:00.000Z'
-	const previous = f.live.findIndex(item => keyOf(item) === targets[index])
+	const previous = f.live.findIndex(
+		item => keyOf(item) === selectedTargets[index]
+	)
 	if (previous >= 0) f.live.splice(previous, 1, row)
 	else f.live.push(row)
 	return row
 }
+
+function slaFixture() {
+	const f = fixture(),
+		crmBefore = structuredClone(f.configs.crmAfter),
+		notificationBefore = structuredClone(f.configs.notificationAfter)
+	crmBefore.services['crm-sales-api'].environment.CRM_SALES_PROCESS_ROLE =
+		'api'
+	const intakeImage = structuredClone(f.images[1])
+	intakeImage.Id = 'sha256:' + id(3)
+	intakeImage.Config.Labels['org.opencontainers.image.title'] =
+		'winwidget-crm-intake'
+	const api = structuredClone(
+		f.configs.crmBefore.services['crm-sales-api']
+	)
+	api.image = intakeImage.Id
+	api.environment = {
+		APP_REVISION: revision,
+		NODE_ENV: 'production',
+		CRM_INTAKE_PROCESS_ROLE: 'api'
+	}
+	crmBefore.services['crm-intake-api'] = api
+	const crmAfter = structuredClone(crmBefore),
+		notificationAfter = structuredClone(notificationBefore)
+	Object.assign(crmAfter.services['crm-intake-api'].environment, {
+		CRM_INTAKE_SLA_ENABLED: 'true',
+		CRM_INTAKE_NOTIFICATION_DELIVERY_TOKEN: '8'.repeat(64),
+		NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN: '9'.repeat(64),
+		NOTIFICATION_DELIVERY_INTERNAL_BASE_URL: 'http://127.0.0.1:4401'
+	})
+	for (const role of ['sla-worker', 'sla-publisher']) {
+		const service = structuredClone(crmAfter.services['crm-intake-api'])
+		service.environment.CRM_INTAKE_PROCESS_ROLE = role
+		crmAfter.services['crm-intake-' + role] = service
+	}
+	Object.assign(
+		notificationAfter.services['notification-delivery-worker'].environment,
+		{
+			CRM_INTAKE_INTERNAL_BASE_URL: 'http://127.0.0.1:5310',
+			CRM_INTAKE_NOTIFICATION_DELIVERY_TOKEN: '8'.repeat(64),
+			NOTIFICATION_DELIVERY_CRM_INTAKE_TOKEN: '9'.repeat(64)
+		}
+	)
+	notificationAfter.services[
+		'notification-delivery-worker'
+	].environment.NOTIFICATION_DELIVERY_KINDS +=
+		',wincrm-intake-sla-email,wincrm-intake-sla-telegram'
+	const live = [
+		rowFor(
+			'winwidget',
+			'notification-delivery-worker',
+			notificationBefore.services['notification-delivery-worker'],
+			f.images[0],
+			20
+		),
+		rowFor(
+			'winwidget-crm',
+			'crm-sales-api',
+			crmBefore.services['crm-sales-api'],
+			f.images[1],
+			21
+		),
+		f.live[2],
+		rowFor(
+			'winwidget-crm',
+			'crm-sales-reminders',
+			crmBefore.services['crm-sales-reminders'],
+			f.images[1],
+			23
+		),
+		rowFor('winwidget-crm', 'crm-intake-api', api, intakeImage, 24)
+	]
+	return {
+		live,
+		images: [f.images[0], intakeImage],
+		environmentHashes: f.environmentHashes,
+		configs: {
+			crmBefore,
+			crmAfter,
+			notificationBefore,
+			notificationAfter
+		},
+		baseline: crmRemindersBaseline(
+			live,
+			revision,
+			f.environmentHashes,
+			slaKind
+		)
+	}
+}
+
+test('SLA activation is a distinct four-step forward-only plan and preserves active Sales neighbors', () => {
+	const f = slaFixture(),
+		neighbors = structuredClone(
+			f.live.filter(row => !slaTargets.includes(keyOf(row)))
+		)
+	const plan = prepareCrmRemindersActivation(f, () => true)
+	assert.equal(plan.kind, slaKind)
+	assert.equal(Object.keys(plan.targets).length, 4)
+	assert.throws(() =>
+		crmRemindersBaseline(
+			f.live.filter(
+				row => keyOf(row) !== 'winwidget-crm/crm-sales-reminders'
+			),
+			revision,
+			f.environmentHashes,
+			slaKind
+		)
+	)
+	let state = stateFor(plan)
+	for (let index = 0; index < 4; index++) {
+		const input = () => ({
+			live: f.live,
+			baseline: f.baseline,
+			plan,
+			state,
+			marker: state.admission
+		})
+		assert.equal(
+			remindersTransition(input(), 'progress').next,
+			slaTargets[index]
+		)
+		state = remindersTransition(input(), 'begin')
+		const old = f.live.find(row => keyOf(row) === slaTargets[index])
+		if (old) {
+			old.State.Running = false
+			old.State.Pid = 0
+		}
+		const started = remindersTransition(input(), 'start')
+		assert.throws(() =>
+			remindersTransition({ ...input(), started }, 'start')
+		)
+		replace(f, plan, index)
+		const observed = remindersTransition(
+			{ ...input(), started },
+			'observe'
+		)
+		state = remindersTransition(
+			{ ...input(), started, observed },
+			'complete'
+		)
+	}
+	assert.equal(
+		assertCrmRemindersProgress(f.live, f.baseline, plan, state).complete,
+		true
+	)
+	assert.deepEqual(
+		f.live.filter(row => !slaTargets.includes(keyOf(row))),
+		neighbors
+	)
+	assert.throws(() =>
+		assertCrmRemindersProgress(
+			f.live,
+			{
+				...f.baseline,
+				kind: 'winwidget.crm.reminders-activation.v1.baseline'
+			},
+			plan,
+			state
+		)
+	)
+})
+
+test('legacy ND relay extra_hosts and unset resource limits remain exact during activation', () => {
+	const f = fixture()
+	for (const phase of ['notificationBefore', 'notificationAfter']) {
+		const service =
+			f.configs[phase].services['notification-delivery-worker']
+		service.extra_hosts = { 'tg.winwidget.ru': '127.0.0.1' }
+		delete service.mem_limit
+		delete service.cpus
+	}
+	f.live[0] = rowFor(
+		'winwidget',
+		'notification-delivery-worker',
+		f.configs.notificationBefore.services['notification-delivery-worker'],
+		f.images[0],
+		20
+	)
+	f.baseline = crmRemindersBaseline(f.live, revision, f.environmentHashes)
+	assert.doesNotThrow(() => planFor(f))
+	f.configs.notificationAfter.services[
+		'notification-delivery-worker'
+	].extra_hosts['tg.winwidget.ru'] = '127.0.0.2'
+	assert.throws(() => planFor(f))
+})
 
 test('baseline records new worker absence and only ND/Sales immutable targets; hash binding is strict', () => {
 	const f = fixture(),

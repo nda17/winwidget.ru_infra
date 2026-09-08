@@ -169,8 +169,10 @@ export async function bootstrapCrmReminders({
 	inputs,
 	connect,
 	request,
-	assertReleaseFence
+	assertReleaseFence,
+	activation = 'reminders'
 }) {
+	assert.ok(['reminders', 'intake-sla'].includes(activation))
 	let connection
 	try {
 		await assertReleaseFence()
@@ -187,7 +189,9 @@ export async function bootstrapCrmReminders({
 			assertReleaseFence,
 			credentials: inputs.credentials,
 			legacyPrincipals: inputs.legacyPrincipals,
-			readSnapshot: () => readCrmRemindersBrokerSnapshot(request)
+			readSnapshot: () =>
+				readCrmRemindersBrokerSnapshot(request, 15000, activation),
+			activation
 		})
 	} finally {
 		if (connection) await connection.close()
@@ -240,9 +244,14 @@ if (
 	try {
 		assert.equal(process.argv.length, 3)
 		assert.ok(
-			['provision', 'provision-reminders'].includes(process.argv[2])
+			[
+				'provision',
+				'provision-reminders',
+				'provision-intake-sla'
+			].includes(process.argv[2])
 		)
-		const reminders = process.argv[2] === 'provision-reminders'
+		const sla = process.argv[2] === 'provision-intake-sla'
+		const reminders = process.argv[2] !== 'provision'
 		assert.equal(process.platform, 'linux')
 		assert.equal(process.getuid(), 0)
 		assert.equal(process.env.CRM_BOOTSTRAP_CONTROLLER_PROTOCOL, 'stdio-v1')
@@ -293,7 +302,13 @@ if (
 		}
 		await assertReleaseFence()
 		stage = 'inputs'
-		const inputs = (reminders ? crmReminderBrokerInputs : crmBrokerInputs)(
+		const inputReader = sla
+			? (await import('./crm-intake-sla-broker-topology.mjs'))
+					.crmIntakeSlaBrokerInputs
+			: reminders
+				? crmReminderBrokerInputs
+				: crmBrokerInputs
+		const inputs = inputReader(
 			parseEnv(readFileSync(paths.canonical, 'utf8')),
 			parseEnv(readFileSync(paths.crm, 'utf8')),
 			reminders
@@ -347,7 +362,8 @@ if (
 			inputs,
 			connect,
 			request,
-			assertReleaseFence
+			assertReleaseFence,
+			...(sla ? { activation: 'intake-sla' } : {})
 		})
 		await assertReleaseFence()
 		process.stdout.write(JSON.stringify(report) + '\n')

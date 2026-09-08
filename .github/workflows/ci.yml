@@ -109,6 +109,7 @@ jobs:
           shellcheck -x scripts/deploy-crm-reminders-scoped.sh
           node --check scripts/crm-reminders-activation.mjs
           node --check scripts/crm-reminders-activation-cli.mjs
+          node --check scripts/crm-intake-sla-broker-topology.mjs
           bash -n scripts/deploy-crm-customers-provider-scoped.sh
           shellcheck -x scripts/deploy-crm-customers-provider-scoped.sh
           node --check scripts/crm-customers-provider-config.mjs

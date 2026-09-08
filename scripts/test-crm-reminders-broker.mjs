@@ -13,6 +13,12 @@ import {
 	readCrmRemindersBrokerSnapshot
 } from './crm-reminders-broker-topology.mjs'
 import { bootstrapCrmReminders } from './crm-broker-bootstrap.mjs'
+import {
+	crmIntakeSlaBrokerInputs,
+	crmIntakeSlaBrokerContract,
+	crmIntakeSlaNotificationTopology,
+	assertCrmIntakeSlaBrokerSnapshot
+} from './crm-intake-sla-broker-topology.mjs'
 
 const contract = crmRemindersBrokerContract()
 const secret = 'f'.repeat(64)
@@ -48,6 +54,27 @@ const inputs = () =>
 		crm,
 		crmReminderNotificationTopology()
 	)
+function slaInputs() {
+	const contract = crmIntakeSlaBrokerContract()
+	return crmIntakeSlaBrokerInputs(
+		{
+			...canonical,
+			CRM_REMINDERS_RABBITMQ_CONTRACT: 'task-reminders-v1',
+			CRM_INTAKE_SLA_RABBITMQ_CONTRACT: 'intake-sla-v1',
+			NOTIFICATION_DELIVERY_KINDS: crmIntakeSlaNotificationTopology()
+				.deadLetterRoutingKeys.map(key =>
+					key.replace(/\.dead-letter$/, '')
+				)
+				.join(',')
+		},
+		{
+			...crm,
+			CRM_INTAKE_SLA_WORKER_RABBITMQ_URL: `amqp://${contract.principals[0].name}:${'b'.repeat(64)}@127.0.0.1:5672/winwidget`,
+			CRM_INTAKE_SLA_PUBLISHER_RABBITMQ_URL: `amqp://${contract.principals[1].name}:${'c'.repeat(64)}@127.0.0.1:5672/winwidget`
+		},
+		crmIntakeSlaNotificationTopology()
+	)
+}
 const resource = (user, acl) => ({
 	user,
 	vhost: 'winwidget',
@@ -89,8 +116,11 @@ const queueRow = queue => ({
 	consumers: 0,
 	messages: 0
 })
-function harness() {
-	const parsed = inputs(),
+function harness(sla = false) {
+	const contract = sla
+		? crmIntakeSlaBrokerContract()
+		: crmRemindersBrokerContract()
+	const parsed = sla ? slaInputs() : inputs(),
 		topology = snapshot()
 	const nd = 'winwidget-notification-delivery'
 	const state = {
@@ -153,6 +183,19 @@ function harness() {
 			throw Error('synthetic-response-lost-after-PUT')
 	}
 	const channel = {
+		assertExchange: async (name, type, options) => {
+			actions.push(['exchange', name])
+			const expected = contract.exchanges.find(row => row.name === name)
+			assert.equal(type, expected.type)
+			assert.deepEqual(options, {
+				durable: true,
+				autoDelete: false,
+				internal: false,
+				arguments: {}
+			})
+			if (!topology.exchanges.some(row => row.name === name))
+				topology.exchanges.push(structuredClone(expected))
+		},
 		assertQueue: async (queue, options) => {
 			actions.push(['queue', queue])
 			const expected = contract.queues.find(row => row.name === queue)
@@ -183,7 +226,7 @@ function harness() {
 		}
 	}
 	const connect = async (user, password) => {
-		assert.equal(user, name)
+		assert.ok(Object.hasOwn(parsed.credentials, user))
 		assert.equal(passwords.get(user), password)
 		return {
 			createChannel: async () => ({ close: async () => {} }),
@@ -217,10 +260,105 @@ function harness() {
 				legacyPrincipals: parsed.legacyPrincipals,
 				readSnapshot: async () => structuredClone(topology),
 				assertReleaseFence: fence,
+				activation: sla ? 'intake-sla' : 'reminders',
 				...overrides
 			})
 	}
 }
+
+test('Intake SLA exact additive topology preserves sixteen kinds and isolates two principals', async () => {
+	const contract = crmIntakeSlaBrokerContract(),
+		h = harness(true)
+	assert.equal(contract.exchanges.length, 2)
+	assert.equal(contract.queues.length, 12)
+	assert.equal(contract.bindings.length, 18)
+	const [worker, publisher] = contract.principals
+	assert.equal(worker.write, '^$')
+	assert.equal(worker.configure, '^$')
+	assert.match('winwidget.crm-intake.sla.v1', new RegExp(worker.read))
+	assert.doesNotMatch(
+		'winwidget.crm-intake.sla.v1.dead-letter',
+		new RegExp(worker.read)
+	)
+	assert.equal(publisher.read, '^$')
+	assert.equal(publisher.configure, '^$')
+	assert.doesNotMatch(
+		'notification.wincrm.task-reminder.email.requested.v1',
+		new RegExp(publisher.topics[0].write)
+	)
+	for (const pattern of [
+		contract.notificationAfter.read,
+		contract.notificationAfter.configure,
+		...contract.notificationAfter.topics.flatMap(row => [
+			row.read,
+			row.write
+		])
+	])
+		assert.ok(Buffer.byteLength(pattern) <= 1024)
+	h.topology.queues.push({
+		...queueRow({
+			name: 'winwidget.crm.sales.reminders',
+			durable: true,
+			auto_delete: false,
+			arguments: {}
+		}),
+		consumers: 1,
+		messages: 4
+	})
+	const old = structuredClone(h.topology.queues)
+	const report = await h.run()
+	assert.equal(report.authenticatedPrincipals, 2)
+	assert.equal(report.legacyPrincipalsUnchanged, 25)
+	assert.equal(report.notificationKinds, 16)
+	assert.equal(report.exchanges, 2)
+	assert.equal(h.state.users.length, 28)
+	for (const row of old)
+		assert.deepEqual(
+			h.topology.queues.find(item => item.name === row.name),
+			row
+		)
+	const puts = h.actions.filter(row => row[1] === 'PUT').length
+	await h.run()
+	assert.equal(h.actions.filter(row => row[1] === 'PUT').length, puts)
+	assertCrmIntakeSlaBrokerSnapshot(h.topology, true)
+})
+
+test('Intake SLA interrupted grants resume without widening worker or rotating credentials', async () => {
+	const reference = harness(true)
+	await reference.run()
+	for (let index = 1; index <= reference.putStates.length; index++) {
+		const h = harness(true)
+		h.failAfterPut = index
+		await assert.rejects(h.run())
+		h.failAfterPut = Infinity
+		await h.run()
+		assert.equal(
+			h.actions.filter(
+				([path, method]) =>
+					method === 'PUT' && path.startsWith('/api/users/')
+			).length,
+			2
+		)
+	}
+	for (const mutate of [
+		h => h.state.users.push({ name: 'unexpected', tags: [] }),
+		h =>
+			h.topology.queues.push({
+				...queueRow(crmIntakeSlaBrokerContract().queues[0]),
+				consumers: 1
+			}),
+		h =>
+			h.topology.queues.push({
+				...queueRow(crmIntakeSlaBrokerContract().queues[0]),
+				arguments: { 'x-message-ttl': 5 }
+			})
+	]) {
+		const h = harness(true)
+		mutate(h)
+		await assert.rejects(h.run())
+		assert.equal(h.actions.length, 0)
+	}
+})
 
 test('optional contract keeps MVP separate and exact principal reads one queue and writes three topics', () => {
 	assert.equal(contract.version, 'task-reminders-v1')

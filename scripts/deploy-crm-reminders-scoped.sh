@@ -6,19 +6,32 @@
 [[ "${BASH_SOURCE[0]}" != "$0" ]] || { printf '%s\n' 'Use the pinned reusable production workflow.' >&2; exit 1; }
 
 reminders_files=(crm-reminders-activation-cli.mjs crm-reminders-activation.mjs crm-release.mjs scoped-service-release.mjs crm-broker-bootstrap.mjs crm-broker-topology.mjs crm-reminders-broker-topology.mjs)
+reminders_owner=crm-sales
+reminders_label=reminders
+reminders_validator=validate-crm-reminders-compose.mjs
+reminders_provision=provision-reminders
+if [[ "${release_scope:-crm-reminders-activate}" == crm-intake-sla-activate ]]; then
+	reminders_files+=(crm-intake-sla-broker-topology.mjs)
+	reminders_owner=crm-intake
+	reminders_label=intake-sla
+	reminders_validator=validate-crm-intake-sla-compose.mjs
+	reminders_provision=provision-intake-sla
+fi
 
 reminders_unpack() {
 	# Only public, hash-verified code is writable here. Validate every entry before
 	# writing any file; exact names exclude path traversal, links and duplicate keys.
 	docker run --rm --interactive --network none --read-only --log-driver none --cap-drop ALL \
 		--security-opt no-new-privileges --user 0:0 --memory 128m --memory-swap 128m --cpus 0.5 --pids-limit 32 --ulimit core=0:0 \
-		--volume "$scoped_payload_directory:/run/payload:rw" --entrypoint node "$reminders_probe_image" --input-type=module <<'REMINDERS_UNPACK'
+		--env "REMINDERS_ACTIVATION_SCOPE=$release_scope" --volume "$scoped_payload_directory:/run/payload:rw" --entrypoint node "$reminders_probe_image" --input-type=module <<'REMINDERS_UNPACK'
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {readFileSync,lstatSync,writeFileSync} from 'node:fs';
 try {
  const bytes=readFileSync('/run/payload/verifier.mjs'); assert.ok(bytes.length>0&&bytes.length<=524288);
  const value=JSON.parse(bytes), names=['crm-reminders-activation-cli.mjs','crm-reminders-activation.mjs','crm-release.mjs','scoped-service-release.mjs','crm-broker-bootstrap.mjs','crm-broker-topology.mjs','crm-reminders-broker-topology.mjs'];
+ assert.ok(['crm-reminders-activate','crm-intake-sla-activate'].includes(process.env.REMINDERS_ACTIVATION_SCOPE));
+ if(process.env.REMINDERS_ACTIVATION_SCOPE==='crm-intake-sla-activate') names.push('crm-intake-sla-broker-topology.mjs');
  const exact=(item,keys)=>{assert.ok(item&&typeof item==='object'&&!Array.isArray(item));assert.deepEqual(Object.keys(item).sort(),keys.sort());};
  exact(value,['schemaVersion','files']);assert.equal(value.schemaVersion,1);assert.ok(Array.isArray(value.files));
  assert.deepEqual(value.files.map(item=>item.name).sort(),names.sort());
@@ -70,10 +83,10 @@ reminders_probe() {
 	else
 		mounts+=(--volume "$reminders_directory:/run/reminders:ro")
 		if [[ "$mode" == database-input ]]; then
-			case "$argument" in notification-delivery) file="$reminders_notification_env" ;; crm-sales) file="$reminders_crm_env" ;; *) return 1 ;; esac
+			case "$argument" in notification-delivery) file="$reminders_notification_env" ;; "$reminders_owner") file="$reminders_crm_env" ;; *) return 1 ;; esac
 			mounts+=(--volume "$file:/run/owner.env:ro")
 		elif [[ "$mode" == prepare || "$mode" == notification-topology || "$mode" == readiness-input ]]; then
-			mounts+=(--volume "$release_root/.github/scripts/validate-crm-reminders-compose.mjs:/run/crm-reminder-validator.mjs:ro"
+			mounts+=(--volume "$release_root/.github/scripts/$reminders_validator:/run/crm-reminder-validator.mjs:ro"
 				--volume "$env_file:/run/canonical.env:ro" --volume "$reminders_notification_env:/run/notification-delivery.env:ro" --volume "$reminders_crm_env:/run/crm.env:ro")
 		fi
 	fi
@@ -85,6 +98,7 @@ reminders_probe() {
 		--env "REMINDERS_SERVICES_REVISION=$services_revision" --env "REMINDERS_INFRA_REVISION=$infra_revision" \
 		--env "REMINDERS_PAYLOAD_SHA256=$scoped_node_sha256" --env "REMINDERS_CONTROLLER_SHA256=$scoped_shell_sha256" \
 		--env "REMINDERS_GATEWAY_REVISION=$expected_live_revision" \
+		--env "REMINDERS_ACTIVATION_SCOPE=$release_scope" \
 		"${mounts[@]}" --entrypoint timeout "$image" -s TERM -k 5s 45s \
 		node "/run/reminders-code/$script" "${args[@]}"
 }
@@ -133,7 +147,7 @@ reminders_databases() {
 	local owner image handoff pending
 	export -n handoff
 	reminders_inputs || return 1
-	for owner in crm-sales notification-delivery; do
+	for owner in "$reminders_owner" notification-delivery; do
 		image="$(reminders_probe owner-image "$owner")" || return 1
 		[[ "$image" =~ ^sha256:[a-f0-9]{64}$ ]] || return 1
 		reminders_probe source "$owner" "$image" >/dev/null || return 1
@@ -161,7 +175,7 @@ reminders_broker() {
 	reminders_fence || return 1
 	reminders_capture notification-topology.json true reminders_probe notification-topology || return 1
 	topology_hash="$(sha256sum "$reminders_directory/notification-topology.json" | awk '{print $1}')" || return 1
-	image="$(reminders_probe owner-image crm-sales)" || return 1
+	image="$(reminders_probe owner-image "$reminders_owner")" || return 1
 	revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" || return 1
 	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$revision" =~ ^[a-f0-9]{40}$ ]] || return 1
 	for file in "${reminders_files[@]}"; do mounts+=(--volume "$scoped_payload_directory/$file:/run/reminders-code/$file:ro"); done
@@ -178,7 +192,7 @@ reminders_broker() {
 			--env CRM_BOOTSTRAP_CONTROLLER_PROTOCOL=stdio-v1 --env "CRM_BOOTSTRAP_IMAGE_REVISION=$revision" --env "APP_REVISION=$revision" \
 			--env "CRM_BOOTSTRAP_CANONICAL_SHA256=$expected_env_sha256" --env "CRM_BOOTSTRAP_CRM_SHA256=$expected_service_env_sha256" \
 			--env "CRM_BOOTSTRAP_NOTIFICATION_SHA256=$topology_hash" \
-			--entrypoint timeout "$image" -s TERM -k 5s 180s node /run/reminders-code/crm-broker-bootstrap.mjs provision-reminders <"$pipes/input" >"$pipes/output" &
+			--entrypoint timeout "$image" -s TERM -k 5s 180s node /run/reminders-code/crm-broker-bootstrap.mjs "$reminders_provision" <"$pipes/input" >"$pipes/output" &
 	broker_pid=$!
 	exec {writer}>"$pipes/input"
 	exec {reader}<"$pipes/output"
@@ -203,7 +217,10 @@ reminders_broker() {
 reminders_compose() {
 	local project="$1" name="$2" file="$reminders_directory/$1-runtime.json" expected
 	case "$project/$name" in
-		winwidget-crm/crm-sales-api|winwidget-crm/crm-sales-reminders) expected="$reminders_crm_runtime_hash" ;;
+		winwidget-crm/crm-sales-api|winwidget-crm/crm-sales-reminders)
+			[[ "$reminders_owner" == crm-sales ]] || return 1; expected="$reminders_crm_runtime_hash" ;;
+		winwidget-crm/crm-intake-api|winwidget-crm/crm-intake-sla-worker|winwidget-crm/crm-intake-sla-publisher)
+			[[ "$reminders_owner" == crm-intake ]] || return 1; expected="$reminders_crm_runtime_hash" ;;
 		winwidget/notification-delivery-worker) expected="$reminders_notification_runtime_hash" ;;
 		*) return 1 ;;
 	esac
@@ -229,12 +246,16 @@ reminders_cleanup() {
 
 scoped_deploy_main() {
 	local gateway_id revision directory file hash pending selection index key old_id project name image values attempt
-	local -a image_env=() images=()
-	[[ "$release_scope" == crm-reminders-activate && "$expected_crm_reminders_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Invalid reminders scope approval.'
+	local -a image_env=() images=() crm_base_overlays=() notification_base_overlays=()
+	[[ ( "$release_scope" == crm-reminders-activate || "$release_scope" == crm-intake-sla-activate ) && "$expected_crm_reminders_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Invalid reminders scope approval.'
+	if [[ "$release_scope" == crm-intake-sla-activate ]]; then
+		crm_base_overlays=(-f "$release_root/deploy/docker-compose.crm-reminders.yml")
+		notification_base_overlays=(-f "$release_root/deploy/docker-compose.notification-reminders.yml")
+	fi
 	[[ -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}" && "$(docker context inspect --format '{{.Endpoints.docker.Host}}')" == unix:///var/run/docker.sock ]] || die 'Reminders activation requires the local production Docker daemon.'
 	reminders_crm_env="$app_root/deploy/backend/crm/.env.production"
 	reminders_notification_env="$services_repository/apps/notification-delivery/.env.production"
-	reminders_baseline="$app_root/deploy/backend/crm/reminders-activation-baseline.json"
+	reminders_baseline="$app_root/deploy/backend/crm/$reminders_label-activation-baseline.json"
 	for directory in "$app_root/deploy/backend/crm" "$services_repository/apps" "$services_repository/apps/notification-delivery"; do assert_root_owned_directory "$directory"; done
 	for file in "$env_file" "$reminders_crm_env" "$reminders_notification_env" "$reminders_baseline"; do reminders_private "$file" || die 'Unsafe reminders input.'; done
 	reminders_notification_hash="$(sha256sum "$reminders_notification_env" | awk '{print $1}')"
@@ -249,7 +270,7 @@ scoped_deploy_main() {
 	reminders_code_hashes=()
 	for file in "${reminders_files[@]}"; do reminders_code_hashes+=("$(sha256sum "$scoped_payload_directory/$file" | awk '{print $1}')"); done
 	reminders_inputs || die 'Reminders approval inputs changed.'
-	directory="$app_root/deploy/backend/crm/reminders-activations"
+	directory="$app_root/deploy/backend/crm/$reminders_label-activations"
 	if [[ ! -e "$directory" && ! -L "$directory" ]]; then install -d -o root -g root -m 0700 "$directory"; fi
 	assert_root_owned_directory "$directory"
 	[[ "$(stat -c '%a' "$directory")" == 700 ]] || die 'Unsafe private reminders directory.'
@@ -279,10 +300,10 @@ scoped_deploy_main() {
 		values="$(reminders_probe target-images)" || die 'Cannot select immutable target images.'
 		while IFS= read -r image; do [[ "$image" =~ ^sha256:[a-f0-9]{64}$ ]] || die 'Invalid target image.'; images+=("$image"); done <<<"$values"
 		reminders_capture images.json true docker image inspect "${images[@]}" || die 'Cannot inspect target images.'
-		reminders_capture notification-before.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget --profile '*' --env-file "$env_file" --env-file "$reminders_notification_env" -f "$release_root/deploy/docker-compose.prod.yml" config --format json 2>/dev/null || die 'Cannot materialize Notification configuration.'
-		reminders_capture notification-after.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget --profile '*' --env-file "$env_file" --env-file "$reminders_notification_env" -f "$release_root/deploy/docker-compose.prod.yml" -f "$release_root/deploy/docker-compose.notification-reminders.yml" config --format json 2>/dev/null || die 'Cannot materialize Notification reminder overlay.'
-		reminders_capture crm-before.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$reminders_crm_env" -f "$release_root/deploy/docker-compose.crm.yml" config --format json 2>/dev/null || die 'Cannot materialize CRM configuration.'
-		reminders_capture crm-after.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$reminders_crm_env" -f "$release_root/deploy/docker-compose.crm.yml" -f "$release_root/deploy/docker-compose.crm-reminders.yml" config --format json 2>/dev/null || die 'Cannot materialize CRM reminder overlay.'
+		reminders_capture notification-before.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget --profile '*' --env-file "$env_file" --env-file "$reminders_notification_env" -f "$release_root/deploy/docker-compose.prod.yml" "${notification_base_overlays[@]}" config --format json 2>/dev/null || die 'Cannot materialize Notification configuration.'
+		reminders_capture notification-after.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget --profile '*' --env-file "$env_file" --env-file "$reminders_notification_env" -f "$release_root/deploy/docker-compose.prod.yml" "${notification_base_overlays[@]}" -f "$release_root/deploy/docker-compose.notification-$reminders_label.yml" config --format json 2>/dev/null || die 'Cannot materialize Notification activation overlay.'
+		reminders_capture crm-before.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$reminders_crm_env" -f "$release_root/deploy/docker-compose.crm.yml" "${crm_base_overlays[@]}" config --format json 2>/dev/null || die 'Cannot materialize CRM configuration.'
+		reminders_capture crm-after.json true env -i PATH="$PATH" "${image_env[@]}" docker compose --project-name winwidget-crm --profile '*' --env-file "$reminders_crm_env" -f "$release_root/deploy/docker-compose.crm.yml" "${crm_base_overlays[@]}" -f "$release_root/deploy/docker-compose.crm-$reminders_label.yml" config --format json 2>/dev/null || die 'Cannot materialize CRM activation overlay.'
 		reminders_capture plan.json false reminders_probe prepare || die 'Reminders configuration exceeds approved exact changes.'
 	fi
 	if [[ ! -e "$reminders_directory/binding.json" ]]; then reminders_capture binding.json false reminders_probe seal || die 'Cannot seal reminders plan.'; fi
@@ -300,7 +321,7 @@ scoped_deploy_main() {
 	reminders_notification_runtime_hash="$(sha256sum "$reminders_directory/winwidget-runtime.json" | awk '{print $1}')"
 	reminders_crm_runtime_hash="$(sha256sum "$reminders_directory/winwidget-crm-runtime.json" | awk '{print $1}')"
 	reminders_databases || die 'Read-only reminders database preflight failed.'
-	for name in crm-sales notification-delivery; do
+	for name in "$reminders_owner" notification-delivery; do
 		if [[ ! -e "$reminders_directory/$name-database-before.json" ]]; then
 			[[ ! -e "$reminders_directory/admission.json" ]] || die 'Admitted activation lost original database proof.'
 			pending="$(mktemp "$reminders_directory/.pending.XXXXXX")"; cp -- "$reminders_directory/$name-database-current.json" "$pending"; reminders_publish "$pending" "$name-database-before.json"
@@ -320,7 +341,13 @@ scoped_deploy_main() {
 		selection="$(reminders_probe select)" || die 'Cannot resolve next reminders target.'
 		[[ "$selection" != complete ]] || break
 		read -r index key old_id <<<"$selection"
-		[[ "$index" =~ ^[0-2]$ && ( "$old_id" =~ ^[a-f0-9]{64}$ || ( "$index" == 1 && "$old_id" == absent ) ) ]] || die 'Invalid reminders target receipt.'
+		case "$reminders_owner/$index/$key" in
+			crm-sales/0/winwidget/notification-delivery-worker|crm-sales/2/winwidget-crm/crm-sales-api|crm-intake/0/winwidget/notification-delivery-worker|crm-intake/3/winwidget-crm/crm-intake-api)
+				[[ "$old_id" =~ ^[a-f0-9]{64}$ ]] || die 'Invalid existing activation target.' ;;
+			crm-sales/1/winwidget-crm/crm-sales-reminders|crm-intake/1/winwidget-crm/crm-intake-sla-worker|crm-intake/2/winwidget-crm/crm-intake-sla-publisher)
+				[[ "$old_id" == absent ]] || die 'Invalid new activation target.' ;;
+			*) die 'Invalid activation target order.' ;;
+		esac
 		project="${key%%/*}"; name="${key#*/}"
 		if [[ ! -e "$reminders_directory/start-$index.json" ]]; then
 			reminders_capture state.json true reminders_probe begin || die 'Cannot persist forward switching intent.'
@@ -347,5 +374,5 @@ scoped_deploy_main() {
 	done
 	if ! reminders_databases || ! reminders_fence || ! reminders_probe database-check >/dev/null; then die 'Final reminders database/runtime continuity failed.'; fi
 	reminders_readiness || die 'Final reminder delivery readiness is not confirmed.'
-	printf '%s\n' 'CRM reminders activation verified: exactly two config-only replacements and one new Sales reminder process; immutable images, database identity/ledger/ACL and all neighbors preserved. No provider call was made by this controller.'
+	printf '%s\n' "CRM $reminders_label activation verified: exact ordered config-only targets; immutable images, database identity/ledger/ACL and all neighbors preserved. No provider call was made by this controller."
 }
