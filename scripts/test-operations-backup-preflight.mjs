@@ -430,7 +430,11 @@ function databaseFixture(schema = 'operations') {
 		if (query === 'SHOW transaction_read_only') return [{ transaction_read_only: f.readOnly }]
 		if (query === 'SHOW server_version_num') return [{ server_version_num: f.version }]
 		if (query.startsWith('SELECT current_database()')) return [f.identity]
-		if (query.includes('FROM pg_roles roles')) return [f.principal]
+		if (query.includes('FROM pg_roles roles')) {
+			assert.ok(query.includes(`pg_get_userbyid(datdba) = 'winwidget_${schema}_admin'`), 'database owner must match service bootstrap contract')
+			assert.ok(!query.includes('_owner_admin'))
+			return [f.principal]
+		}
 		if (query.includes('SELECT id, service_name')) return f.serviceIdentity
 		if (query.includes('SELECT migration_name')) return f.ledger
 		if (query.includes('AS schema_sha256')) return f.metadata

@@ -1233,7 +1233,7 @@ async function assertBackupProbeSession(client, schema, role) {
 	const principals = await client.$queryRawUnsafe(`SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
 		AND ${schema === 'operations' ? 'TRUE' : 'NOT rolinherit'} AND NOT rolreplication AND NOT rolbypassrls AS restricted,
 		NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member = roles.oid OR roleid = roles.oid) AS no_memberships,
-		(SELECT pg_get_userbyid(datdba) = 'winwidget_${schema}_${schema === 'operations' ? 'admin' : 'owner_admin'}' FROM pg_database WHERE datname = current_database()) AS database_owner_matches,
+		(SELECT pg_get_userbyid(datdba) = 'winwidget_${schema}_admin' FROM pg_database WHERE datname = current_database()) AS database_owner_matches,
 		(SELECT pg_get_userbyid(nspowner) = 'winwidget_${schema}_migration' FROM pg_namespace WHERE nspname = '${schema}') AS schema_owner_matches,
 		has_database_privilege(current_user, current_database(), 'CONNECT') AS connect,
 		NOT has_database_privilege(current_user, current_database(), '${schema === 'operations' ? 'CREATE' : 'CREATE,TEMPORARY'}') AS no_database_ddl,
