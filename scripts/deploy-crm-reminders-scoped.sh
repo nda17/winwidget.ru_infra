@@ -78,6 +78,8 @@ reminders_probe() {
 	for file in "${reminders_files[@]}"; do mounts+=(--volume "$scoped_payload_directory/$file:/run/reminders-code/$file:ro"); done
 	if [[ "$mode" == database ]]; then
 		network=host; user=1001:1001; script=crm-release.mjs; args=(upgrade-database "$argument" complete)
+		# Legacy ND owns its private Prisma files as node (1000), unlike CRM.
+		if [[ "$argument" == notification-delivery ]]; then user=1000:1000; fi
 	elif [[ "$mode" == readiness ]]; then
 		network=host; user=1001:1001
 	else

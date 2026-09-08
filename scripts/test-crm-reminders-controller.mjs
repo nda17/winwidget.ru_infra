@@ -232,20 +232,20 @@ test('SLA packaging is bounded, kind-specific and its readiness cannot use Sales
 		kind
 	)
 })
-test('actual probe argv isolates owner DB credentials on stdin and keeps three whole envs on root-only reader', () => {
+test('actual probe argv uses the owner UID, isolates DB credentials on stdin and keeps whole envs on root-only reader', () => {
 	const source = shell.slice(
 		shell.indexOf('reminders_probe()'),
 		shell.indexOf('\nreminders_publish()')
 	)
-	const run = (mode, owner = 'crm-sales') =>
+	const run = (mode, owner = 'crm-sales', sla = false) =>
 		spawnSync('/bin/bash', ['-s'], {
 			encoding: 'utf8',
 			input: `set -euo pipefail
 reminders_files=(${REMINDERS_PAYLOAD_FILES.join(' ')})
 scoped_payload_directory=/public/payload
 reminders_directory=/private/state
-release_scope=crm-reminders-activate
-reminders_owner=crm-sales
+release_scope=${sla ? 'crm-intake-sla-activate' : 'crm-reminders-activate'}
+reminders_owner=${sla ? 'crm-intake' : 'crm-sales'}
 reminders_validator=validate-crm-reminders-compose.mjs
 reminders_probe_image=sha256:${'a'.repeat(64)}
 reminders_notification_env=/private/notification.env
@@ -266,13 +266,24 @@ ${source}
 reminders_probe ${mode} ${owner}
 `
 		})
-	for (const owner of ['crm-sales', 'notification-delivery']) {
-		const db = run('database', owner),
-			reader = run('database-input', owner)
+	for (const [owner, sla] of [
+		['crm-sales', false],
+		['notification-delivery', false],
+		['crm-intake', true],
+		['notification-delivery', true]
+	]) {
+		const db = run('database', owner, sla),
+			reader = run('database-input', owner, sla)
 		assert.equal(db.status, 0, db.stderr)
 		assert.equal(reader.status, 0, reader.stderr)
 		assert.match(db.stdout, /--network\nhost\n/)
-		assert.match(db.stdout, /--user\n1001:1001\n/)
+		assert.match(
+			db.stdout,
+			owner === 'notification-delivery'
+				? /--user\n1000:1000\n/
+				: /--user\n1001:1001\n/
+		)
+		assert.doesNotMatch(db.stdout, /--user\n0:0\n/)
 		assert.equal(db.stdout.includes('/private/'), false)
 		assert.equal(db.stdout.includes('--env-file'), false)
 		assert.match(
@@ -286,7 +297,7 @@ reminders_probe ${mode} ${owner}
 		assert.ok(
 			reader.stdout.includes(
 				'/private/' +
-					(owner === 'crm-sales' ? 'crm' : 'notification') +
+					(owner.startsWith('crm-') ? 'crm' : 'notification') +
 					'.env:/run/owner.env:ro'
 			)
 		)
