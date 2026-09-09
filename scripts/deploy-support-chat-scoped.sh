@@ -123,7 +123,7 @@ support_database() {
 		--tmpfs /tmp:rw,nosuid,size=64m --env-file "$file" \
 		--volume "$scoped_payload_directory:/run/support-code:ro" \
 		--entrypoint node "$image" /run/support-code/support-chat-release.mjs "$action" "$owner" \
-		|| die 'Support owned migration/ledger/privilege verification failed.'
+		|| die "Support $owner $action migration/ledger/privilege verification failed."
 }
 support_quiet() {
 	docker run --rm --network host --read-only --log-driver none --cap-drop ALL --security-opt no-new-privileges \

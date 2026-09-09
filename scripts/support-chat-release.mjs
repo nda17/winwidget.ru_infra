@@ -247,9 +247,33 @@ const databaseOwner = owner => {
 	assert.ok(['identity', 'crm-access', 'operations', 'notification-delivery', 'support'].includes(owner))
 	return owner.replaceAll('-', '_')
 }
+export function supportChatMigrationLedger(rows) {
+	assert.ok(Array.isArray(rows))
+	const applied = []
+	for (const row of rows) {
+		assert.equal(typeof row.finished, 'boolean'); assert.equal(typeof row.rolledBack, 'boolean')
+		// A resolved failed attempt is historical evidence, not an applied migration.
+		if (row.rolledBack) continue
+		assert.equal(row.finished, true)
+		applied.push({ name: row.name, checksum: row.checksum })
+	}
+	return applied
+}
 async function databaseAction(action, owner) {
+	databaseOwner(owner)
+	assert.ok(['database-preflight', 'database-migrate'].includes(action))
+	let stage = 'SOURCE_READ'
+	try {
+		await databaseActionSteps(action, owner, value => { stage = value })
+	} catch {
+		process.stderr.write(`Support database ${owner} ${action} failed at ${stage}.\n`)
+		throw new Error('Support database contract failed')
+	}
+}
+async function databaseActionSteps(action, owner, setStage) {
 	const schema = databaseOwner(owner), prefix = schema.toUpperCase()
 	const source = migrationFiles('/app/prisma/migrations')
+	setStage('URL_VALIDATE')
 	const url = new URL(process.env[migrationKey(owner)] ?? '')
 	assert.equal(url.protocol, 'postgresql:'); assert.equal(url.hostname, '127.0.0.1')
 	assert.equal(url.port, { identity: '55438', 'crm-access': '55442', operations: '55441', 'notification-delivery': '55432', support: '55440' }[owner])
@@ -261,38 +285,48 @@ async function databaseAction(action, owner) {
 		assert.equal(url.searchParams.getAll(key).length, 1)
 	}
 	assert.equal(url.searchParams.get('sslmode'), 'disable')
+	setStage('CLIENT_INIT')
 	const { PrismaClient } = createRequire('/app/package.json')('@prisma/' + owner + '-client')
 	const client = new PrismaClient({ datasources: { db: { url: url.href } }, log: [] })
 	const ledger = async () => {
+		setStage('PG_VERSION')
 		assert.match((await client.$queryRawUnsafe('SHOW server_version_num'))[0].server_version_num, /^18\d{4}$/)
+		setStage('PG_IDENTITY')
 		const identity = await client.$queryRawUnsafe('SELECT current_database() AS database, current_user AS username, current_schema() AS schema, pg_is_in_recovery() AS recovery')
 		assert.deepEqual(identity, [{ database: 'winwidget_' + schema, username: 'winwidget_' + schema + '_migration', schema, recovery: false }])
-		const rows = await client.$queryRawUnsafe(`SELECT migration_name AS name, checksum, finished_at IS NOT NULL AND rolled_back_at IS NULL AS completed FROM "${schema}"._prisma_migrations ORDER BY migration_name`)
-		for (const row of rows) assert.equal(row.completed, true)
-		return rows.map(({ name, checksum }) => ({ name, checksum }))
+		setStage('LEDGER_READ')
+		const rows = await client.$queryRawUnsafe(`SELECT migration_name AS name, checksum, finished_at IS NOT NULL AS finished, rolled_back_at IS NOT NULL AS "rolledBack" FROM "${schema}"._prisma_migrations ORDER BY migration_name`)
+		setStage('LEDGER_STATUS')
+		return supportChatMigrationLedger(rows)
 	}
 	try {
 		const before = await ledger(), allowed = owner === 'operations' ? [deferredOperationsMigration] : SUPPORT_CHAT_MIGRATIONS[owner] ?? []
+		setStage('LEDGER_COMPARE')
 		const missing = source.filter(row => !before.some(item => item.name === row.name))
 		assert.ok(missing.every(row => allowed.includes(row.name)))
 		assert.deepEqual(before, source.filter(row => before.some(item => item.name === row.name)))
 		if (action === 'database-preflight') return
 		assert.equal(action, 'database-migrate'); assert.ok(Object.hasOwn(SUPPORT_CHAT_MIGRATIONS, owner))
 		if (missing.length) {
+			setStage('MIGRATION_DEPLOY')
 			await client.$disconnect()
 			const result = spawnSync('/app/node_modules/.bin/prisma', ['migrate', 'deploy', '--schema', '/app/prisma/schema.prisma'], {
 				cwd: '/app', env: { PATH: process.env.PATH, NODE_ENV: 'production', [prefix + '_DATABASE_URL']: url.href }, stdio: 'ignore', timeout: 180000
 			})
 			assert.equal(result.status, 0)
 		}
-		assert.deepEqual(await ledger(), source)
+		const after = await ledger()
+		setStage('POST_MIGRATION_COMPARE')
+		assert.deepEqual(after, source)
 		if (owner === 'support') {
+			setStage('RUNTIME_GRANTS')
 			await client.$executeRawUnsafe('REVOKE ALL ON support.web_conversations, support.web_commands, support.web_read_states, support.web_attachments, support.web_notification_settings, support.web_notification_intents, support.web_messages, support.web_rate_buckets FROM winwidget_support_runtime')
 			await client.$executeRawUnsafe('GRANT SELECT, INSERT, UPDATE ON support.web_conversations, support.web_commands, support.web_read_states, support.web_attachments, support.web_notification_settings, support.web_notification_intents TO winwidget_support_runtime')
 			await client.$executeRawUnsafe('GRANT SELECT, INSERT ON support.web_messages TO winwidget_support_runtime')
 			await client.$executeRawUnsafe('GRANT SELECT, INSERT, UPDATE, DELETE ON support.web_rate_buckets TO winwidget_support_runtime')
 			await client.$executeRawUnsafe('REVOKE ALL ON SEQUENCE support.web_conversations_number_seq FROM winwidget_support_runtime')
 			await client.$executeRawUnsafe('GRANT USAGE, SELECT ON SEQUENCE support.web_conversations_number_seq TO winwidget_support_runtime')
+			setStage('BACKUP_GRANTS')
 			await client.$executeRawUnsafe('GRANT SELECT ON support.web_conversations, support.web_commands, support.web_read_states, support.web_attachments, support.web_notification_settings, support.web_notification_intents, support.web_messages, support.web_rate_buckets TO winwidget_support_backup')
 			await client.$executeRawUnsafe('GRANT SELECT ON SEQUENCE support.web_conversations_number_seq TO winwidget_support_backup')
 		}

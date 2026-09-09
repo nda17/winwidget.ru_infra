@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { SUPPORT_CHAT_TARGETS, SUPPORT_CHAT_ENV_NAMES, supportChatBaseline, supportChatBaselineSha256,
-	prepareSupportChatCompose, assertSupportChatFence, assertSupportChatRoute, assertSupportChatManifests, supportChatPayload } from './support-chat-release.mjs'
+	prepareSupportChatCompose, assertSupportChatFence, assertSupportChatRoute, assertSupportChatManifests, supportChatPayload, supportChatMigrationLedger } from './support-chat-release.mjs'
 
 const oldRevision = 'a'.repeat(40), revision = 'b'.repeat(40)
 const oldRoutes = [{ id: 'support-admin', pathPrefix: '/api/v1/support/admin', upstreamUrl: 'http://127.0.0.1:5100', authPolicy: 'required', timeoutMs: 60000 },
@@ -15,6 +15,16 @@ const oldRoutes = [{ id: 'support-admin', pathPrefix: '/api/v1/support/admin', u
 const route = { id: 'support-web-chat', pathPrefix: '/api/v1/support', upstreamUrl: 'http://127.0.0.1:5100', authPolicy: 'required', timeoutMs: 30000 }
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const env = values => Object.entries(values).map(([key, value]) => `${key}=${value}`)
+test('ledger excludes resolved rollback history while unresolved attempts still block release', () => {
+	const name = '20260828000000_remove_online_consultant_delivery_data'
+	const rows = [
+		{ name, checksum: 'a'.repeat(64), finished: false, rolledBack: true },
+		{ name, checksum: 'b'.repeat(64), finished: true, rolledBack: false }
+	]
+	assert.deepEqual(supportChatMigrationLedger(rows), [{ name, checksum: 'b'.repeat(64) }])
+	assert.throws(() => supportChatMigrationLedger([{ ...rows[0], rolledBack: false }, rows[1]]))
+	assert.deepEqual(rows[0], { name, checksum: 'a'.repeat(64), finished: false, rolledBack: true })
+})
 function fixture() {
 	const images = [...new Set(SUPPORT_CHAT_TARGETS.map(row => row[2]))].map((owner, index) => ({ Id: 'sha256:' + String(index + 1).repeat(64), Config: {
 		Labels: { 'org.opencontainers.image.revision': revision }, Env: ['NODE_ENV=production', `APP_REVISION=${revision}`], User: 'node', Cmd: ['node', 'dist/src/main.js'], Entrypoint: null } }))
