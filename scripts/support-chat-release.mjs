@@ -145,6 +145,48 @@ function allowedEnv(name, activation = false) {
 	return []
 }
 const token = value => assert.ok(typeof value === 'string' && /^[a-f0-9]{48,128}$/.test(value))
+function assertSupportChatCors(before, after) {
+	assert.equal(typeof before, 'string')
+	const crmOrigin = 'https://crm.winwidget.ru', origins = before.split(',').map(value => value.trim())
+	assert.ok(origins.length > 0 && origins.every(Boolean))
+	assert.equal(after, origins.includes(crmOrigin) ? before : before + ',' + crmOrigin)
+}
+export function prepareSupportChatRepair({ containers, composes, images, revision, envHashes, gatewayRevision, expectedBaselineSha256 }) {
+	assert.match(revision, /^[a-f0-9]{40}$/)
+	assert.equal(supportChatBaselineSha256({ containers, envHashes, gatewayRevision }), expectedBaselineSha256)
+	const desired = { winwidget: { name: 'winwidget', services: {}, volumes: {}, secrets: {} }, 'winwidget-crm': { name: 'winwidget-crm', services: {}, volumes: {}, secrets: {} } }
+	const rollback = structuredClone(desired)
+	for (const [project, name] of SUPPORT_CHAT_TARGETS.filter(row => row[2] === 'support')) {
+		const live = containers.find(row => keyOf(row) === `${project}/${name}`)
+		const compose = composes.support, service = structuredClone(compose.services[name])
+		const matchingImages = images.filter(row => row.Id === service.image)
+		assert.equal(matchingImages.length, 1)
+		const image = matchingImages[0], before = environment(live.Config.Env)
+		assert.equal(image.Config.Labels['org.opencontainers.image.revision'], revision)
+		assertServiceConfiguration(service, live, image, compose.secrets ?? {})
+		assert.equal(before.SUPPORT_WEB_CHAT_ENABLED, 'false')
+		assert.equal(service.environment.APP_REVISION, revision)
+		assert.equal(service.environment.SUPPORT_WEB_CHAT_ENABLED, 'true')
+		for (const [key, value] of Object.entries(service.environment)) {
+			if (['APP_REVISION', 'SUPPORT_WEB_CHAT_ENABLED'].includes(key)) continue
+			if (name === 'support-api' && key === 'CORS_ALLOWED_ORIGINS') assertSupportChatCors(before[key], value)
+			else assert.equal(value, before[key])
+		}
+		for (const [key, value] of Object.entries(environment(image.Config.Env ?? []))) if (key !== 'APP_REVISION') assert.equal(value, before[key])
+		delete service.build; delete service.depends_on; delete service.profiles
+		service.environment = { ...before, APP_REVISION: revision }
+		service.labels = { ...service.labels, 'org.opencontainers.image.revision': revision }
+		desired[project].services[name] = service
+		rollback[project].services[name] = { ...structuredClone(service), image: live.Image, environment: before,
+			labels: { ...service.labels, 'org.opencontainers.image.revision': live.Config.Labels['org.opencontainers.image.revision'] } }
+		for (const target of [desired[project], rollback[project]]) {
+			for (const value of service.secrets ?? []) target.secrets[value.source] = compose.secrets[value.source]
+			for (const value of service.volumes ?? []) if (value.type === 'volume') target.volumes[value.source] = compose.volumes[value.source]
+		}
+	}
+	assert.equal(new Set(Object.values(desired.winwidget.services).map(service => service.image)).size, 1)
+	return { desired, rollback, neighborsSha256: supportChatNeighbors(containers) }
+}
 export function prepareSupportChatCompose({ containers, composes, images, revision, envHashes, gatewayRevision, expectedBaselineSha256, activation = false }) {
 	assert.equal(typeof activation, 'boolean')
 	assert.match(revision, /^[a-f0-9]{40}$/)
@@ -182,12 +224,7 @@ export function prepareSupportChatCompose({ containers, composes, images, revisi
 			assert.equal(after.SUPPORT_WEB_CHAT_ENABLED, activation ? 'true' : 'false')
 		}
 		if (activation && name === 'support-api') {
-			assert.equal(typeof before.CORS_ALLOWED_ORIGINS, 'string')
-			const crmOrigin = 'https://crm.winwidget.ru'
-			const origins = before.CORS_ALLOWED_ORIGINS.split(',').map(value => value.trim())
-			assert.ok(origins.length > 0 && origins.every(Boolean))
-			assert.equal(after.CORS_ALLOWED_ORIGINS, origins.includes(crmOrigin)
-				? before.CORS_ALLOWED_ORIGINS : before.CORS_ALLOWED_ORIGINS + ',' + crmOrigin)
+			assertSupportChatCors(before.CORS_ALLOWED_ORIGINS, after.CORS_ALLOWED_ORIGINS)
 		}
 		if (name === 'api-gateway' && !activation) assertSupportChatRoute(before.GATEWAY_ROUTES_JSON, after.GATEWAY_ROUTES_JSON)
 		if (name === 'notification-delivery-worker') {
@@ -379,7 +416,8 @@ async function main() {
 	}
 	if (command === 'prepare') {
 		const composes = Object.fromEntries([...new Set(SUPPORT_CHAT_TARGETS.map(row => row[2]))].map(owner => [owner, read(owner + '.json')]))
-		const result = prepareSupportChatCompose({ containers: read('before.json'), composes, images: read('images.json'), revision: process.env.SUPPORT_REVISION,
+		const prepare = process.env.SUPPORT_RELEASE_SCOPE === 'support-chat-repair' ? prepareSupportChatRepair : prepareSupportChatCompose
+		const result = prepare({ containers: read('before.json'), composes, images: read('images.json'), revision: process.env.SUPPORT_REVISION,
 			envHashes: read('env-hashes.json'), gatewayRevision: process.env.SUPPORT_GATEWAY_REVISION, expectedBaselineSha256: process.env.SUPPORT_EXPECTED_BASELINE,
 			activation: process.env.SUPPORT_RELEASE_SCOPE === 'support-chat-activate' })
 		for (const project of ['winwidget', 'winwidget-crm']) {
@@ -393,6 +431,9 @@ async function main() {
 	}
 	if (['updated', 'paused', 'unpaused'].includes(command)) {
 		assert.ok(SUPPORT_CHAT_TARGETS.some(row => row[1] === directory))
+		if (process.env.SUPPORT_RELEASE_SCOPE === 'support-chat-repair') {
+			assert.notEqual(command, 'paused'); assert.ok(SUPPORT_CHAT_TARGETS.some(row => row[1] === directory && row[2] === 'support'))
+		}
 		const state = read('state.json')
 		if (command === 'updated') state.updated = [...new Set([...state.updated, directory])]
 		if (command === 'paused') state.paused = [...new Set([...state.paused, directory])]
@@ -403,9 +444,10 @@ async function main() {
 		assert.ok(['backup', 'restore'].includes(directory))
 		assertSupportChatManifests(read('manifest-' + directory + '-before.json'), read('manifest-' + directory + '-after.json')); return
 	}
-	if (command.startsWith('database-')) { await databaseAction(command, directory); return }
-	if (command === 'operations-quiet') { await operationsQuiet(); return }
+	if (command.startsWith('database-')) { assert.notEqual(process.env.SUPPORT_RELEASE_SCOPE, 'support-chat-repair'); await databaseAction(command, directory); return }
+	if (command === 'operations-quiet') { assert.notEqual(process.env.SUPPORT_RELEASE_SCOPE, 'support-chat-repair'); await operationsQuiet(); return }
 	if (command === 'broker') {
+		assert.notEqual(process.env.SUPPORT_RELEASE_SCOPE, 'support-chat-repair')
 		const canonical = parseEnv(readFileSync('/run/support-input/canonical', 'utf8'))
 		assert.equal(canonical.RABBITMQ_MANAGEMENT_URL, 'http://127.0.0.1:15672'); assert.equal(canonical.RABBITMQ_VHOST, 'winwidget')
 		assert.ok(canonical.RABBITMQ_ADMIN_USER && canonical.RABBITMQ_ADMIN_PASSWORD)

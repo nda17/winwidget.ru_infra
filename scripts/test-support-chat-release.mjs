@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { SUPPORT_CHAT_TARGETS, SUPPORT_CHAT_ENV_NAMES, supportChatBaseline, supportChatBaselineSha256,
-	prepareSupportChatCompose, assertSupportChatFence, assertSupportChatRoute, assertSupportChatManifests, supportChatPayload, supportChatMigrationLedger } from './support-chat-release.mjs'
+	prepareSupportChatCompose, prepareSupportChatRepair, assertSupportChatFence, assertSupportChatRoute, assertSupportChatManifests, supportChatPayload, supportChatMigrationLedger } from './support-chat-release.mjs'
 
 const oldRevision = 'a'.repeat(40), revision = 'b'.repeat(40)
 const oldRoutes = [{ id: 'support-admin', pathPrefix: '/api/v1/support/admin', upstreamUrl: 'http://127.0.0.1:5100', authPolicy: 'required', timeoutMs: 60000 },
@@ -106,6 +106,7 @@ docker() {
  esac
 }
 image_env=()
+release_scope=support-chat
 for owner in "\${support_owners[@]}"; do support_image_variables "$owner" "$MOCK_TARGET_IMAGE" "$MOCK_TARGET_REVISION"; done
 support_existing_compose_images
 printf '%s\\n' "\${image_env[@]}"
@@ -213,6 +214,67 @@ test('separate activation reuses existing immutable images and appends only thre
 	assert.throws(() => prepareSupportChatCompose(workerLeak))
 	activation.composes['notification-delivery'].services['notification-delivery-worker'].environment.NOTIFICATION_DELIVERY_KINDS = 'support-team-email,support-team-telegram,support-client-email'
 	assert.throws(() => prepareSupportChatCompose(activation))
+})
+test('repair replaces only three Support images, preserves closed runtime gates and leaves active ND untouched', () => {
+	const input = fixture(), released = prepareSupportChatCompose(input)
+	for (const [project, name, owner] of SUPPORT_CHAT_TARGETS) {
+		const service = released.desired[project].services[name]
+		const live = input.containers.find(row => row.Config.Labels['com.docker.compose.service'] === name)
+		live.Image = service.image; live.Config.Env = env(service.environment); live.Config.Labels['org.opencontainers.image.revision'] = revision
+		input.composes[owner].services[name] = structuredClone(service)
+	}
+	const nd = input.containers.find(row => row.Config.Labels['com.docker.compose.service'] === 'notification-delivery-worker')
+	nd.Config.Env = nd.Config.Env.map(value => value.startsWith('NOTIFICATION_DELIVERY_KINDS=') ? value + ',support-team-email,support-team-telegram,support-client-email' : value)
+	const image = input.images.find(row => row.Id === input.composes.support.services['support-api'].image)
+	image.Id = 'sha256:' + 'e'.repeat(64); image.Config.Labels['org.opencontainers.image.revision'] = 'c'.repeat(40)
+	image.Config.Env = ['NODE_ENV=production', 'APP_REVISION=' + 'c'.repeat(40)]
+	for (const name of ['support-api', 'support-worker', 'support-outbox-publisher']) {
+		const service = input.composes.support.services[name]
+		service.image = image.Id; service.environment.APP_REVISION = 'c'.repeat(40); service.environment.SUPPORT_WEB_CHAT_ENABLED = 'true'
+	}
+	input.composes.support.services['support-api'].environment.CORS_ALLOWED_ORIGINS += ',https://crm.winwidget.ru'
+	input.gatewayRevision = revision; input.revision = 'c'.repeat(40); input.expectedBaselineSha256 = supportChatBaselineSha256(input)
+	const result = prepareSupportChatRepair(input)
+	assert.deepEqual(Object.keys(result.desired.winwidget.services), ['support-api', 'support-worker', 'support-outbox-publisher'])
+	assert.deepEqual(result.desired['winwidget-crm'].services, {})
+	for (const [name, service] of Object.entries(result.desired.winwidget.services)) {
+		assert.equal(service.image, image.Id)
+		assert.deepEqual(service.environment, { ...result.rollback.winwidget.services[name].environment, APP_REVISION: input.revision })
+		assert.equal(service.environment.SUPPORT_WEB_CHAT_ENABLED, 'false')
+	}
+	assertSupportChatFence({ before: input.containers, live: input.containers, desired: result.desired, images: input.images })
+	const live = structuredClone(input.containers), updated = Object.keys(result.desired.winwidget.services)
+	for (const name of updated) {
+		const row = live.find(item => item.Config.Labels['com.docker.compose.service'] === name), service = result.desired.winwidget.services[name]
+		row.Image = service.image; row.Config.Env = env(service.environment); row.Config.Labels['org.opencontainers.image.revision'] = input.revision
+	}
+	assertSupportChatFence({ before: input.containers, live, desired: result.desired, images: input.images, updated })
+	const drift = structuredClone(input.containers); drift.find(row => row.Id === nd.Id).Config.Env.push('UNEXPECTED=true')
+	assert.throws(() => assertSupportChatFence({ before: input.containers, live: drift, desired: result.desired, images: input.images }))
+	for (const mutate of [
+		value => { value.composes.support.services['support-api'].environment.EXISTING_SETTING = 'changed' },
+		value => { value.composes.support.services['support-worker'].environment.SUPPORT_WEB_CHAT_ENABLED = 'false' },
+		value => { value.composes.support.services['support-api'].environment.CORS_ALLOWED_ORIGINS = '*' },
+		value => { value.containers[0].State.Health.Status = 'unhealthy' },
+		value => { value.images.find(row => row.Id === image.Id).Config.Env.push('UNEXPECTED=true') }
+	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareSupportChatRepair(changed)) }
+})
+test('repair controller builds only Support and returns before database and broker stages', () => {
+	const shellPath = resolve(dirname(fileURLToPath(import.meta.url)), 'deploy-support-chat-scoped.sh')
+	const result = spawnSync('bash', ['-c', `
+set -euo pipefail
+source "$1"
+release_scope=support-chat-repair
+for owner in "\${support_owners[@]}"; do if ! support_reuses_image "$owner"; then printf '%s\\n' "$owner"; fi; done
+`, 'support-repair-test', shellPath], { encoding: 'utf8', env: { PATH: process.env.PATH } })
+	assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout.trim(), 'support')
+	const shell = readFileSync(shellPath, 'utf8'), start = shell.indexOf('\tsupport_node prepare ||')
+	const repair = shell.slice(start, shell.indexOf('\tif [[ "$release_scope" == support-chat-activate ]]', start))
+	assert.ok(repair.includes('for name in support-worker support-outbox-publisher support-api;'))
+	assert.ok(repair.includes('\t\treturn\n\tfi'))
+	assert.ok(!repair.includes('support_database') && !repair.includes('support_node broker') && !repair.includes('support_quiet'))
+	assert.ok(shell.includes('apps/support/prisma'))
+	assert.ok(shell.includes("-- apps ':(exclude)apps/support'"))
 })
 test('backup manifest cannot introduce unrelated migrations or revise historical checksums', () => {
 	const previous = { schemaVersion: 1, targets: { support: { migrations: [{ name: 'old', checksum: 'c' }], manifestSha256: 'old' }, identity: { migrations: [], manifestSha256: 'same' } } }

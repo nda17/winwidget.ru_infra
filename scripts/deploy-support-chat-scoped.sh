@@ -7,6 +7,9 @@
 support_code_files=(support-chat-release.mjs support-chat-broker.mjs scoped-service-release.mjs)
 support_owners=(identity crm-access operations notification-delivery support api-gateway)
 
+support_reuses_image() {
+	[[ "$release_scope" == support-chat-activate || ( "$release_scope" == support-chat-repair && "$1" != support ) ]]
+}
 support_image_variables() {
 	local owner="$1" image="$2" revision="$3" prefix
 	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$revision" =~ ^[a-f0-9]{40}$ ]] || die 'Support Compose image identity is invalid.'
@@ -110,7 +113,7 @@ support_start() {
 	local name="$1"
 	support_fence || die 'Support runtime or immutable inputs changed.'
 	support_compose "$name" up --detach --no-deps --no-build --pull never "$name" >/dev/null 2>&1 || die 'Support scoped process update failed.'
-	support_wait "$name" || die 'Support scoped process did not become healthy.'
+	support_wait "$name" || die "Support scoped process $name did not become healthy."
 	if ! support_node unpaused "$name" || ! support_node updated "$name"; then die 'Cannot record scoped process state.'; fi
 	support_fence || die 'Support replacement differs from its prepared image/configuration.'
 }
@@ -151,7 +154,7 @@ support_finish() {
 scoped_deploy_main() {
 	local owner prefix image id name file index manifest operations_before_image
 	local -a image_ids=() image_env=()
-	[[ "$release_scope" =~ ^support-chat(-activate)?$ && "$expected_support_chat_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Invalid Support release scope.'
+	[[ "$release_scope" =~ ^support-chat(-(activate|repair))?$ && "$expected_support_chat_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Invalid Support release scope.'
 	[[ -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}" && "$(docker context inspect --format '{{.Endpoints.docker.Host}}')" == unix:///var/run/docker.sock ]] || die 'Support release requires the local production Docker daemon.'
 	support_env_names=(canonical identity notificationDelivery operations support crm)
 	support_env_files=("$env_file" "$services_repository/apps/identity/.env.production" "$services_repository/apps/notification-delivery/.env.production" "$services_repository/apps/operations/.env.production" "$services_repository/apps/support/.env.production" "$app_root/deploy/backend/crm/.env.production")
@@ -186,10 +189,18 @@ SUPPORT_UNPACK
 	trap support_finish EXIT
 	support_inventory >"$support_directory/before.json" || die 'Cannot capture Support baseline.'
 	if ! support_inputs || ! support_node inputs; then die 'Support runtime differs from the approved baseline.'; fi
+	if [[ "$release_scope" == support-chat-repair ]]; then
+		id="$(docker ps --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=support-api --format '{{.ID}}')"
+		[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Support repair needs one existing Support API.'
+		prefix="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")"
+		[[ "$prefix" =~ ^[a-f0-9]{40}$ ]] || die 'Support repair predecessor revision is invalid.'
+		git -C "$release_root" diff --quiet "$prefix" "$services_revision" -- apps ':(exclude)apps/support' || die 'Support repair cannot introduce other application source changes.'
+		git -C "$release_root" diff --quiet "$prefix" "$services_revision" -- apps/support/prisma || die 'Support repair cannot change its database schema or migrations.'
+	fi
 	for owner in "${support_owners[@]}"; do
 		support_inputs || die 'Support inputs changed before build.'
 		image="winwidget-$owner:git-$services_revision"
-		if [[ "$release_scope" == support-chat-activate ]]; then
+		if support_reuses_image "$owner"; then
 			case "$owner" in
 				identity | crm-access | support | operations) name="$owner-api" ;;
 				notification-delivery) name=notification-delivery-worker ;;
@@ -199,7 +210,7 @@ SUPPORT_UNPACK
 			[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Support activation process is not uniquely running.'
 			read -r image prefix < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
 			[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$prefix" =~ ^[a-f0-9]{40}$ ]] || die 'Support activation image identity is invalid.'
-			git -C "$release_root" diff --quiet "$prefix" "$services_revision" -- "apps/$owner" || die 'Support activation cannot change application source; release compatible images first.'
+			git -C "$release_root" diff --quiet "$prefix" "$services_revision" -- "apps/$owner" || die 'Support retained application source changed; release compatible images first.'
 			image_ids+=("$image")
 			support_image_variables "$owner" "$image" "$prefix"
 			continue
@@ -224,6 +235,13 @@ SUPPORT_UNPACK
 		fi
 	done
 	support_node prepare || die 'Support candidate changes exceed the scoped configuration contract.'
+	if [[ "$release_scope" == support-chat-repair ]]; then
+		for name in support-worker support-outbox-publisher support-api; do support_start "$name"; done
+		support_probe_network=host support_node http || die 'Support repair authenticated route smoke failed.'
+		support_fence || die 'Support repair final runtime fence failed.'
+		printf '%s\n' 'Support runtime repair is healthy on one immutable image. Existing runtime gates, owner env files, database, broker and every other process are preserved.'
+		return
+	fi
 	if [[ "$release_scope" == support-chat-activate ]]; then
 		support_probe_network=host support_node broker || die 'Support activation topology/ACL preflight failed.'
 		# Delivery and outcome readers precede the API that admits new messages.

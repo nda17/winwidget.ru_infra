@@ -69,7 +69,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate)
+	identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate | support-chat-repair)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -87,7 +87,7 @@ case "$release_scope" in
 		fi ;;
 	*) die 'Unsupported production release scope.' ;;
 esac
-if [[ "$release_scope" =~ ^support-chat(-activate)?$ ]]; then
+if [[ "$release_scope" =~ ^support-chat(-(activate|repair))?$ ]]; then
 	[[ "$expected_support_chat_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'Support chat requires an approved exact runtime and owner-env baseline hash.'
 else
 	[[ -z "$expected_support_chat_baseline_sha256" ]] || die 'Support chat authorization cannot be reused by another scope.'
@@ -170,7 +170,7 @@ elif [[ "$release_scope" == crm-reminders-activate || "$release_scope" == crm-in
 elif [[ "$release_scope" == crm-customers-provider-config ]]; then
 	scoped_shell_file="$controller_root/scripts/deploy-crm-customers-provider-scoped.sh"
 	scoped_node_file="$controller_root/scripts/crm-customers-provider-config.mjs"
-elif [[ "$release_scope" =~ ^support-chat(-activate)?$ ]]; then
+elif [[ "$release_scope" =~ ^support-chat(-(activate|repair))?$ ]]; then
 	scoped_shell_file="$controller_root/scripts/deploy-support-chat-scoped.sh"
 	scoped_node_file="$controller_root/scripts/support-chat-release.mjs"
 fi
@@ -194,7 +194,7 @@ scoped_shell_sha256="$(sha256sum "$scoped_shell_file" | awk '{print $1}')"
 scoped_shell_base64="$(gzip -n -6 -c <"$scoped_shell_file" | base64 | tr -d '\n')"
 scoped_node_sha256="$(sha256sum "$scoped_node_file" | awk '{print $1}')"
 scoped_node_base64="$(gzip -n -6 -c <"$scoped_node_file" | base64 | tr -d '\n')"
-if [[ "$release_scope" =~ ^support-chat(-activate)?$ ]]; then
+if [[ "$release_scope" =~ ^support-chat(-(activate|repair))?$ ]]; then
 	command -v node >/dev/null || die 'Support payload packaging requires Node.js.'
 	for scoped_name in support-chat-release.mjs support-chat-broker.mjs scoped-service-release.mjs; do
 		git -C "$controller_root" ls-files --error-unmatch "scripts/$scoped_name" >/dev/null 2>&1 || die 'Support module is not tracked by immutable Infra.'
@@ -424,7 +424,7 @@ elif [[ "$release_scope" == crm-reminders-activate || "$release_scope" == crm-in
 	printf -v remote_controller_arguments '%s %q %q' "$remote_controller_arguments" '' "$expected_crm_reminders_baseline_sha256"
 elif [[ "$release_scope" == crm-customers-provider-config ]]; then
 	printf -v remote_controller_arguments '%s %q %q %q' "$remote_controller_arguments" '' '' "$expected_crm_customers_provider_baseline_sha256"
-elif [[ "$release_scope" =~ ^support-chat(-activate)?$ ]]; then
+elif [[ "$release_scope" =~ ^support-chat(-(activate|repair))?$ ]]; then
 	printf -v remote_controller_arguments '%s %q %q %q %q' "$remote_controller_arguments" '' '' '' "$expected_support_chat_baseline_sha256"
 fi
 # The remote shell, not this local controller, must expand these variables.
@@ -686,7 +686,7 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		if [[ "${release_scope:-all}" == gateway-tilda-upgrade ]]; then
 			rm -f -- "$scoped_payload_directory/gateway-tilda-release.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
 		fi
-		if [[ "${release_scope:-all}" =~ ^support-chat(-activate)?$ ]]; then
+		if [[ "${release_scope:-all}" =~ ^support-chat(-(activate|repair))?$ ]]; then
 			rm -f -- "$scoped_payload_directory/support-chat-release.mjs" "$scoped_payload_directory/support-chat-broker.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
 		fi
 		rm -f -- "$scoped_payload_directory/controller.sh" "$scoped_payload_directory/verifier.mjs"
@@ -724,7 +724,7 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 			die 'Scoped payload exceeds its bounded uncompressed size.'
 	}
 	scoped_decode_payload "$scoped_shell_base64" "$scoped_payload_directory/controller.sh"
-	if [[ "${release_scope:-all}" =~ ^support-chat(-activate)?$ ]]; then
+	if [[ "${release_scope:-all}" =~ ^support-chat(-(activate|repair))?$ ]]; then
 		printf '%s' "$scoped_node_base64" | base64 --decode | gzip -dc | head -c 393217 >"$scoped_payload_directory/verifier.mjs" || die 'Support envelope decompression failed.'
 		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
 		[[ "$scoped_envelope_size" =~ ^[0-9]+$ ]] || die 'Support envelope size is invalid.'

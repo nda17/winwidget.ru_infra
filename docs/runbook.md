@@ -2289,7 +2289,7 @@ source guard и remote decoder для всех существующих scopes, 
 
 ## Чат поддержки CRM: scoped release и отдельное включение
 
-`support-chat` и `support-chat-activate` выполняются только существующим
+`support-chat`, `support-chat-activate` и `support-chat-repair` выполняются только существующим
 immutable Services production workflow через pinned Infra controller и общий
 `.production-deploy.lock`. Они не используют `all`, не синхронизируют env и не
 отправляют тестовые email/Telegram. Перед каждым этапом синхронизировать полные
@@ -2341,11 +2341,25 @@ queues: четыре независимых main/retry1–3/DLQ семейств
 старые kinds. `support-chat-activate` проверяет прежние image IDs и отсутствие
 изменений apps относительно live revision, затем обновляет только ND worker,
 Support worker, publisher и API, в таком порядке. Broker на этом этапе только
-проверяется. Настройки получателей/каналов включаются авторизованным оператором
+проверяется; Support API получает только добавление `https://crm.winwidget.ru`
+к существующему CORS списку. Настройки получателей/каналов включаются авторизованным оператором
 в админке после готовности runtime; delivery smoke выполняется отдельно.
 
+`support-chat-repair` исправляет только образ трёх Support процессов перед
+повторной активацией. Требует здоровый exact baseline и выключенные фактические
+runtime gates всех трёх ролей. Синхронизированные env уже могут содержать
+подготовленную активацию; repair сохраняет весь фактический runtime env, включая
+выключенные gates и прежний CORS, меняя только `APP_REVISION`. Собирается один
+Support image, затем обновляются worker, publisher, API. Исходники других
+приложений и Support Prisma schema/migrations должны совпадать с revision
+предыдущего Support API; исторические source/image различия соседей не выпускаются.
+Остальные контейнеры, включая уже активный ND, не меняются. Нет SQL, broker или
+env-file mutations. После repair получить свежий baseline и выполнить обычный
+`support-chat-activate`; временно сохранённые gates не являются отдельным режимом
+управления production env.
+
 При остановке этапа приватные baseline/desired/rollback/state файлы остаются в
-root-only `.support-chat[-activate]-release-<SHA>.*` под backend deploy directory.
+root-only `.support-chat[-activate|-repair]-release-<SHA>.*` под backend deploy directory.
 Для повтора нужен свежий baseline фактических процессов и env. Не откатывать
 применённые миграции, не удалять retained события и не возвращать старые ND или
 Operations readers поверх новых контрактов. При recovery изменения production

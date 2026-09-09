@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, gateway-tilda-upgrade, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, crm-intake-sla-activate, crm-customers-provider-config, billing-crm-commerce-acl, support-chat, or support-chat-activate
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, gateway-tilda-upgrade, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, crm-intake-sla-activate, crm-customers-provider-config, billing-crm-commerce-acl, support-chat, support-chat-activate, or support-chat-repair
         default: all
         type: string
       expected_live_revision:
@@ -24,7 +24,7 @@ on:
         default: ''
         type: string
       expected_support_chat_baseline_sha256:
-        description: Exact target, neighbor and six prepared env hashes (support-chat or support-chat-activate)
+        description: Exact target, neighbor and six prepared env hashes (support-chat, support-chat-activate, or support-chat-repair)
         default: ''
         type: string
       expected_crm_commerce_baseline_sha256:
