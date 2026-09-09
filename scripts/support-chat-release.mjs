@@ -132,6 +132,7 @@ const supportApiKeys = ['SUPPORT_NOTIFICATION_DELIVERY_TOKEN', 'SUPPORT_CRM_ACCE
 const ndKeys = ['SUPPORT_INTERNAL_BASE_URL', 'SUPPORT_NOTIFICATION_DELIVERY_TOKEN', 'TELEGRAM_SUPPORT_BOT_TOKEN']
 function allowedEnv(name, activation = false) {
 	if (activation) {
+		if (name === 'support-api') return ['SUPPORT_WEB_CHAT_ENABLED', 'CORS_ALLOWED_ORIGINS']
 		if (name.startsWith('support-')) return ['SUPPORT_WEB_CHAT_ENABLED']
 		if (name === 'notification-delivery-worker') return ['NOTIFICATION_DELIVERY_KINDS']
 		return []
@@ -152,12 +153,15 @@ export function prepareSupportChatCompose({ containers, composes, images, revisi
 	const rollback = structuredClone(desired)
 	for (const [project, name, owner] of SUPPORT_CHAT_TARGETS) {
 		const live = containers.find(row => keyOf(row) === `${project}/${name}`)
-		const image = images.find(row => row.Id === composes[owner].services[name]?.image)
-		assert.ok(image)
 		const targetRevision = activation ? live.Config.Labels['org.opencontainers.image.revision'] : revision
+		const service = structuredClone(composes[owner].services[name])
+		const matchingImages = images.filter(row => row.Id === service.image || (name === 'api-gateway'
+			&& service.image === `winwidget-api-gateway:git-${targetRevision}` && row.RepoTags?.includes(service.image)))
+		assert.equal(matchingImages.length, 1)
+		const image = matchingImages[0]
 		assert.equal(image.Config.Labels['org.opencontainers.image.revision'], targetRevision)
 		if (activation) assert.equal(image.Id, live.Image)
-		const service = structuredClone(composes[owner].services[name])
+		service.image = image.Id
 		assertServiceConfiguration(service, live, image, composes[owner].secrets ?? {})
 		const before = environment(live.Config.Env), imageEnv = environment(image.Config.Env ?? [])
 		const candidate = { ...imageEnv, ...service.environment }
@@ -176,6 +180,14 @@ export function prepareSupportChatCompose({ containers, composes, images, revisi
 		if (name.startsWith('support-')) {
 			if (activation) assert.ok(['true', 'false'].includes(before.SUPPORT_WEB_CHAT_ENABLED))
 			assert.equal(after.SUPPORT_WEB_CHAT_ENABLED, activation ? 'true' : 'false')
+		}
+		if (activation && name === 'support-api') {
+			assert.equal(typeof before.CORS_ALLOWED_ORIGINS, 'string')
+			const crmOrigin = 'https://crm.winwidget.ru'
+			const origins = before.CORS_ALLOWED_ORIGINS.split(',').map(value => value.trim())
+			assert.ok(origins.length > 0 && origins.every(Boolean))
+			assert.equal(after.CORS_ALLOWED_ORIGINS, origins.includes(crmOrigin)
+				? before.CORS_ALLOWED_ORIGINS : before.CORS_ALLOWED_ORIGINS + ',' + crmOrigin)
 		}
 		if (name === 'api-gateway' && !activation) assertSupportChatRoute(before.GATEWAY_ROUTES_JSON, after.GATEWAY_ROUTES_JSON)
 		if (name === 'notification-delivery-worker') {

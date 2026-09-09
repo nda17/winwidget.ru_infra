@@ -7,6 +7,35 @@
 support_code_files=(support-chat-release.mjs support-chat-broker.mjs scoped-service-release.mjs)
 support_owners=(identity crm-access operations notification-delivery support api-gateway)
 
+support_image_variables() {
+	local owner="$1" image="$2" revision="$3" prefix
+	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$revision" =~ ^[a-f0-9]{40}$ ]] || die 'Support Compose image identity is invalid.'
+	if [[ "$owner" == api-gateway ]]; then
+		[[ "$(docker image inspect --format '{{.Id}}' "winwidget-api-gateway:git-$revision")" == "$image" ]] || die 'Gateway image tag no longer resolves to its exact image ID.'
+		image_env+=("APP_VERSION=git-$revision" "APP_REVISION=$revision")
+	else
+		prefix="$(printf '%s' "$owner" | tr '[:lower:]-' '[:upper:]_')"
+		image_env+=("${prefix}_IMAGE=$image" "${prefix}_REVISION=$revision")
+	fi
+}
+support_existing_compose_images() {
+	local owner project name id image revision
+	# Full Compose interpolation needs neighboring image variables even though
+	# prepared output contains only the eleven explicitly allowed processes.
+	for owner in campaigns reporting widgets billing platform crm-intake crm-customers crm-sales; do
+		project=winwidget
+		case "$owner" in
+			campaigns | reporting | widgets) name="$owner-service" ;;
+			crm-*) project=winwidget-crm; name="$owner-api" ;;
+			*) name="$owner-api" ;;
+		esac
+		id="$(docker ps --no-trunc --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=$name" --format '{{.ID}}')"
+		[[ "$id" =~ ^[a-f0-9]{64}$ ]] || die 'Support Compose neighbor is not uniquely running.'
+		read -r image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
+		support_image_variables "$owner" "$image" "$revision"
+	done
+}
+
 support_private() {
 	assert_root_owned_file "$1" && [[ "$(stat -c '%a:%h' "$1")" == 600:1 ]]
 }
@@ -167,9 +196,7 @@ SUPPORT_UNPACK
 			[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$prefix" =~ ^[a-f0-9]{40}$ ]] || die 'Support activation image identity is invalid.'
 			git -C "$release_root" diff --quiet "$prefix" "$services_revision" -- "apps/$owner" || die 'Support activation cannot change application source; release compatible images first.'
 			image_ids+=("$image")
-			id="$prefix"; prefix="$(printf '%s' "$owner" | tr '[:lower:]-' '[:upper:]_')"
-			image_env+=("${prefix}_IMAGE=$image" "${prefix}_REVISION=$id")
-			if [[ "$owner" == api-gateway ]]; then image_env+=("APP_REVISION=$id"); fi
+			support_image_variables "$owner" "$image" "$prefix"
 			continue
 		fi
 		if ! docker image inspect "$image" >/dev/null 2>&1; then
@@ -178,10 +205,9 @@ SUPPORT_UNPACK
 		read -r id prefix < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")
 		[[ "$id" =~ ^sha256:[a-f0-9]{64}$ && "$prefix" == "$services_revision" ]] || die 'Support candidate image revision mismatch.'
 		image_ids+=("$id")
-		prefix="$(printf '%s' "$owner" | tr '[:lower:]-' '[:upper:]_')"
-		image_env+=("${prefix}_IMAGE=$id" "${prefix}_REVISION=$services_revision")
-		if [[ "$owner" == api-gateway ]]; then image_env+=("APP_REVISION=$services_revision"); fi
+		support_image_variables "$owner" "$id" "$services_revision"
 	done
+	support_existing_compose_images
 	docker image inspect "${image_ids[@]}" >"$support_directory/images.json"
 	for owner in "${support_owners[@]}"; do
 		file="$services_repository/apps/$owner/.env.production"
@@ -189,7 +215,7 @@ SUPPORT_UNPACK
 		if [[ "$owner" == crm-access ]]; then
 			env -i PATH="$PATH" "${image_env[@]}" docker compose --profile '*' --project-name winwidget-crm --env-file "${support_env_files[5]}" -f "$release_root/deploy/docker-compose.crm.yml" config --format json >"$support_directory/$owner.json" 2>/dev/null || die 'Support CRM Compose materialization failed.'
 		else
-			env -i PATH="$PATH" "${image_env[@]}" docker compose --profile '*' --project-name winwidget --env-file "$env_file" --env-file "$file" -f "$release_root/deploy/docker-compose.prod.yml" config --format json >"$support_directory/$owner.json" 2>/dev/null || die 'Support owner Compose materialization failed.'
+			env -i PATH="$PATH" "${image_env[@]}" docker compose --profile '*' --project-name winwidget --env-file "$env_file" --env-file "$file" -f "$release_root/deploy/docker-compose.prod.yml" config --format json >"$support_directory/$owner.json" 2>/dev/null || die "Support $owner Compose materialization failed."
 		fi
 	done
 	support_node prepare || die 'Support candidate changes exceed the scoped configuration contract.'

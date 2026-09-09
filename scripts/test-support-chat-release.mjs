@@ -3,6 +3,7 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
+import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { SUPPORT_CHAT_TARGETS, SUPPORT_CHAT_ENV_NAMES, supportChatBaseline, supportChatBaselineSha256,
@@ -22,7 +23,7 @@ function fixture() {
 		const before = { NODE_ENV: 'production', APP_REVISION: oldRevision, EXISTING_SETTING: 'preserve' }
 		if (name === 'api-gateway') before.GATEWAY_ROUTES_JSON = JSON.stringify(oldRoutes)
 		if (name === 'identity-api') before.IDENTITY_SUPPORT_TOKEN = 'c'.repeat(64)
-		if (name === 'support-api') { before.IDENTITY_SUPPORT_TOKEN = 'c'.repeat(64); before.TELEGRAM_SUPPORT_BOT_TOKEN = 'bot' }
+		if (name === 'support-api') { before.IDENTITY_SUPPORT_TOKEN = 'c'.repeat(64); before.TELEGRAM_SUPPORT_BOT_TOKEN = 'bot'; before.CORS_ALLOWED_ORIGINS = 'https://winwidget.ru,https://www.winwidget.ru' }
 		if (name === 'notification-delivery-worker') before.NOTIFICATION_DELIVERY_KINDS = 'email,telegram,wincrm-invitation-email'
 		const after = { ...before, APP_REVISION: revision }
 		if (name === 'api-gateway') after.GATEWAY_ROUTES_JSON = JSON.stringify([...oldRoutes, route])
@@ -63,9 +64,60 @@ test('release prepares only eleven owner processes and preserves unrelated live 
 	const live = structuredClone(input.containers); live.at(-1).RestartCount++
 	assert.throws(() => assertSupportChatFence({ before: input.containers, live, desired: result.desired, images: input.images }))
 })
+test('Gateway Compose git tag is bound to inspected revision and normalized to its immutable image ID', () => {
+	const input = fixture(), service = input.composes['api-gateway'].services['api-gateway']
+	const image = input.images.find(row => row.Id === service.image)
+	service.image = `winwidget-api-gateway:git-${revision}`; image.RepoTags = [service.image]
+	const result = prepareSupportChatCompose(input)
+	assert.equal(result.desired.winwidget.services['api-gateway'].image, image.Id)
+	for (const mutate of [
+		value => { value.images.at(-1).RepoTags = [] },
+		value => { value.composes['api-gateway'].services['api-gateway'].image = 'winwidget-api-gateway:latest' },
+		value => { value.images.at(-1).Config.Labels['org.opencontainers.image.revision'] = oldRevision },
+		value => { value.images.push(structuredClone(value.images.at(-1))) }
+	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareSupportChatCompose(changed)) }
+})
+test('scoped shell supplies every full-Compose application image variable from exact targets or live neighbors without a daemon', () => {
+	const shellPath = resolve(dirname(fileURLToPath(import.meta.url)), 'deploy-support-chat-scoped.sh')
+	const execute = mismatch => spawnSync('bash', ['-c', `
+set -euo pipefail
+source "$1"
+die() { printf '%s\\n' "$1" >&2; exit 1; }
+docker() {
+ case "$1 $2" in
+  'image inspect') printf '%s\\n' "$MOCK_GATEWAY_IMAGE" ;;
+  'ps --no-trunc')
+   [[ "$*" == *'label=com.docker.compose.project=winwidget'* ]] || return 1
+   if [[ "$*" == *'label=com.docker.compose.service=crm-'* ]]; then [[ "$*" == *'label=com.docker.compose.project=winwidget-crm'* ]] || return 1; fi
+   printf '%s\\n' "$MOCK_CONTAINER_ID" ;;
+  'inspect --format') printf '%s %s\\n' "$MOCK_LIVE_IMAGE" "$MOCK_LIVE_REVISION" ;;
+  *) return 1 ;;
+ esac
+}
+image_env=()
+for owner in "\${support_owners[@]}"; do support_image_variables "$owner" "$MOCK_TARGET_IMAGE" "$MOCK_TARGET_REVISION"; done
+support_existing_compose_images
+printf '%s\\n' "\${image_env[@]}"
+`, 'support-compose-test', shellPath], { encoding: 'utf8', env: { PATH: process.env.PATH,
+		MOCK_CONTAINER_ID: '1'.repeat(64), MOCK_LIVE_IMAGE: 'sha256:' + '2'.repeat(64), MOCK_LIVE_REVISION: oldRevision,
+		MOCK_TARGET_IMAGE: 'sha256:' + '3'.repeat(64), MOCK_TARGET_REVISION: revision,
+		MOCK_GATEWAY_IMAGE: 'sha256:' + (mismatch ? '4' : '3').repeat(64) } })
+	const result = execute(false); assert.equal(result.status, 0, result.stderr)
+	const variables = Object.fromEntries(result.stdout.trim().split('\n').map(value => value.split('=')))
+	assert.equal(variables.APP_VERSION, `git-${revision}`); assert.equal(variables.APP_REVISION, revision)
+	for (const owner of ['IDENTITY', 'CRM_ACCESS', 'OPERATIONS', 'NOTIFICATION_DELIVERY', 'SUPPORT']) {
+		assert.equal(variables[`${owner}_IMAGE`], 'sha256:' + '3'.repeat(64)); assert.equal(variables[`${owner}_REVISION`], revision)
+	}
+	for (const owner of ['CAMPAIGNS', 'REPORTING', 'WIDGETS', 'BILLING', 'PLATFORM', 'CRM_INTAKE', 'CRM_CUSTOMERS', 'CRM_SALES']) {
+		assert.equal(variables[`${owner}_IMAGE`], 'sha256:' + '2'.repeat(64)); assert.equal(variables[`${owner}_REVISION`], oldRevision)
+	}
+	assert.equal(Object.keys(variables).length, 28)
+	assert.notEqual(execute(true).status, 0)
+})
 test('release rejects early activation, credential leaks, changed neighbors and unrelated env edits', () => {
 	for (const mutate of [
 		value => { value.composes.support.services['support-worker'].environment.SUPPORT_WEB_CHAT_ENABLED = 'true' },
+		value => { value.composes.support.services['support-api'].environment.CORS_ALLOWED_ORIGINS += ',https://crm.winwidget.ru' },
 		value => { value.composes.support.services['support-outbox-publisher'].environment.SUPPORT_S3_SECRET_ACCESS_KEY = 'leak' },
 		value => { value.composes.identity.services['identity-api'].environment.EXISTING_SETTING = 'changed' },
 		value => { value.composes['notification-delivery'].services['notification-delivery-worker'].environment.NOTIFICATION_DELIVERY_KINDS += ',support-team-email' },
@@ -88,6 +140,7 @@ test('separate activation reuses existing immutable images and appends only thre
 		composes[owner] ??= { name: project, services: {}, secrets: {}, volumes: {} }; composes[owner].services[name] = structuredClone(service)
 	}
 	for (const name of ['support-api', 'support-worker', 'support-outbox-publisher']) composes.support.services[name].environment.SUPPORT_WEB_CHAT_ENABLED = 'true'
+	composes.support.services['support-api'].environment.CORS_ALLOWED_ORIGINS += ',https://crm.winwidget.ru'
 	composes['notification-delivery'].services['notification-delivery-worker'].environment.NOTIFICATION_DELIVERY_KINDS += ',support-team-email,support-team-telegram,support-client-email'
 	const activation = { ...input, containers, composes, activation: true, gatewayRevision: revision, revision: 'c'.repeat(40) }
 	activation.expectedBaselineSha256 = supportChatBaselineSha256(activation)
@@ -98,6 +151,21 @@ test('separate activation reuses existing immutable images and appends only thre
 		assert.equal(service.image, containers.find(row => row.Config.Labels['com.docker.compose.service'] === name).Image)
 	}
 	assert.equal(result.desired.winwidget.services['support-api'].environment.SUPPORT_WEB_CHAT_ENABLED, 'true')
+	assert.equal(result.desired.winwidget.services['support-api'].environment.CORS_ALLOWED_ORIGINS, 'https://winwidget.ru,https://www.winwidget.ru,https://crm.winwidget.ru')
+	const existingCors = structuredClone(activation)
+	const supportApi = existingCors.containers.find(row => row.Config.Labels['com.docker.compose.service'] === 'support-api')
+	supportApi.Config.Env = supportApi.Config.Env.map(value => value.startsWith('CORS_ALLOWED_ORIGINS=') ? value + ',https://crm.winwidget.ru' : value)
+	existingCors.expectedBaselineSha256 = supportChatBaselineSha256(existingCors)
+	assert.equal(prepareSupportChatCompose(existingCors).desired.winwidget.services['support-api'].environment.CORS_ALLOWED_ORIGINS,
+		result.desired.winwidget.services['support-api'].environment.CORS_ALLOWED_ORIGINS)
+	for (const cors of ['https://crm.winwidget.ru', 'https://winwidget.ru,https://www.winwidget.ru,https://evil.example', '*', 'https://winwidget.ru,https://www.winwidget.ru']) {
+		const changed = structuredClone(activation)
+		changed.composes.support.services['support-api'].environment.CORS_ALLOWED_ORIGINS = cors
+		assert.throws(() => prepareSupportChatCompose(changed))
+	}
+	const workerLeak = structuredClone(activation)
+	workerLeak.composes.support.services['support-worker'].environment.CORS_ALLOWED_ORIGINS = 'https://crm.winwidget.ru'
+	assert.throws(() => prepareSupportChatCompose(workerLeak))
 	activation.composes['notification-delivery'].services['notification-delivery-worker'].environment.NOTIFICATION_DELIVERY_KINDS = 'support-team-email,support-team-telegram,support-client-email'
 	assert.throws(() => prepareSupportChatCompose(activation))
 })
