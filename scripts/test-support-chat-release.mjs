@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, writeFileSync, chmodSync, statSync, rmSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import { SUPPORT_CHAT_TARGETS, SUPPORT_CHAT_ENV_NAMES, supportChatBaseline, supportChatBaselineSha256,
 	prepareSupportChatCompose, assertSupportChatFence, assertSupportChatRoute, assertSupportChatManifests, supportChatPayload, supportChatMigrationLedger } from './support-chat-release.mjs'
 
@@ -123,6 +124,40 @@ printf '%s\\n' "\${image_env[@]}"
 	}
 	assert.equal(Object.keys(variables).length, 28)
 	assert.notEqual(execute(true).status, 0)
+})
+test('database and quiet helpers retain the image user and mount readable code without the private payload directory', () => {
+	const shellPath = resolve(dirname(fileURLToPath(import.meta.url)), 'deploy-support-chat-scoped.sh')
+	const directory = mkdtempSync(resolve(tmpdir(), 'support-owner-probe-'))
+	const names = ['support-chat-release.mjs', 'support-chat-broker.mjs', 'scoped-service-release.mjs']
+	try {
+		chmodSync(directory, 0o700)
+		for (const name of names) writeFileSync(resolve(directory, name), 'export {};\n', { mode: 0o444 })
+		const result = spawnSync('bash', ['-c', `
+set -euo pipefail
+source "$1"
+docker() { printf 'CALL\\0'; printf '%s\\0' "$@"; }
+die() { exit 1; }
+support_fence() { return 0; }
+services_repository=/owner
+services_revision=$MOCK_REVISION
+scoped_payload_directory=$MOCK_PAYLOAD
+support_env_files=(/canonical /identity /notification /operations /support /crm)
+support_database identity database-preflight
+support_database notification-delivery database-migrate
+support_quiet
+`, 'support-owner-probe-test', shellPath], { encoding: 'utf8', env: { PATH: process.env.PATH, MOCK_PAYLOAD: directory, MOCK_REVISION: revision } })
+		assert.equal(result.status, 0, result.stderr)
+		const calls = result.stdout.split('CALL\0').slice(1).map(value => value.split('\0').filter(Boolean))
+		assert.equal(calls.length, 3)
+		for (const args of calls) {
+			assert.equal(args[0], 'run'); assert.ok(!args.includes('--user')); assert.ok(!args.includes('--cap-add'))
+			assert.equal(args[args.indexOf('--cap-drop') + 1], 'ALL')
+			const mounts = args.flatMap((value, index) => value === '--volume' ? [args[index + 1]] : [])
+			assert.deepEqual(mounts, names.map(name => `${directory}/${name}:/run/support-code/${name}:ro`))
+			for (const name of names) assert.equal(statSync(resolve(directory, name)).mode & 0o777, 0o444)
+		}
+		assert.equal(statSync(directory).mode & 0o777, 0o700)
+	} finally { rmSync(directory, { recursive: true, force: true }) }
 })
 test('release rejects early activation, credential leaks, changed neighbors and unrelated env edits', () => {
 	for (const mutate of [

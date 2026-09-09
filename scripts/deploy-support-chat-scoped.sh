@@ -115,20 +115,25 @@ support_start() {
 	support_fence || die 'Support replacement differs from its prepared image/configuration.'
 }
 support_database() {
-	local owner="$1" action="$2" file="$services_repository/apps/$1/.env.production" image="winwidget-$1:git-$services_revision"
+	local owner="$1" action="$2" file="$services_repository/apps/$1/.env.production" image="winwidget-$1:git-$services_revision" code
+	local -a mounts=()
+	for code in "${support_code_files[@]}"; do mounts+=(--volume "$scoped_payload_directory/$code:/run/support-code/$code:ro"); done
 	[[ "$owner" != crm-access ]] || file="${support_env_files[5]}"
 	support_fence || die 'Support release fence failed before database work.'
 	docker run --rm --network host --read-only --log-driver none --cap-drop ALL --security-opt no-new-privileges \
-		--user 0:0 --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 --ulimit core=0:0 \
+		--memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 --ulimit core=0:0 \
 		--tmpfs /tmp:rw,nosuid,size=64m --env-file "$file" \
-		--volume "$scoped_payload_directory:/run/support-code:ro" \
+		"${mounts[@]}" \
 		--entrypoint node "$image" /run/support-code/support-chat-release.mjs "$action" "$owner" \
 		|| die "Support $owner $action migration/ledger/privilege verification failed."
 }
 support_quiet() {
+	local code
+	local -a mounts=()
+	for code in "${support_code_files[@]}"; do mounts+=(--volume "$scoped_payload_directory/$code:/run/support-code/$code:ro"); done
 	docker run --rm --network host --read-only --log-driver none --cap-drop ALL --security-opt no-new-privileges \
-		--user 0:0 --memory 256m --memory-swap 256m --cpus 1 --pids-limit 64 --ulimit core=0:0 \
-		--env-file "${support_env_files[3]}" --volume "$scoped_payload_directory:/run/support-code:ro" \
+		--memory 256m --memory-swap 256m --cpus 1 --pids-limit 64 --ulimit core=0:0 \
+		--env-file "${support_env_files[3]}" "${mounts[@]}" \
 		--entrypoint node "winwidget-operations:git-$services_revision" /run/support-code/support-chat-release.mjs operations-quiet
 }
 support_finish() {
