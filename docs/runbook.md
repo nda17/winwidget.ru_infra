@@ -2286,3 +2286,71 @@ source guard и remote decoder для всех существующих scopes, 
 Ручные ad hoc изменения production Compose/Nginx/env должны быть немедленно
 возвращены в `winwidget.ru_infra`; временный VPS-файл не является источником
 истины.
+
+## Чат поддержки CRM: scoped release и отдельное включение
+
+`support-chat` и `support-chat-activate` выполняются только существующим
+immutable Services production workflow через pinned Infra controller и общий
+`.production-deploy.lock`. Они не используют `all`, не синхронизируют env и не
+отправляют тестовые email/Telegram. Перед каждым этапом синхронизировать полные
+canonical/owner env в обе стороны по правилам проекта и получить новый baseline.
+
+`scripts/support-chat-release.mjs` экспортирует `supportChatBaseline` и
+`supportChatBaselineSha256`; CLI `baseline`/`baseline-sha256` принимает приватный
+JSON stdin `{containers, envHashes, gatewayRevision}`. `containers` — полный
+`docker inspect` running inventory; наружу helper возвращает только SHA256 и
+безопасные OCI/container identities. `envHashes` содержит ровно `canonical`,
+`identity`, `notificationDelivery`, `operations`, `support`, `crm`. Canonical —
+`/opt/winwidget/deploy/backend/.env.production`, CRM —
+`/opt/winwidget/deploy/backend/crm/.env.production`, остальные четыре —
+`/opt/winwidget/winwidget.ru_services/apps/<owner>/.env.production`.
+Workflow inputs: `expected_live_revision` — Gateway revision,
+`expected_service_env_sha256` — полный CRM env hash,
+`expected_support_chat_baseline_sha256` — результат helper; canonical hash
+передаётся существующим `BACKEND_PRODUCTION_ENV_SHA256`.
+
+Первый этап обновляет только Identity API, CRM Access API, четыре Operations
+процесса, единый `notification-delivery-worker`, три Support процесса и Gateway.
+Каждый процесс сохраняет чужие env/configuration; остальные контейнеры и базы
+не перезапускаются. Разрешены только миграции
+`20260909010000_add_support_notifications` и
+`20260909160000_add_web_support_chat`. Неисполненная Operations migration
+`20260910110000_remove_admin_backlog` остаётся отложенной. Backup и restore
+manifests допускают только две новые service-owned миграции. Operations backup
+и restore workers останавливаются на время изменения схем после проверки idle,
+затем запускаются с совместимым manifest. API/publisher роли не запускают dump.
+
+На первом этапе `SUPPORT_WEB_CHAT_ENABLED=false`, три новых ND kinds отсутствуют.
+Контроллер добавляет только `/api/v1/support` с `authPolicy=required`, upstream
+`http://127.0.0.1:5100`, timeout 30000; существующий `/api/v1/support/admin` и
+Telegram webhook сохраняются. Support → CRM Access использует порт 5300,
+`SUPPORT_CRM_ACCESS_TOKEN` / `CRM_ACCESS_SUPPORT_TOKEN`; ND → Support — отдельный
+`SUPPORT_NOTIFICATION_DELIVERY_TOKEN`. S3 credentials есть только в Support API.
+Support bot в ND служит только outbound transport через прежний relay.
+
+Broker provisioning расширяет конечные exact ACL только трёх существующих
+principals: ND, Support worker и Support publisher. Добавляет 20 durable classic
+queues: четыре независимых main/retry1–3/DLQ семейства. ND очереди используют
+`retry-v2`, outcome очередь `winwidget.support.notification-outcomes.v1` —
+`retry-v1`. TTL 30s/5min/30min, dead-letter destination `winwidget.manual-retry`.
+Никакие сообщения, очереди, users или чужие permissions не удаляются.
+
+Для второго этапа сначала синхронизировать env с `SUPPORT_WEB_CHAT_ENABLED=true`
+и добавить к прежнему ND списку ровно
+`support-team-email,support-team-telegram,support-client-email`; сохранить все
+старые kinds. `support-chat-activate` проверяет прежние image IDs и отсутствие
+изменений apps относительно live revision, затем обновляет только ND worker,
+Support worker, publisher и API, в таком порядке. Broker на этом этапе только
+проверяется. Настройки получателей/каналов включаются авторизованным оператором
+в админке после готовности runtime; delivery smoke выполняется отдельно.
+
+При остановке этапа приватные baseline/desired/rollback/state файлы остаются в
+root-only `.support-chat[-activate]-release-<SHA>.*` под backend deploy directory.
+Для повтора нужен свежий baseline фактических процессов и env. Не откатывать
+применённые миграции, не удалять retained события и не возвращать старые ND или
+Operations readers поверх новых контрактов. При recovery изменения production
+env проходят ту же полную двустороннюю синхронизацию; runtime-only env overrides
+не являются способом выключения чата. Исторические CRM activation scopes не
+использовать после расширения ACL: их прежние exact contracts намеренно не
+принимают новый Support topology. Следующий несвязанный rollout должен сохранить
+этот дополнительный контракт, а не повторно provision старой ACL-конфигурации.

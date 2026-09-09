@@ -97,6 +97,10 @@ jobs:
           bash -n scripts/deploy-identity-operations-scoped.sh
           shellcheck -x scripts/deploy-identity-operations-scoped.sh
           node --check scripts/scoped-service-release.mjs
+          bash -n scripts/deploy-support-chat-scoped.sh
+          shellcheck -x scripts/deploy-support-chat-scoped.sh
+          node --check scripts/support-chat-release.mjs
+          node --check scripts/support-chat-broker.mjs
           node --check scripts/gateway-tilda-release.mjs
           bash -n scripts/deploy-crm-scoped.sh
           shellcheck -x scripts/deploy-crm-scoped.sh
@@ -168,6 +172,9 @@ jobs:
       - name: Verify additive CRM broker topology and scoped ACL contract
         shell: bash
         run: node --test scripts/test-crm-broker-topology.mjs scripts/test-crm-broker-bootstrap.mjs scripts/test-crm-reminders-broker.mjs
+
+      - name: Verify isolated Support release, retained events and exact ACL extension
+        run: node --test scripts/test-support-chat-release.mjs scripts/test-support-chat-broker.mjs
 
       - name: Verify closed CRM companion environment preparation
         run: node --test scripts/test-crm-companion-env.mjs scripts/test-crm-companion-release.mjs scripts/test-crm-public-release.mjs scripts/test-billing-crm-acl-release.mjs

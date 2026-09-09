@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, gateway-tilda-upgrade, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, crm-intake-sla-activate, crm-customers-provider-config, or billing-crm-commerce-acl
+        description: all, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, gateway-tilda-upgrade, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, crm-intake-sla-activate, crm-customers-provider-config, billing-crm-commerce-acl, support-chat, or support-chat-activate
         default: all
         type: string
       expected_live_revision:
@@ -21,6 +21,10 @@ on:
         type: string
       expected_crm_upgrade_baseline_sha256:
         description: Fresh approved exact runtime and owner-env baseline hash (crm-upgrade only)
+        default: ''
+        type: string
+      expected_support_chat_baseline_sha256:
+        description: Exact target, neighbor and six prepared env hashes (support-chat or support-chat-activate)
         default: ''
         type: string
       expected_crm_commerce_baseline_sha256:
@@ -136,6 +140,7 @@ jobs:
           EXPECTED_LIVE_REVISION: ${{ inputs.expected_live_revision }}
           EXPECTED_SERVICE_ENV_SHA256: ${{ inputs.expected_service_env_sha256 }}
           EXPECTED_CRM_UPGRADE_BASELINE_SHA256: ${{ inputs.expected_crm_upgrade_baseline_sha256 }}
+          EXPECTED_SUPPORT_CHAT_BASELINE_SHA256: ${{ inputs.expected_support_chat_baseline_sha256 }}
           EXPECTED_CRM_COMMERCE_BASELINE_SHA256: ${{ inputs.expected_crm_commerce_baseline_sha256 }}
           EXPECTED_CRM_REMINDERS_BASELINE_SHA256: ${{ inputs.expected_crm_reminders_baseline_sha256 }}
           EXPECTED_CRM_CUSTOMERS_PROVIDER_BASELINE_SHA256: ${{ inputs.expected_crm_customers_provider_baseline_sha256 }}
