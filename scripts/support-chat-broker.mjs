@@ -201,8 +201,10 @@ export function assertSupportChatBrokerSnapshot(snapshot, complete = false, allo
 		// messages are valid and are never purged or used as a release gate.
 		const consumers = Number(row.consumers ?? 0)
 		assert.ok(Number.isSafeInteger(consumers) && consumers >= 0)
-		const main = [SUPPORT_CHAT_OUTCOME_QUEUE, ...SUPPORT_CHAT_KINDS.map(item => item[1])].includes(row.name)
-		assert.ok(consumers <= (allowConsumers && main ? 1 : 0))
+		// ND consumes its DLQ to persist failures, independently of main delivery.
+		const consumed = [SUPPORT_CHAT_OUTCOME_QUEUE,
+			...SUPPORT_CHAT_KINDS.flatMap(item => [item[1], item[1] + '.dead-letter'])].includes(row.name)
+		assert.ok(consumers <= (allowConsumers && consumed ? 1 : 0))
 	}
 	const key = row => JSON.stringify([row.source, row.destination, row.destination_type, row.routing_key, row.arguments])
 	const bindings = snapshot.bindings.filter(row => row.source && owned(row.destination))

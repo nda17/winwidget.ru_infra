@@ -107,13 +107,25 @@ test('incompatible durable queue, active consumer or wildcard target ACL prevent
 		assert.ok(calls.every(([method]) => method === 'GET'))
 	}
 })
-test('activation verifies complete topology without mutations and permits exactly one resumed consumer', async () => {
+test('activation permits one main or ND DLQ consumer while retry and outcome DLQ stay unconsumed', async () => {
 	const snapshot = fixture()
 	await provisionSupportChatBroker(api(snapshot))
 	snapshot.queues.find(row => row.name === SUPPORT_CHAT_OUTCOME_QUEUE).consumers = 1
+	for (const [, name] of SUPPORT_CHAT_KINDS) {
+		snapshot.queues.find(row => row.name === name).consumers = 1
+		snapshot.queues.find(row => row.name === name + '.dead-letter').consumers = 1
+	}
 	const calls = []
 	await verifySupportChatBroker(api(snapshot, calls))
 	assert.ok(calls.every(([method]) => method === 'GET'))
-	snapshot.queues.find(row => row.name === SUPPORT_CHAT_OUTCOME_QUEUE).consumers = 2
-	await assert.rejects(() => verifySupportChatBroker(api(snapshot)))
+	for (const [name, consumers] of [
+		[SUPPORT_CHAT_OUTCOME_QUEUE, 2],
+		[SUPPORT_CHAT_KINDS[0][1] + '.dead-letter', 2],
+		[SUPPORT_CHAT_KINDS[0][1] + '.retry-v2.1', 1],
+		[SUPPORT_CHAT_OUTCOME_QUEUE + '.dead-letter', 1]
+	]) {
+		const changed = structuredClone(snapshot)
+		changed.queues.find(row => row.name === name).consumers = consumers
+		await assert.rejects(() => verifySupportChatBroker(api(changed)))
+	}
 })
