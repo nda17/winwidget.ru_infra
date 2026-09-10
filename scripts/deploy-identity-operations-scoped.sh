@@ -676,6 +676,133 @@ scoped_workers_quiet() {
 	done
 }
 
+scoped_identity_source() {
+	local changes path base=5dc888e76ff092ba029c90648486ea8773980192
+	path=apps/identity/src/transports/verification-transport.service.ts
+	# The owner image can predate already deployed changes in other owners.
+	# Pin the reviewed repository baseline separately from the live Identity tree.
+	git -C "$release_root" merge-base --is-ancestor "$base" "$services_revision" || return 1
+	changes="$(git -C "$release_root" diff --name-only "$base" "$services_revision")" || return 1
+	[[ "$changes" == $'.github/scripts/static-check-services-lifecycle.sh\n.github/workflows/ci.yml\napps/identity/src/transports/verification-transport.service.ts' ]] || return 1
+	changes="$(git -C "$release_root" diff --name-only "$expected_live_revision" "$services_revision" -- apps/identity)" || return 1
+	[[ "$changes" == "$path" ]] || return 1
+	[[ -f "$release_root/$path" && ! -L "$release_root/$path" && "$(realpath -e "$release_root/$path")" == "$release_root/$path" ]] || return 1
+	git -C "$release_root" show "$expected_live_revision:$path" >"$scoped_work_directory/identity-source-before.ts" || return 1
+	chmod 600 "$scoped_work_directory/identity-source-before.ts" || return 1
+	install -m 600 "$release_root/$path" "$scoped_work_directory/identity-source-after.ts" || return 1
+	scoped_verifier identity-api-source || return 1
+}
+
+scoped_identity_image_inventory() {
+	local image="$1" output="$2"
+	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$output" =~ ^identity-image-(before|after).json$ ]] || return 1
+	(
+		umask 077; set -o noclobber
+		docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+			--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
+			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			--entrypoint timeout "$image" --signal=TERM --kill-after=5s 30s node /run/scoped-verifier.mjs identity-api-image >"$scoped_work_directory/$output"
+	) || return 1
+}
+
+scoped_identity_neighbors() {
+	local ids id result target
+	local -a container_ids=()
+	# Include every running Docker project and the stopped target during cutover.
+	ids="$(docker ps --no-trunc --format '{{.ID}}')" || return 1
+	target="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=identity-api --format '{{.ID}}')" || return 1
+	[[ "$target" =~ ^[a-f0-9]{64}$ ]] || return 1
+	ids+=$'\n'"$target"
+	while IFS= read -r id; do [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1; container_ids+=("$id"); done < <(printf '%s\n' "$ids" | LC_ALL=C sort -u)
+	(( ${#container_ids[@]} >= 3 && ${#container_ids[@]} <= 200 )) || return 1
+	docker inspect "${container_ids[@]}" >"$scoped_work_directory/identity-neighbors.json" || return 1
+	chmod 600 "$scoped_work_directory/identity-neighbors.json" || return 1
+	result="$(scoped_verifier identity-api-neighbors)" || return 1
+	[[ "$result" =~ ^[a-f0-9]{64}$ ]] || return 1
+	printf '%s' "$result"
+}
+
+scoped_identity_assert_neighbors() {
+	local fingerprint
+	(scoped_assert_unchanged_neighbors) || return 1
+	scoped_assert_hash "$app_root/deploy/backend/crm/.env.production" "$scoped_identity_crm_env_sha256" || return 1
+	fingerprint="$(scoped_identity_neighbors)" || return 1
+	[[ "$fingerprint" == "$scoped_identity_neighbors_before" ]] || return 1
+}
+
+scoped_identity_http() {
+	docker run --rm --network host --read-only --cap-drop ALL --security-opt no-new-privileges \
+		--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
+		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint timeout "$scoped_identity_expected_image" --signal=TERM --kill-after=5s 30s \
+		node /run/scoped-verifier.mjs identity-api-http "$scoped_identity_expected_revision" || return 1
+}
+
+scoped_identity_runtime() {
+	local id
+	id="$(scoped_container_id identity-api)" || return 1
+	docker inspect "$id" >"$scoped_work_directory/identity-current.json" || return 1
+	chmod 600 "$scoped_work_directory/identity-current.json" || return 1
+	scoped_verifier identity-api-runtime "$1" || return 1
+}
+
+scoped_identity_rollback() {
+	local id image revision
+	id="$(docker ps --all --no-trunc --filter label=com.docker.compose.project=winwidget --filter label=com.docker.compose.service=identity-api --format '{{.ID}}')" || return 1
+	[[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+	read -r image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
+	[[ "$image $revision" == "$scoped_image_id $services_revision" || "$image $revision" == "$scoped_identity_previous_image $expected_live_revision" ]] || return 1
+	scoped_identity_assert_neighbors || return 1
+	scoped_workers_graceful_stop "$id" || return 1
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || return 1
+	scoped_identity_assert_neighbors || return 1
+	scoped_compose rollback up -d --no-build --no-deps --force-recreate identity-api >/dev/null 2>&1 || return 1
+	scoped_wait_healthy || return 1
+	id="$(scoped_container_id identity-api)" || return 1
+	[[ "$(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")" == "$scoped_identity_previous_image $expected_live_revision" ]] || return 1
+	scoped_identity_expected_image="$scoped_identity_previous_image"; scoped_identity_expected_revision="$expected_live_revision"
+	(scoped_identity_runtime rollback && scoped_identity_http && scoped_identity_assert_neighbors) || return 1
+}
+
+scoped_deploy_identity_api() {
+	local image_tag image_revision
+	scoped_identity_previous_image="$1"; scoped_identity_previous_id="$2"
+	scoped_identity_expected_image="$1"; scoped_identity_expected_revision="$expected_live_revision"
+	(scoped_identity_source) || die 'Identity source exceeds the two approved SMS template edits and CI caller gates.'
+	scoped_identity_crm_env_sha256="$(sha256sum "$app_root/deploy/backend/crm/.env.production" | awk '{print $1}')"
+	scoped_assert_hash "$app_root/deploy/backend/crm/.env.production" "$scoped_identity_crm_env_sha256"
+	scoped_identity_neighbors_before="$(scoped_identity_neighbors)" || die 'Identity release requires healthy unchanged runtime neighbors.'
+	scoped_identity_image_inventory "$1" identity-image-before.json || die 'Preserved Identity image inventory is invalid.'
+	scoped_identity_http || die 'Preserved Identity read-only HTTP contract is not ready.'
+	image_tag="winwidget-identity:git-$services_revision"
+	docker build --build-arg "APP_REVISION=$services_revision" --tag "$image_tag" "$release_root/apps/identity" >/dev/null 2>&1 || die 'Identity immutable image build failed.'
+	read -r scoped_image_id image_revision < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_tag")
+	[[ "$scoped_image_id" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" ]] || die 'Identity image is not the exact green candidate.'
+	scoped_identity_image_inventory "$scoped_image_id" identity-image-after.json || die 'Candidate Identity image inventory is invalid.'
+	scoped_verifier identity-api-images || die 'Identity image changed another module, dependency, schema, migration or asset.'
+	export IDENTITY_IMAGE="$scoped_image_id" IDENTITY_REVISION="$services_revision"
+	scoped_source_compose config --format json >"$scoped_work_directory/compose.json"
+	scoped_target_ids=("$scoped_identity_previous_id")
+	docker inspect "${scoped_target_ids[@]}" >"$scoped_work_directory/live.json"
+	docker image inspect "$scoped_image_id" >"$scoped_work_directory/image.json"
+	docker image inspect "$scoped_identity_previous_image" >"$scoped_work_directory/identity-previous-image.json"
+	chmod 600 "$scoped_work_directory/compose.json" "$scoped_work_directory/live.json" "$scoped_work_directory/image.json" "$scoped_work_directory/identity-previous-image.json"
+	scoped_verifier prepare || die 'Identity candidate changes unapproved runtime configuration.'
+	scoped_identity_assert_neighbors || die 'Identity post-build admission changed.'
+	[[ "$(scoped_container_id identity-api)" == "$scoped_identity_previous_id" ]] || die 'Identity API changed identity before stop.'
+	scoped_identity_stop_started=true
+	scoped_workers_graceful_stop "$scoped_identity_previous_id" || die 'Identity graceful exit was not proven; no forced stop or replacement.'
+	[[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$scoped_identity_previous_id")" == 'false 0' ]] || die 'Old Identity API is not physically stopped.'
+	scoped_identity_assert_neighbors || die 'Identity neighbors changed before replacement.'
+	scoped_cutover_started=true
+	scoped_compose desired up -d --no-build --no-deps --force-recreate identity-api >/dev/null 2>&1 || die 'Identity API replacement failed.'
+	(scoped_wait_healthy && scoped_verify_target_images) || die 'Identity candidate is not healthy on its exact image.'
+	scoped_identity_expected_image="$scoped_image_id"; scoped_identity_expected_revision="$services_revision"
+	(scoped_identity_runtime desired && scoped_identity_http && scoped_identity_assert_neighbors) || die 'Identity postflight failed.'
+	[[ "$(scoped_container_id identity-api)" != "$scoped_identity_previous_id" ]] || die 'Identity API replacement was not observed.'
+	printf 'Identity SMS API release completed without migrations, env, workers or broker changes: infra=%s services=%s\n' "$infra_revision" "$services_revision"
+}
+
 scoped_platform_source() {
 	local changes path checksum index=0 peers base=19a0ecd47fd448ca82d1efeb67df59bb00a0c293
 	local -a paths=(content/platform-content.validation.ts home-page-content/home-page-content.service.ts)
@@ -1074,6 +1201,12 @@ scoped_cleanup() {
 		else
 			printf '%s\n' 'RECOVERY_REQUIRED: pre-DDL Operations restart needs operator verification.' >&2
 		fi
+	elif [[ "$exit_code" != 0 && "$release_scope" == identity-api-runtime && "${scoped_identity_stop_started:-false}" == true ]]; then
+		if scoped_identity_rollback; then
+			printf '%s\n' 'Identity rollback restored the preserved API image/config; workers, env and other runtimes are unchanged.' >&2
+		else
+			printf '%s\n' 'RECOVERY_REQUIRED: Identity graceful stop or unchanged neighbors could not be proven; no forced replacement was attempted.' >&2
+		fi
 	elif [[ "$exit_code" != 0 && "$release_scope" == gateway-tilda-upgrade && "${scoped_gateway_stop_started:-false}" == true ]]; then
 		if scoped_gateway_rollback; then
 			printf '%s\n' 'Gateway rollback restored its exact preserved image/config; routes, env and CRM/SLA neighbors are unchanged.' >&2
@@ -1137,13 +1270,14 @@ scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
-	[[ "$release_scope" =~ ^(identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|gateway-tilda-upgrade|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
+	[[ "$release_scope" =~ ^(identity-api-runtime|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|gateway-tilda-upgrade|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'
 	[[ "$(stat -Lc '%d:%i' "/proc/self/fd/$deploy_lock_fd")" == "$(stat -c '%d:%i' "$deploy_lock")" ]] ||
 		die 'Scoped deployment did not inherit the canonical production lock.'
 	flock -n "$deploy_lock_fd" || die 'Scoped deployment lost the canonical production lock.'
 	case "$release_scope" in
+		identity-api-runtime) scoped_owner=identity; scoped_targets=(identity-api) ;;
 		platform-marketing-runtime) scoped_owner=platform; scoped_targets=(platform-api) ;;
 		operations-federation-config | operations-api-runtime) scoped_owner=operations; scoped_targets=(operations-api) ;;
 		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-api billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
@@ -1210,6 +1344,10 @@ scoped_deploy_main() {
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
+	if [[ "$release_scope" == identity-api-runtime ]]; then
+		scoped_deploy_identity_api "$old_image" "$id"
+		return
+	fi
 	if [[ "$release_scope" == gateway-tilda-upgrade ]]; then
 		scoped_gateway_unpack || die 'Gateway helper envelope is invalid.'
 		scoped_deploy_gateway_tilda "$old_image" "$id"

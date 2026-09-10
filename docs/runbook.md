@@ -1052,6 +1052,28 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
 их не пересоздаёт. Все соседние container IDs/images и hashes env проверяются
 до и после; `--no-deps` запрещает косвенное пересоздание соседних сервисов.
 
+- `identity-api-runtime`: только `identity-api`, для двух проверенных SMS
+  шаблонов с упоминанием WinWidget. `expected_live_revision` закрепляет
+  работающий Identity API, `expected_service_env_sha256` — полный Identity env.
+  Workers/publisher могут иметь другую ревизию и сохраняют свои image/ID.
+  Source admission допускает только точные bytes transport-файла, caller CI
+  и его `static-check-services-lifecycle.sh` gate
+  относительно закреплённого services baseline; относительно live Identity
+  запрещены любые другие изменения приложения. UID1001 image probe без сети
+  и credentials сверяет только две literal-замены в compiled transport,
+  остальные dist/declarations/maps, зависимости, assets, Prisma schema и
+  migration files. Меняется лишь карта исходников изменённого JS-модуля.
+  Полный runtime env, mounts, healthcheck, ресурсы и команды API сохраняются;
+  меняются только image и `APP_REVISION`. Canonical, Identity/прочие owner env
+  и CRM env остаются побайтово неизменными. Fingerprint всех работающих Docker
+  projects защищает соседние ID/image/config/mounts/restarts. Scope выполняется
+  до общего provisioning, без migration, DB writes, GRANT, RabbitMQ или
+  отправки SMS. TERM обязан доказать `Running=false/Pid=0`; после замены
+  проверяются exact OCI/runtime revision и GET `/health/live`, `/health/ready`,
+  `/health/revision` Identity на порту 4900. При ошибке отдельный rollback
+  возвращает сохранённый API image/config только после доказанного TERM и
+  неизменности соседей/env. Публичный Gateway сохраняет прежнюю ревизию.
+
 - `workers-bootstrap-recovery`: только `billing-api`, `billing-worker`,
   `billing-outbox-publisher`, `operations-worker`,
   `operations-outbox-publisher`, `operations-restore-worker`, `support-worker`,

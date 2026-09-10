@@ -20,6 +20,14 @@ import {
 	OPERATIONS_API_PHASE_A_SHA256,
 	OPERATIONS_API_SOURCE_PATHS,
 	PLATFORM_MARKETING_SOURCE,
+	IDENTITY_SMS_SOURCE,
+	assertIdentitySmsSource,
+	assertIdentitySmsCompiled,
+	validateIdentityApiInventory,
+	assertIdentityApiImages,
+	assertIdentityApiRuntime,
+	identityApiNeighborFingerprint,
+	verifyIdentityApiHttp,
 	assertPlatformMarketingSource,
 	assertPlatformImages,
 	validatePlatformInventory,
@@ -62,6 +70,7 @@ const identityScope = 'identity-with-operations-manifest'
 const workerScope = 'workers-bootstrap-recovery'
 const apiScope = 'operations-api-runtime'
 const platformScope = 'platform-marketing-runtime'
+const identityApiScope = 'identity-api-runtime'
 const backupRuntimeScope = 'operations-backup-runtime'
 const gatewayTildaScope = 'gateway-tilda-upgrade'
 
@@ -206,7 +215,7 @@ test('Platform database admission is SELECT-only and binds its eight applied mig
 test('scoped neighbor inventories ignore only mount enumeration order, not mount or ordered configuration changes', () => {
 	const { live: operations } = apiPeersFixture()
 	for (let index = 0; index < 26; index++) { const item = structuredClone(operations[4]); item.Id = (index + 20).toString(16).padStart(64, '0'); item.Config.Labels['com.docker.compose.service'] = `neighbor-${index}`; operations.push(item) }
-	for (const [live, fingerprint] of [[operations, operationsApiNeighborFingerprint], [platformPeersFixture(), platformNeighborFingerprint]]) {
+	for (const [live, fingerprint] of [[operations, operationsApiNeighborFingerprint], [platformPeersFixture(), platformNeighborFingerprint], [identityApiPeersFixture(), identityApiNeighborFingerprint]]) {
 		live[3].Mounts = [
 			{ Type: 'bind', Source: '/synthetic/source', Destination: '/run/input', Mode: 'ro', RW: false, Propagation: 'rprivate' },
 			{ Type: 'volume', Name: 'synthetic-volume', Source: '/synthetic/volume', Destination: '/data', Driver: 'local', Mode: 'rw', RW: true, Propagation: '' }
@@ -372,7 +381,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', gatewayTildaScope, workerScope, apiScope, platformScope, ...crmScopes]) {
+	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', gatewayTildaScope, workerScope, apiScope, platformScope, identityApiScope, ...crmScopes]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -388,6 +397,15 @@ test('Platform controller rejects destructive and foreign companion authority be
 		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_OPERATIONS_ENV_SHA256: envHash },
 		{ EXPECTED_OPERATIONS_API_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash }
 	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: platformScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization|baseline/i)
+})
+
+test('Identity API controller rejects destructive and foreign companion authority before transport', () => {
+	for (const authority of [
+		{ OPERATIONS_RUNTIME_REVISION: oldRevision }, { OPERATIONS_EVIDENCE_SHA256: envHash },
+		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_OPERATIONS_ENV_SHA256: envHash },
+		{ EXPECTED_OPERATIONS_API_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash },
+		{ EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash }
+	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: identityApiScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...authority }, /authorization|baseline/i)
 })
 
 for (const scope of crmScopes) test(scope + ' cannot receive destructive or foreign companion authorization', () => {
@@ -629,8 +647,9 @@ function composeFixture(scope = identityScope) {
 		if (scope === workerScope && name === 'operations-restore-worker') environment.DATABASE_RESTORE_ENABLED = 'false'
 		if (scope === apiScope) environment.DATABASE_RESTORE_ENABLED = 'false'
 		if (scope === platformScope) environment.PLATFORM_PROCESS_ROLE = 'api'
+		if (scope === identityApiScope) environment.IDENTITY_PROCESS_ROLE = 'api'
 		const before = { ...environment, APP_REVISION: oldRevision }
-		if (name === 'identity-api') before.IDENTITY_LOGIN_OTP_ENABLED = 'false'
+		if (scope === identityScope && name === 'identity-api') before.IDENTITY_LOGIN_OTP_ENABLED = 'false'
 		services[name] = {
 			network_mode: 'host',
 			stop_grace_period: '10s',
@@ -984,6 +1003,211 @@ test('Platform Compose replaces only its API and preserves process role, environ
 		value => { value.compose.services['platform-api'].mem_limit = 1024 },
 		value => { value.live[0].State.Health.Status = 'unhealthy' }
 	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareScopedCompose(changed), undefined, mutate.toString()) }
+})
+
+test('Identity API Compose changes only its immutable image and revision while preserving OTP, role and neighboring workers', () => {
+	const input = composeFixture(identityApiScope)
+	for (const name of ['identity-worker', 'identity-outbox-publisher', 'support-api', 'api-gateway']) input.compose.services[name] = { image: 'preserve-this-neighbor' }
+	const { desired, rollback } = prepareScopedCompose(input)
+	assert.deepEqual(Object.keys(desired.services), ['identity-api'])
+	assert.deepEqual(Object.keys(rollback.services), ['identity-api'])
+	assert.equal(desired.services['identity-api'].image, input.image.Id)
+	assert.equal(rollback.services['identity-api'].image, input.live[0].Image)
+	assert.equal(desired.services['identity-api'].environment.APP_REVISION, revision)
+	assert.equal(rollback.services['identity-api'].environment.APP_REVISION, oldRevision)
+	for (const snapshot of [desired, rollback]) {
+		assert.equal(snapshot.services['identity-api'].environment.IDENTITY_LOGIN_OTP_ENABLED, 'true')
+		assert.equal(snapshot.services['identity-api'].environment.IDENTITY_PROCESS_ROLE, 'api')
+		assert.equal(snapshot.services['identity-api'].build, undefined)
+		assert.equal(snapshot.services['identity-api'].depends_on, undefined)
+	}
+	for (const mutate of [
+		value => { value.compose.services['identity-api'].environment.IDENTITY_PROCESS_ROLE = 'worker' },
+		value => { value.compose.services['identity-api'].environment.IDENTITY_LOGIN_OTP_ENABLED = 'false' },
+		value => { value.compose.services['identity-api'].environment.SMSAERO_SIGN = 'unreviewed' },
+		value => { value.live[0].Config.Env = value.live[0].Config.Env.filter(row => !row.startsWith('IDENTITY_PROCESS_ROLE=')) },
+		value => { value.live[0].Config.Env = value.live[0].Config.Env.map(row => row.startsWith('APP_REVISION=') ? `APP_REVISION=${revision}` : row) },
+		value => { value.compose.services['identity-api'].mem_limit = 1024 },
+		value => { value.live[0].State.Health.Status = 'unhealthy' },
+		value => { value.image.Config.Labels['org.opencontainers.image.revision'] = oldRevision },
+		value => { value.live.push(structuredClone(value.live[0])) }
+	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareScopedCompose(changed), undefined, mutate.toString()) }
+})
+
+test('Identity postflight binds the recreated process to the approved image, complete environment and runtime configuration', () => {
+	const input = composeFixture(identityApiScope), { desired } = prepareScopedCompose(input)
+	const live = structuredClone(input.live), current = live[0]
+	current.Image = input.image.Id; current.Config.Labels['org.opencontainers.image.revision'] = revision
+	current.Config.Env = current.Config.Env.map(row => row.startsWith('APP_REVISION=') ? `APP_REVISION=${revision}` : row)
+	current.RestartCount = 0; current.State.OOMKilled = false
+	const fixture = { snapshot: desired, live, image: input.image, revision }
+	assertIdentityApiRuntime(fixture)
+	for (const mutate of [
+		value => { value.live[0].Image = `sha256:${'f'.repeat(64)}` },
+		value => { value.live[0].Config.Labels['org.opencontainers.image.revision'] = oldRevision },
+		value => { value.live[0].Config.Env = value.live[0].Config.Env.map(row => row.startsWith('APP_REVISION=') ? `APP_REVISION=${oldRevision}` : row) },
+		value => { value.live[0].Config.Env.push('UNAPPROVED_SETTING=changed') },
+		value => { value.live[0].Config.Env = value.live[0].Config.Env.filter(row => !row.startsWith('IDENTITY_PROCESS_ROLE=')) },
+		value => { value.live[0].HostConfig.NetworkMode = 'bridge' }, value => { value.live[0].RestartCount = 1 },
+		value => { value.live[0].State.OOMKilled = true }, value => { value.live[0].State.Health.Status = 'unhealthy' },
+		value => { value.snapshot.services['identity-worker'] = value.snapshot.services['identity-api'] }
+	]) { const changed = structuredClone(fixture); mutate(changed); assert.throws(() => assertIdentityApiRuntime(changed), undefined, mutate.toString()) }
+})
+
+function identitySmsCompiledFixture() {
+	const before = 'prefix\nreturn this.sendSms(phone, `Ваш код подтверждения: ${code}`);\nreturn this.sendSms(phone, `Ваш новый пароль: ${password}`);\nsuffix\n'
+	return { before, after: before.replace('Ваш код подтверждения:', 'Ваш код подтверждения в WinWidget:').replace('Ваш новый пароль:', 'Ваш новый пароль в WinWidget:') }
+}
+
+test('Identity SMS source and compiled admission permit exactly the two reviewed service-name additions', () => {
+	assert.deepEqual(IDENTITY_SMS_SOURCE, {
+		before: '46cf5d21383b7ca7cc5afd0736f25cf30c3105e46cb5d4930b38dd1cb4380c79',
+		after: '568ea3f19344446a3ee6abde9c678a3c9c7d44a273d52196832bf2dbe0fa81b3'
+	})
+	const { before, after } = identitySmsCompiledFixture()
+	assertIdentitySmsCompiled(before, after)
+	for (const value of [before, after + '\n', after.replace('prefix', 'changed'), after.replace('${code}', '${password}'), after.replace('WinWidget', 'Other'), after.replace('Ваш новый пароль в WinWidget:', 'Ваш новый пароль:')]) assert.throws(() => assertIdentitySmsCompiled(before, value))
+	assert.throws(() => assertIdentitySmsCompiled(before + before, after + after))
+	assert.throws(() => assertIdentitySmsCompiled(after, before))
+	for (const [previous, candidate] of [[before, after], ['', after], [undefined, after], [before, undefined]]) assert.throws(() => assertIdentitySmsSource(previous, candidate))
+	// Positive source hashes are verified from the actual release, not weakened
+	// to admit synthetic source bytes in this standalone infrastructure fixture.
+})
+
+test('Identity source coordinator admits only its three reviewed release paths and one owner transport path', () => {
+	for (const scenario of ['success', 'no-base', 'source-drift', 'owner-drift', 'missing-file', 'symlink', 'hash-failed']) privateFixture(directory => {
+		const root = realpathSync(directory), release = join(root, 'release'), work = join(root, 'work')
+		const source = join(release, 'apps/identity/src/transports/verification-transport.service.ts')
+		mkdirSync(dirname(source), { recursive: true }); mkdirSync(work)
+		if (scenario === 'symlink') { writeFileSync(join(root, 'outside.ts'), '// synthetic\n'); symlinkSync(join(root, 'outside.ts'), source) }
+		else if (scenario !== 'missing-file') writeFileSync(source, '// synthetic\n')
+		const result = spawnSync('/bin/bash', ['-c', String.raw`
+set -euo pipefail
+source "$SCOPED_LIBRARY"
+release_root="$TEST_RELEASE"
+scoped_work_directory="$TEST_WORK"
+services_revision="$TEST_REVISION"
+expected_live_revision="$TEST_PREVIOUS_REVISION"
+realpath() { "$TEST_NODE" -e 'process.stdout.write(require("fs").realpathSync(process.argv.at(-1)))' -- "$@"; }
+git() {
+  if [[ " $* " == *' merge-base --is-ancestor '* ]]; then
+    [[ " $* " == *' 5dc888e76ff092ba029c90648486ea8773980192 '* && "$TEST_SCENARIO" != no-base ]]; return
+  fi
+  if [[ " $* " == *' diff --name-only '* ]]; then
+    if [[ " $* " == *' -- apps/identity '* ]]; then
+      printf '%s\n' apps/identity/src/transports/verification-transport.service.ts
+      if [[ "$TEST_SCENARIO" == owner-drift ]]; then printf '%s\n' apps/identity/prisma/schema.prisma; fi
+    else
+      printf '%s\n' .github/scripts/static-check-services-lifecycle.sh .github/workflows/ci.yml apps/identity/src/transports/verification-transport.service.ts
+      if [[ "$TEST_SCENARIO" == source-drift ]]; then printf '%s\n' apps/support/src/main.ts; fi
+    fi
+    return 0
+  fi
+  [[ " $* " == *' show '* ]] || return 1
+  printf '// synthetic previous source\n'
+}
+scoped_verifier() { [[ "$1" == identity-api-source && "$TEST_SCENARIO" != hash-failed ]] || return 1; printf 'VERIFIED_SOURCE\n'; }
+scoped_identity_source
+`], { encoding: 'utf8', timeout: 3000, env: { PATH: '/usr/bin:/bin', SCOPED_LIBRARY: scopedControllerPath, TEST_NODE: process.execPath, TEST_RELEASE: release, TEST_WORK: work, TEST_REVISION: revision, TEST_PREVIOUS_REVISION: oldRevision, TEST_SCENARIO: scenario } })
+		assert.equal(result.error, undefined, scenario)
+		if (scenario === 'success') { assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout, 'VERIFIED_SOURCE\n') }
+		else { assert.notEqual(result.status, 0, scenario); assert.equal(result.stdout, '', scenario) }
+	})
+})
+
+function identityApiInventoryFixture() {
+	const { before: transportText } = identitySmsCompiledFixture()
+	return {
+		schemaVersion: 1, kind: 'winwidget.identity.sms-image.v1', transportText,
+		compiled: [
+			...Array.from({ length: 40 }, (_, index) => ({ path: `src/module-${String(index).padStart(2, '0')}.js`, sha256: envHash })),
+			{ path: 'src/transports/verification-transport.service.js', sha256: sha256(transportText) },
+			{ path: 'src/transports/verification-transport.service.d.ts', sha256: envHash },
+			{ path: 'src/main.js.map', sha256: envHash }
+		].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
+		migrations: [...Array.from({ length: 8 }, (_, index) => ({ name: `20260901${String(index).padStart(6, '0')}_owner`, checksum: envHash })), { name: OTP_MIGRATION, checksum: envHash }],
+		schemaSha256: envHash, generatedSchemaSha256: envHash,
+		packages: Array.from({ length: 40 }, (_, index) => `package-${String(index).padStart(2, '0')}@1.0.0`), packageSha256: envHash,
+		assets: [{ path: 'email-logo.png', sha256: envHash }]
+	}
+}
+
+test('Identity image pair preserves schema, migration checksums, dependencies, declarations, other sourcemaps and assets', () => {
+	const before = identityApiInventoryFixture(), after = structuredClone(before)
+	after.transportText = identitySmsCompiledFixture().after
+	after.compiled.find(row => row.path === 'src/transports/verification-transport.service.js').sha256 = sha256(after.transportText)
+	assert.equal(validateIdentityApiInventory(before), before)
+	assertIdentityApiImages(before, after)
+	for (const mutate of [
+		value => { value.kind = 'another-owner' }, value => { value.schemaVersion = 2 }, value => { value.extra = true },
+		value => { value.schemaSha256 = value.generatedSchemaSha256 = 'e'.repeat(64) }, value => { value.generatedSchemaSha256 = 'e'.repeat(64) },
+		value => { value.migrations.pop() }, value => { value.migrations[0].checksum = 'e'.repeat(64) }, value => { value.migrations.push(value.migrations[0]) },
+		value => { value.compiled.find(row => row.path.endsWith('.d.ts')).sha256 = 'e'.repeat(64) },
+		value => { value.compiled.find(row => row.path.endsWith('.map')).sha256 = 'e'.repeat(64) },
+		value => { value.compiled.find(row => row.path === 'src/module-00.js').sha256 = 'e'.repeat(64) },
+		value => { value.compiled.find(row => row.path === 'src/transports/verification-transport.service.js').sha256 = envHash },
+		value => { value.transportText += '\n' }, value => { value.compiled.pop() }, value => { value.compiled.push(value.compiled[0]) },
+		value => { value.compiled[0].path = '../unsafe.js' }, value => { value.compiled[0].extra = true },
+		value => { value.packages[0] = 'different@1.0.0'; value.packages.sort() }, value => { value.packageSha256 = 'e'.repeat(64) },
+		value => { value.assets[0].sha256 = 'e'.repeat(64) }, value => { value.assets[0].path = '../unsafe.png' }
+	]) { const changed = structuredClone(after); mutate(changed); assert.throws(() => assertIdentityApiImages(before, changed), undefined, mutate.toString()) }
+	assert.throws(() => assertIdentityApiImages(after, before))
+	assert.throws(() => assertIdentityApiImages(before, before))
+})
+
+function identityApiPeersFixture() {
+	return [
+		['winwidget', 'identity-api'], ['winwidget', 'identity-worker'], ['winwidget', 'identity-outbox-publisher'],
+		['wincrm', 'crm-access-api'], ['another-project', 'identity-api']
+	].map(([project, name], index) => ({
+		Id: (index + 1).toString(16).padStart(64, '0'), Image: `sha256:${'e'.repeat(64)}`,
+		Config: { Labels: { 'com.docker.compose.project': project, 'com.docker.compose.service': name, 'org.opencontainers.image.revision': oldRevision }, Env: [`APP_REVISION=${oldRevision}`, 'SYNTHETIC_ONLY=true'], Healthcheck: { Test: ['CMD', 'node', 'health.js'] } },
+		State: { Running: true, Paused: false, Restarting: false, OOMKilled: false, Status: 'running', Health: { Status: 'healthy' }, StartedAt: '2026-09-10T20:00:00.000Z' },
+		RestartCount: 0, HostConfig: { NetworkMode: 'host' }, Mounts: []
+	}))
+}
+
+test('Identity fingerprints every neighboring project and preserves its worker and publisher through API replacement', () => {
+	const live = identityApiPeersFixture(), before = identityApiNeighborFingerprint(live)
+	assert.match(before, /^[a-f0-9]{64}$/)
+	assert.equal(identityApiNeighborFingerprint([...live].reverse()), before)
+	const replacement = structuredClone(live)
+	replacement[0].Id = 'f'.repeat(64); replacement[0].Image = `sha256:${'f'.repeat(64)}`; replacement[0].Config.Env.push('APP_REVISION=synthetic-candidate')
+	replacement[0].State = { Running: false, Status: 'exited' }
+	assert.equal(identityApiNeighborFingerprint(replacement), before)
+	for (const mutate of [
+		value => { value[1].Id = 'f'.repeat(64) }, value => { value[2].Image = `sha256:${'f'.repeat(64)}` },
+		value => { value[3].RestartCount++ }, value => { value[3].Config.Env.push('SYNTHETIC_DRIFT=true') },
+		value => { value[3].HostConfig.NetworkMode = 'bridge' }, value => { value[3].Mounts.push({ Source: '/synthetic', Destination: '/changed' }) },
+		value => { value[3].State.StartedAt = '2026-09-10T20:30:00.000Z' }, value => { value[4].Id = 'f'.repeat(64) }, value => { value.pop() }
+	]) { const changed = structuredClone(live); mutate(changed); assert.notEqual(identityApiNeighborFingerprint(changed), before, mutate.toString()) }
+	for (const mutate of [
+		value => { value.splice(1, 1) }, value => { value.splice(2, 1) }, value => { value.push(structuredClone(value[0])) },
+		value => { value[1].Id = value[0].Id }, value => { value[0].Config.Labels['com.docker.compose.project'] = 'foreign' },
+		value => { value[2].Config.Labels['com.docker.compose.service'] = value[1].Config.Labels['com.docker.compose.service'] },
+		value => { value[3].State.Health.Status = 'unhealthy' }, value => { value[3].State.Running = false },
+		value => { value[3].State.Status = 'exited' }, value => { value[3].Image = 'mutable:latest' }
+	]) { const changed = structuredClone(live); mutate(changed); assert.throws(() => identityApiNeighborFingerprint(changed), undefined, mutate.toString()) }
+})
+
+test('Identity runtime verification performs only bounded read-only health GETs and checks actual API revision', async () => {
+	const expected = ['/health/live', '/health/ready', '/health/revision'], calls = []
+	const fake = (mutate = () => {}) => async (url, options) => {
+		const path = new URL(url).pathname; calls.push(path)
+		assert.equal(new URL(url).origin, 'http://127.0.0.1:4900'); assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'error'); assert.ok(options.signal instanceof AbortSignal)
+		assert.ok(expected.includes(path)); assert.equal(options.body, undefined); assert.equal(options.headers, undefined)
+		const value = { service: 'identity', revision, ...(path.endsWith('revision') ? {} : { role: 'api', status: path.endsWith('ready') ? 'ready' : 'ok' }) }
+		const response = { value, status: 200, headers: { 'cache-control': 'no-store' } }; mutate(response, path)
+		return new Response(JSON.stringify(response.value), { status: response.status, headers: response.headers })
+	}
+	await verifyIdentityApiHttp(revision, fake()); assert.deepEqual(calls, expected)
+	for (const mutate of [
+		response => { response.status = 503 }, response => { response.value.revision = oldRevision }, response => { response.value.role = 'worker' },
+		response => { response.value.service = 'support' }, response => { delete response.headers['cache-control'] },
+		(response, path) => { if (!path.endsWith('revision')) response.value.status = 'not-ready' }
+	]) await assert.rejects(() => verifyIdentityApiHttp(revision, fake(mutate)), undefined, mutate.toString())
+	await assert.rejects(() => verifyIdentityApiHttp('prod', fake()))
+	await assert.rejects(() => verifyIdentityApiHttp(revision, async () => { throw new Error('synthetic unavailable') }))
 })
 
 test('worker Compose requires its healthy same-revision Billing API companion and excludes all other APIs/schedulers', () => {
@@ -1745,6 +1969,11 @@ expected_operations_env_sha256="$TEST_ENV_HASH"
 expected_support_env_sha256="$TEST_ENV_HASH"
 operations_runtime_revision=''
 operations_evidence_sha256=''
+if [[ "$release_scope" == identity-api-runtime ]]; then
+  expected_operations_revision=''; expected_operations_env_sha256=''; expected_support_env_sha256=''
+  if [[ "$TEST_SCENARIO" == owner-hash-drift ]]; then expected_service_env_sha256="$(printf '%064d' 2)"; fi
+  scoped_identity_source() { printf 'IDENTITY_SOURCE\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != source-drift ]]; }
+fi
 if [[ "$release_scope" == platform-marketing-runtime ]]; then
   expected_operations_revision=''; expected_operations_env_sha256=''; expected_support_env_sha256=''
   if [[ "$TEST_SCENARIO" == foreign-authority ]]; then operations_runtime_revision="$TEST_PREVIOUS_REVISION"; fi
@@ -1828,6 +2057,10 @@ docker() {
   case "$1" in
     context) printf 'unix:///var/run/docker.sock\n' ;;
     ps)
+      if [[ "$TEST_SCOPE" == identity-api-runtime && " $* " != *'label=com.docker.compose.service='* ]]; then
+        for number in {1..50}; do printf '%064d\n' "$number"; done
+        return 0
+      fi
       if [[ ( "$TEST_SCOPE" == operations-api-runtime || "$TEST_SCOPE" == platform-marketing-runtime ) && " $* " != *'label=com.docker.compose.service='* ]]; then
         for number in {1..31}; do printf '%064d\n' "$number"; done
         return 0
@@ -1855,6 +2088,7 @@ docker() {
       esac
       if [[ "$TEST_SCOPE" == operations-api-runtime && "$service" == operations-api && "$current" == desired ]]; then number=15; fi
       if [[ "$TEST_SCOPE" == platform-marketing-runtime && "$service" == platform-api && "$current" == desired ]]; then number=15; fi
+      if [[ "$TEST_SCOPE" == identity-api-runtime && "$service" == identity-api && "$current" == desired ]]; then number=15; fi
       printf -v cid '%064d' "$number"
       [[ " $* " == *' --all '* || ! -f "$SCOPED_FIXTURE/stopped-$cid" ]] || return 0
       printf '%s\n' "$cid" ;;
@@ -1925,6 +2159,7 @@ docker() {
       if [[ "$action" == up ]]; then
         case "$snapshot" in */desired.json) printf desired >"$SCOPED_PHASE" ;; */rollback.json) printf rollback >"$SCOPED_PHASE" ;; *) return 83 ;; esac
         for number in 1 2 3 4 8 9 11 12 13; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
+        if [[ "$TEST_SCOPE" == identity-api-runtime ]]; then for number in 5 15; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done; fi
         if [[ "$snapshot" == */desired.json ]]; then
           if [[ "$TEST_SCENARIO" == term || "$TEST_SCENARIO" == repeated-term ]]; then kill -TERM "$$"; fi
           if [[ "$TEST_SCENARIO" == hup ]]; then kill -HUP "$$"; fi
@@ -1970,6 +2205,16 @@ docker() {
       fi
       return 84 ;;
     run)
+      if [[ "$TEST_SCOPE" == identity-api-runtime ]]; then
+        case " $* " in
+          *' identity-api-runtime '*) [[ "$TEST_SCENARIO" != runtime-drift || "$current" != desired ]]; return ;;
+          *' identity-api-http '*)
+            [[ " $* " == *' --network host '* && " $* " == *' --read-only '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* ]] || return 1
+            [[ " $* " == *' --signal=TERM --kill-after=5s 30s node '* ]] || return 1
+            [[ "$TEST_SCENARIO" != old-http-failed || "$current" != old ]] || return 1
+            [[ "$TEST_SCENARIO" != http-failed || "$current" != desired ]]; return ;;
+        esac
+      fi
       if [[ "$TEST_SCOPE" == gateway-tilda-upgrade && " $* " == *' gateway-tilda-http '* ]]; then
         [[ " $* " == *' --network host '* && " $* " == *' --user node '* && " $* " != *' --env-file '* ]] || return 1
         [[ " $* " == *' -s TERM -k 5 35 node '* && " $* " != *' --signal='* && " $* " != *' --kill-after='* ]] || return 1
@@ -2017,6 +2262,15 @@ docker() {
       fi
       for arg in "$@"; do last="$arg"; done
       case "$last" in
+        identity-api-image)
+          [[ "$TEST_SCOPE" == identity-api-runtime && "$TEST_SCENARIO" != inventory-failed ]] || return 1
+          [[ " $* " == *' --network none '* && " $* " == *' --read-only '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* ]] || return 1
+          [[ " $* " == *' --signal=TERM --kill-after=5s 30s node '* ]] || return 1
+          printf '{}'; return ;;
+        identity-api-neighbors)
+          if [[ "$TEST_SCENARIO" == crm-neighbor-drift && "$current" == desired ]]; then printf '%064d' 1; else printf '%s' "$TEST_ENV_HASH"; fi
+          return ;;
+        identity-api-images) [[ "$TEST_SCENARIO" != compiled-drift ]]; return ;;
         *'readFileSync'*)
           if [[ "$TEST_SCENARIO" == mixed-manifest-drift && " $* " == *" $TEST_OLD_API_IMAGE "* ]]; then printf '{"drift":true}\n'; return 0; fi
           if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$TEST_SCENARIO" == manifest-failed && " $* " == *" $TEST_OPERATIONS_IMAGE "* ]]; then printf '{"changed":true}\n'; else printf '{}\n'; fi ;;
@@ -2133,6 +2387,69 @@ function assertOnlyScopedUp(result, names, rollback = false) {
 	assert.ok(updates[0].includes('/desired.json>'), updates[0])
 	if (rollback) assert.ok(updates[1].includes('/rollback.json>'), updates[1])
 }
+
+test('Identity API Bash proves its SMS-only image before TERM and replaces exactly one API with read-only HTTP verification', () => {
+	const result = runRuntime(identityApiScope)
+	assert.equal(result.status, 0, result.stderr)
+	assertOnlyScopedUp(result, ['identity-api'])
+	assert.ok(result.calls.indexOf('IDENTITY_SOURCE') < result.calls.indexOf('<build>'))
+	assert.ok(result.calls.indexOf('<identity-api-images>') < result.calls.indexOf('<kill>'))
+	assert.ok(result.calls.indexOf('<kill>') < result.calls.indexOf('<up>'))
+	assert.ok(result.calls.indexOf('<identity-api-runtime> <desired>') > result.calls.indexOf('<up>'))
+	const inventories = result.calls.split('\n').filter(line => line.includes('<identity-api-image>'))
+	assert.equal(inventories.length, 2)
+	const probes = result.calls.split('\n').filter(line => line.includes('<identity-api-http>'))
+	assert.equal(probes.length, 2)
+	assert.ok(probes[0].endsWith(`<${oldRevision}>`)); assert.ok(probes[1].endsWith(`<${revision}>`))
+	for (const forbidden of ['MIGRATE ', '<database>', '<backup-capture>', '<phase-a>', '<prisma>', '<stop>', '<exec>', '<--signal=KILL>']) assert.ok(!result.calls.includes(forbidden), result.calls)
+	assert.match(result.stdout, /without migrations, env, workers or broker changes/)
+})
+
+test('Identity rejects source, image, existing HTTP and environment drift before stopping the old API', () => {
+	for (const scenario of ['owner-hash-drift', 'source-drift', 'inventory-failed', 'old-http-failed', 'compiled-drift', 'prepare-failed', 'build-failed', 'lost-lock']) {
+		const result = runRuntime(identityApiScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('<up>') && !result.calls.includes('<kill>'), `${scenario}\n${result.calls}`)
+		assert.ok(!result.calls.includes('MIGRATE '), result.calls)
+	}
+})
+
+test('Identity rollback restores only the old API after candidate readiness, runtime or interrupt failures', () => {
+	for (const scenario of ['replace-failed', 'unhealthy', 'term', 'hup', 'http-failed', 'runtime-drift']) {
+		const result = runRuntime(identityApiScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assertOnlyScopedUp(result, ['identity-api'], true)
+		assert.equal(result.phase, 'rollback')
+		assert.match(result.stderr, /Identity.*rollback restored/)
+		assert.ok(result.calls.includes('<identity-api-runtime> <rollback>'), result.calls)
+		assert.ok(!result.calls.includes('MIGRATE ') && !result.calls.includes('<--signal=KILL>'), result.calls)
+	}
+})
+
+test('Identity refuses rollback when any project drifts and never forces a process that has not stopped', () => {
+	for (const scenario of ['neighbor-drift', 'crm-neighbor-drift', 'stop-timeout']) {
+		const result = runRuntime(identityApiScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.ok(!result.calls.includes('/rollback.json> <up>'), result.calls)
+		assert.ok(!result.calls.includes('<--signal=KILL>') && !result.calls.includes('<start>'), result.calls)
+		assert.match(result.stderr, /RECOVERY_REQUIRED/)
+		if (scenario.startsWith('stop-')) assert.ok(!result.calls.includes('<up>'), result.calls)
+		else assertOnlyScopedUp(result, ['identity-api'])
+	}
+})
+
+test('Identity interrupted before cutover restores only after retrying TERM and proving physical exit', () => {
+	const result = runRuntime(identityApiScope, 'stop-interrupted')
+	assert.notEqual(result.status, 0)
+	const updates = result.calls.split('\n').filter(line => line.includes('<up>'))
+	assert.equal(updates.length, 1); assert.ok(updates[0].includes('/rollback.json>')); assert.ok(updates[0].endsWith('<identity-api>'))
+	const stops = result.calls.split('\n').filter(line => line.includes('<kill> <--signal=TERM>'))
+	assert.equal(stops.length, 2)
+	assert.ok(result.calls.lastIndexOf('<kill>') < result.calls.indexOf('<up>'))
+	assert.ok(result.calls.includes('<identity-api-runtime> <rollback>'))
+	assert.ok(!result.calls.includes('<--signal=KILL>'))
+	assert.match(result.stderr, /Identity.*rollback restored/)
+})
 
 test('API-only Bash builds one immutable image and gracefully replaces only API without migration or backup', () => {
 	const result = runRuntime(apiScope)
@@ -3037,7 +3354,7 @@ source "$scoped_payload_directory/controller.sh"
 })
 
 test('shared verifier decoder accepts 144 KiB in every matching existing scope without widening other files', () => {
-	const scopes = ['all', identityScope, 'operations-runtime', backupRuntimeScope, 'operations-backlog-backup', 'operations-backlog-finalize', 'gateway-remove-notes', 'workers-bootstrap-recovery', 'operations-federation-config', apiScope, 'platform-marketing-runtime']
+	const scopes = ['all', identityScope, identityApiScope, 'operations-runtime', backupRuntimeScope, 'operations-backlog-backup', 'operations-backlog-finalize', 'gateway-remove-notes', 'workers-bootstrap-recovery', 'operations-federation-config', apiScope, 'platform-marketing-runtime']
 	for (const scope of scopes) privateFixture(directory => {
 		const shell = Buffer.from('# bounded harmless controller\n'), verifier = Buffer.alloc(147456, 35)
 		const result = spawnSync('/bin/bash', ['-c', `

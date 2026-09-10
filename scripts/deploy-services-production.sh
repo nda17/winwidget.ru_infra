@@ -69,7 +69,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate | support-chat-repair)
+	identity-api-runtime | identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate | support-chat-repair)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -711,7 +711,7 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		# widen shell, private env, other Node payload or deployment authority.
 		if [[ "$destination" == "$scoped_payload_directory/verifier.mjs" ]]; then
 			case "${release_scope:-all}" in
-				all|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime) limit=147456 ;;
+				all|identity-api-runtime|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime) limit=147456 ;;
 			esac
 		fi
 		# The sentinel caps output even for a decompression bomb. pipefail also
