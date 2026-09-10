@@ -2295,7 +2295,8 @@ docker() {
           printf '{}'; return ;;
         identity-api-neighbors)
           if [[ "$TEST_SCENARIO" == crm-neighbor-drift && "$current" == desired ]]; then printf '%064d' 1; else printf '%s' "$TEST_ENV_HASH"; fi
-          return ;;
+          # Bash 5 bare return inside EXIT would reuse the trapped failure status.
+          return 0 ;;
         identity-api-images) [[ "$TEST_SCENARIO" != compiled-drift ]]; return ;;
         *'readFileSync'*)
           if [[ "$TEST_SCENARIO" == mixed-manifest-drift && " $* " == *" $TEST_OLD_API_IMAGE "* ]]; then printf '{"drift":true}\n'; return 0; fi
