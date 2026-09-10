@@ -106,6 +106,10 @@ scoped_verifier() {
 		verifier_mounts=(--volume "$scoped_payload_directory/gateway-tilda-release.mjs:/run/scoped-verifier.mjs:ro"
 			--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro")
 	fi
+	if [[ "$release_scope" == identity-api-runtime ]]; then
+		verifier_mounts=(--volume "$scoped_payload_directory/identity-api-release.mjs:/run/scoped-verifier.mjs:ro"
+			--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro")
+	fi
 	if [[ "$release_scope" == operations-backup-runtime && "${1:-}" == operations-backup-input ]]; then
 		verifier_mounts+=(--volume "$scoped_owner_env:/run/scoped-owner.env:ro")
 	fi
@@ -676,6 +680,27 @@ scoped_workers_quiet() {
 	done
 }
 
+scoped_identity_unpack() {
+	docker run --rm --interactive --network none --read-only --log-driver none --cap-drop ALL \
+		--security-opt no-new-privileges --user 0:0 --memory 128m --cpus 0.5 --pids-limit 32 \
+		--volume "$scoped_payload_directory:/run/payload:rw" --entrypoint node "$scoped_image_id" --input-type=module <<'IDENTITY_API_UNPACK'
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {readFileSync,writeFileSync} from 'node:fs';
+try {
+ const bytes=readFileSync('/run/payload/verifier.mjs'); assert.ok(bytes.length>0&&bytes.length<=262144);
+ const value=JSON.parse(bytes), names=['scoped-service-release.mjs','identity-api-release.mjs'];
+ const exact=(item,keys)=>{assert.ok(item&&typeof item==='object'&&!Array.isArray(item));assert.deepEqual(Object.keys(item).sort(),keys.sort());};
+ exact(value,['schemaVersion','files']);assert.equal(value.schemaVersion,1);assert.ok(Array.isArray(value.files));
+ assert.deepEqual(value.files.map(item=>item.name).sort(),names.sort());
+ const files=value.files.map(item=>{exact(item,['name','sha256','content']);assert.equal(typeof item.content,'string');
+ const data=Buffer.from(item.content,'utf8');assert.ok(data.length>0&&data.length<=(item.name==='scoped-service-release.mjs'?147456:32768));
+ assert.equal(createHash('sha256').update(data).digest('hex'),item.sha256);return {...item,data};});
+ for(const file of files) writeFileSync('/run/payload/'+file.name,file.data,{flag:'wx',mode:0o444});
+} catch {process.stderr.write('Identity payload rejected; private details suppressed.\n');process.exitCode=1;}
+IDENTITY_API_UNPACK
+}
+
 scoped_identity_source() {
 	local changes path base=5dc888e76ff092ba029c90648486ea8773980192
 	path=apps/identity/src/transports/verification-transport.service.ts
@@ -683,7 +708,7 @@ scoped_identity_source() {
 	# Pin the reviewed repository baseline separately from the live Identity tree.
 	git -C "$release_root" merge-base --is-ancestor "$base" "$services_revision" || return 1
 	changes="$(git -C "$release_root" diff --name-only "$base" "$services_revision")" || return 1
-	[[ "$changes" == $'.github/scripts/static-check-services-lifecycle.sh\n.github/workflows/ci.yml\napps/identity/src/transports/verification-transport.service.ts' ]] || return 1
+	[[ "$changes" == $'.github/scripts/static-check-services-lifecycle.sh\n.github/workflows/ci.yml\napps/identity/src/transports/verification-transport.service.ts\ndocs/backlog.md' ]] || return 1
 	changes="$(git -C "$release_root" diff --name-only "$expected_live_revision" "$services_revision" -- apps/identity)" || return 1
 	[[ "$changes" == "$path" ]] || return 1
 	[[ -f "$release_root/$path" && ! -L "$release_root/$path" && "$(realpath -e "$release_root/$path")" == "$release_root/$path" ]] || return 1
@@ -700,7 +725,9 @@ scoped_identity_image_inventory() {
 		umask 077; set -o noclobber
 		docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
 			--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
-			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			--env SCOPED_SCOPE=identity-api-runtime \
+			--volume "$scoped_payload_directory/identity-api-release.mjs:/run/scoped-verifier.mjs:ro" \
+			--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro" \
 			--entrypoint timeout "$image" --signal=TERM --kill-after=5s 30s node /run/scoped-verifier.mjs identity-api-image >"$scoped_work_directory/$output"
 	) || return 1
 }
@@ -733,7 +760,9 @@ scoped_identity_assert_neighbors() {
 scoped_identity_http() {
 	docker run --rm --network host --read-only --cap-drop ALL --security-opt no-new-privileges \
 		--user 1001:1001 --memory 256m --cpus 0.5 --pids-limit 32 \
-		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--env SCOPED_SCOPE=identity-api-runtime \
+		--volume "$scoped_payload_directory/identity-api-release.mjs:/run/scoped-verifier.mjs:ro" \
+		--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro" \
 		--entrypoint timeout "$scoped_identity_expected_image" --signal=TERM --kill-after=5s 30s \
 		node /run/scoped-verifier.mjs identity-api-http "$scoped_identity_expected_revision" || return 1
 }
@@ -1345,6 +1374,7 @@ scoped_deploy_main() {
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
 	if [[ "$release_scope" == identity-api-runtime ]]; then
+		scoped_identity_unpack || die 'Identity helper envelope is invalid.'
 		scoped_deploy_identity_api "$old_image" "$id"
 		return
 	fi

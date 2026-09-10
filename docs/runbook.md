@@ -1057,7 +1057,8 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   работающий Identity API, `expected_service_env_sha256` — полный Identity env.
   Workers/publisher могут иметь другую ревизию и сохраняют свои image/ID.
   Source admission допускает только точные bytes transport-файла, caller CI
-  и его `static-check-services-lifecycle.sh` gate
+  его `static-check-services-lifecycle.sh` gate и обязательную запись
+  выявленного CI-риска в `docs/backlog.md`
   относительно закреплённого services baseline; относительно live Identity
   запрещены любые другие изменения приложения. UID1001 image probe без сети
   и credentials сверяет только две literal-замены в compiled transport,
@@ -1073,6 +1074,10 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   `/health/revision` Identity на порту 4900. При ошибке отдельный rollback
   возвращает сохранённый API image/config только после доказанного TERM и
   неизменности соседей/env. Публичный Gateway сохраняет прежнюю ревизию.
+  Identity verifier передаётся отдельным двухфайловым envelope только в этом
+  scope; общие CRM/Support payload не включают его код. Сохраняются прежние
+  compressed SSH budgets, лимит envelope — 256 KiB, Identity helper — 32 KiB,
+  общий verifier — 144 KiB; SHA каждого файла проверяется до unpack.
 
 - `workers-bootstrap-recovery`: только `billing-api`, `billing-worker`,
   `billing-outbox-publisher`, `operations-worker`,

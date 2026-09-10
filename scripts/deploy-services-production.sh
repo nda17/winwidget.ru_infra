@@ -153,7 +153,9 @@ esac
 
 scoped_shell_file="$controller_root/scripts/deploy-identity-operations-scoped.sh"
 scoped_node_file="$controller_root/scripts/scoped-service-release.mjs"
-if [[ "$release_scope" == gateway-tilda-upgrade ]]; then
+if [[ "$release_scope" == identity-api-runtime ]]; then
+	scoped_node_file="$controller_root/scripts/identity-api-release.mjs"
+elif [[ "$release_scope" == gateway-tilda-upgrade ]]; then
 	scoped_node_file="$controller_root/scripts/gateway-tilda-release.mjs"
 elif [[ "$release_scope" == crm-prepare || "$release_scope" == crm-databases || "$release_scope" == crm-runtime || "$release_scope" == crm-upgrade ]]; then
 	scoped_shell_file="$controller_root/scripts/deploy-crm-scoped.sh"
@@ -200,6 +202,16 @@ if [[ "$release_scope" =~ ^support-chat(-(activate|repair))?$ ]]; then
 		git -C "$controller_root" ls-files --error-unmatch "scripts/$scoped_name" >/dev/null 2>&1 || die 'Support module is not tracked by immutable Infra.'
 	done
 	scoped_envelope="$(node "$scoped_node_file" pack "$controller_root/scripts")" || die 'Cannot package Support payload.'
+	scoped_node_sha256="$(printf '%s' "$scoped_envelope" | sha256sum | awk '{print $1}')"
+	scoped_node_base64="$(printf '%s' "$scoped_envelope" | gzip -n -6 -c | base64 | tr -d '\n')"
+	unset scoped_envelope
+fi
+if [[ "$release_scope" == identity-api-runtime ]]; then
+	command -v node >/dev/null || die 'Identity payload packaging requires Node.js.'
+	for scoped_name in scoped-service-release.mjs identity-api-release.mjs; do
+		git -C "$controller_root" ls-files --error-unmatch "scripts/$scoped_name" >/dev/null 2>&1 || die 'Identity module is not tracked by immutable Infra.'
+	done
+	scoped_envelope="$(node "$scoped_node_file" pack)" || die 'Cannot package the bounded Identity payload.'
 	scoped_node_sha256="$(printf '%s' "$scoped_envelope" | sha256sum | awk '{print $1}')"
 	scoped_node_base64="$(printf '%s' "$scoped_envelope" | gzip -n -6 -c | base64 | tr -d '\n')"
 	unset scoped_envelope
@@ -686,6 +698,9 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		if [[ "${release_scope:-all}" == gateway-tilda-upgrade ]]; then
 			rm -f -- "$scoped_payload_directory/gateway-tilda-release.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
 		fi
+		if [[ "${release_scope:-all}" == identity-api-runtime ]]; then
+			rm -f -- "$scoped_payload_directory/identity-api-release.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
+		fi
 		if [[ "${release_scope:-all}" =~ ^support-chat(-(activate|repair))?$ ]]; then
 			rm -f -- "$scoped_payload_directory/support-chat-release.mjs" "$scoped_payload_directory/support-chat-broker.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
 		fi
@@ -711,7 +726,7 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		# widen shell, private env, other Node payload or deployment authority.
 		if [[ "$destination" == "$scoped_payload_directory/verifier.mjs" ]]; then
 			case "${release_scope:-all}" in
-				all|identity-api-runtime|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime) limit=147456 ;;
+				all|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime) limit=147456 ;;
 			esac
 		fi
 		# The sentinel caps output even for a decompression bomb. pipefail also
@@ -729,6 +744,12 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
 		[[ "$scoped_envelope_size" =~ ^[0-9]+$ ]] || die 'Support envelope size is invalid.'
 		(( scoped_envelope_size > 0 && scoped_envelope_size <= 393216 )) || die 'Support envelope exceeds decoded limit.'
+	elif [[ "${release_scope:-all}" == identity-api-runtime ]]; then
+		printf '%s' "$scoped_node_base64" | base64 --decode | gzip -dc | head -c 262145 >"$scoped_payload_directory/verifier.mjs" || die 'Identity envelope decompression failed.'
+		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
+		if [[ ! "$scoped_envelope_size" =~ ^[0-9]+$ ]] || (( scoped_envelope_size <= 0 || scoped_envelope_size > 262144 )); then
+			die 'Identity envelope exceeds its decoded limit.'
+		fi
 	elif [[ "${release_scope:-all}" == gateway-tilda-upgrade ]]; then
 		printf '%s' "$scoped_node_base64" | base64 --decode | gzip -dc | head -c 262145 >"$scoped_payload_directory/verifier.mjs" || die 'Gateway envelope decompression failed.'
 		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"

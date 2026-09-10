@@ -20,14 +20,6 @@ import {
 	OPERATIONS_API_PHASE_A_SHA256,
 	OPERATIONS_API_SOURCE_PATHS,
 	PLATFORM_MARKETING_SOURCE,
-	IDENTITY_SMS_SOURCE,
-	assertIdentitySmsSource,
-	assertIdentitySmsCompiled,
-	validateIdentityApiInventory,
-	assertIdentityApiImages,
-	assertIdentityApiRuntime,
-	identityApiNeighborFingerprint,
-	verifyIdentityApiHttp,
 	assertPlatformMarketingSource,
 	assertPlatformImages,
 	validatePlatformInventory,
@@ -56,6 +48,9 @@ import {
 	verifyOperationsApiHttp,
 	verifyDatabaseState
 } from './scoped-service-release.mjs'
+import { IDENTITY_SMS_SOURCE, assertIdentitySmsSource, assertIdentitySmsCompiled, validateIdentityApiInventory,
+	assertIdentityApiImages, assertIdentityApiRuntime, identityApiNeighborFingerprint, verifyIdentityApiHttp,
+	IDENTITY_API_PAYLOAD_FILES, validateIdentityApiPayload } from './identity-api-release.mjs'
 import { GATEWAY_TILDA_CRM_ROLES, assertGatewayTildaImages, gatewayTildaNeighborFingerprint, verifyGatewayTildaHttp,
 	prepareGatewayTildaCompose, validateGatewayTildaPayload, GATEWAY_TILDA_PAYLOAD_FILES } from './gateway-tilda-release.mjs'
 
@@ -1074,7 +1069,35 @@ test('Identity SMS source and compiled admission permit exactly the two reviewed
 	// to admit synthetic source bytes in this standalone infrastructure fixture.
 })
 
-test('Identity source coordinator admits only its three reviewed release paths and one owner transport path', () => {
+test('Identity dedicated envelope fits the unchanged SSH budget and unpacks only its two checksum-verified public modules', () => {
+	const packed = spawnSync(process.execPath, [join(scriptsRoot, 'identity-api-release.mjs'), 'pack'], { encoding: 'utf8' })
+	assert.equal(packed.status, 0, packed.stderr)
+	assert.deepEqual(IDENTITY_API_PAYLOAD_FILES, ['scoped-service-release.mjs', 'identity-api-release.mjs'])
+	assert.deepEqual(validateIdentityApiPayload(packed.stdout).map(row => row.name), IDENTITY_API_PAYLOAD_FILES)
+	assert.ok(gzipSync(packed.stdout).toString('base64').length + gzipSync(readFileSync(scopedControllerPath)).toString('base64').length <= 90000)
+	const unpack = readFileSync(scopedControllerPath, 'utf8').split("<<'IDENTITY_API_UNPACK'\n")[1].split('\nIDENTITY_API_UNPACK')[0]
+	for (const mutate of [
+		undefined, value => { value.schemaVersion = 2 }, value => { value.extra = true },
+		value => { value.files[0].sha256 = envHash }, value => { value.files[1].name = '../outside.mjs' },
+		value => { value.files.push(value.files[0]) }, value => { value.files.pop() }, value => { value.files[1].extra = true },
+		value => { value.files[1].content = ''; value.files[1].sha256 = sha256('') },
+		value => { value.files[1].content = 'x'.repeat(32769); value.files[1].sha256 = sha256(value.files[1].content) },
+		value => { value.files[0].content = 'x'.repeat(147457); value.files[0].sha256 = sha256(value.files[0].content) }
+	]) {
+		const envelope = JSON.parse(packed.stdout); mutate?.(envelope); const bytes = JSON.stringify(envelope)
+		if (mutate) assert.throws(() => validateIdentityApiPayload(bytes))
+		privateFixture(directory => {
+			writeFileSync(join(directory, 'verifier.mjs'), bytes, { mode: 0o444 })
+			const result = spawnSync(process.execPath, ['--input-type=module', '-e', unpack.replaceAll('/run/payload/', directory + '/')], { encoding: 'utf8' })
+			assert.equal(result.status, mutate ? 1 : 0, result.stderr)
+			if (mutate) assert.deepEqual(readdirSync(directory), ['verifier.mjs'])
+			else for (const file of envelope.files) { assert.equal(readFileSync(join(directory, file.name), 'utf8'), file.content); assert.equal(statSync(join(directory, file.name)).mode & 0o777, 0o444) }
+		})
+	}
+	for (const bytes of ['', '{', '{}', 'x'.repeat(262145)]) assert.throws(() => validateIdentityApiPayload(bytes))
+})
+
+test('Identity source coordinator admits only its four reviewed release paths and one owner transport path', () => {
 	for (const scenario of ['success', 'no-base', 'source-drift', 'owner-drift', 'missing-file', 'symlink', 'hash-failed']) privateFixture(directory => {
 		const root = realpathSync(directory), release = join(root, 'release'), work = join(root, 'work')
 		const source = join(release, 'apps/identity/src/transports/verification-transport.service.ts')
@@ -1098,7 +1121,7 @@ git() {
       printf '%s\n' apps/identity/src/transports/verification-transport.service.ts
       if [[ "$TEST_SCENARIO" == owner-drift ]]; then printf '%s\n' apps/identity/prisma/schema.prisma; fi
     else
-      printf '%s\n' .github/scripts/static-check-services-lifecycle.sh .github/workflows/ci.yml apps/identity/src/transports/verification-transport.service.ts
+      printf '%s\n' .github/scripts/static-check-services-lifecycle.sh .github/workflows/ci.yml apps/identity/src/transports/verification-transport.service.ts docs/backlog.md
       if [[ "$TEST_SCENARIO" == source-drift ]]; then printf '%s\n' apps/support/src/main.ts; fi
     fi
     return 0
@@ -1972,6 +1995,7 @@ operations_evidence_sha256=''
 if [[ "$release_scope" == identity-api-runtime ]]; then
   expected_operations_revision=''; expected_operations_env_sha256=''; expected_support_env_sha256=''
   if [[ "$TEST_SCENARIO" == owner-hash-drift ]]; then expected_service_env_sha256="$(printf '%064d' 2)"; fi
+  scoped_identity_unpack() { printf 'IDENTITY_UNPACK\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != payload-failed ]]; }
   scoped_identity_source() { printf 'IDENTITY_SOURCE\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != source-drift ]]; }
 fi
 if [[ "$release_scope" == platform-marketing-runtime ]]; then
@@ -2206,6 +2230,8 @@ docker() {
       return 84 ;;
     run)
       if [[ "$TEST_SCOPE" == identity-api-runtime ]]; then
+        [[ " $* " == *' --env SCOPED_SCOPE=identity-api-runtime '* ]] || return 1
+        [[ " $* " == *'/identity-api-release.mjs:/run/scoped-verifier.mjs:ro '* && " $* " == *'/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro '* ]] || return 1
         case " $* " in
           *' identity-api-runtime '*) [[ "$TEST_SCENARIO" != runtime-drift || "$current" != desired ]]; return ;;
           *' identity-api-http '*)
@@ -2392,6 +2418,7 @@ test('Identity API Bash proves its SMS-only image before TERM and replaces exact
 	const result = runRuntime(identityApiScope)
 	assert.equal(result.status, 0, result.stderr)
 	assertOnlyScopedUp(result, ['identity-api'])
+	assert.ok(result.calls.indexOf('IDENTITY_UNPACK') < result.calls.indexOf('IDENTITY_SOURCE'))
 	assert.ok(result.calls.indexOf('IDENTITY_SOURCE') < result.calls.indexOf('<build>'))
 	assert.ok(result.calls.indexOf('<identity-api-images>') < result.calls.indexOf('<kill>'))
 	assert.ok(result.calls.indexOf('<kill>') < result.calls.indexOf('<up>'))
@@ -2406,7 +2433,7 @@ test('Identity API Bash proves its SMS-only image before TERM and replaces exact
 })
 
 test('Identity rejects source, image, existing HTTP and environment drift before stopping the old API', () => {
-	for (const scenario of ['owner-hash-drift', 'source-drift', 'inventory-failed', 'old-http-failed', 'compiled-drift', 'prepare-failed', 'build-failed', 'lost-lock']) {
+	for (const scenario of ['owner-hash-drift', 'payload-failed', 'source-drift', 'inventory-failed', 'old-http-failed', 'compiled-drift', 'prepare-failed', 'build-failed', 'lost-lock']) {
 		const result = runRuntime(identityApiScope, scenario)
 		assert.notEqual(result.status, 0, scenario)
 		assert.ok(!result.calls.includes('<up>') && !result.calls.includes('<kill>'), `${scenario}\n${result.calls}`)
@@ -3023,7 +3050,7 @@ test('successful or unknown Identity DDL never restores any old Operations manif
 function runTransport(scenario = 'success', scope = identityScope) {
 	return privateFixture(directory => {
 		const shellPayload = crmScopes.includes(scope) ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
-		const nodePayload = scope === gatewayTildaScope ? 'gateway-tilda-release.mjs' : crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
+		const nodePayload = scope === identityApiScope ? 'identity-api-release.mjs' : scope === gatewayTildaScope ? 'gateway-tilda-release.mjs' : crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
 		const checkout = join(directory, 'infra')
 		const bin = join(directory, 'bin')
 		const trace = join(directory, 'transport.jsonl')
@@ -3032,7 +3059,7 @@ function runTransport(scenario = 'success', scope = identityScope) {
 		for (const relative of [
 			'scripts/deploy-services-production.sh', 'scripts/deploy-identity-operations-scoped.sh',
 			'scripts/scoped-service-release.mjs', 'scripts/deploy-crm-scoped.sh', 'scripts/crm-release.mjs',
-			'scripts/gateway-tilda-release.mjs',
+			'scripts/gateway-tilda-release.mjs', 'scripts/identity-api-release.mjs',
 			'nginx/backend-api.conf', 'nginx/frontend.conf'
 		]) {
 			if (scenario === 'missing-payload' && relative === 'scripts/' + nodePayload) continue
@@ -3067,7 +3094,7 @@ if (name === 'git') {
 } else process.exit(82);
 `
 		for (const name of ['git', 'sha256sum', 'ssh-keygen', 'ssh']) writeFileSync(join(bin, name), shim, { mode: 0o700 })
-		if (scope === gatewayTildaScope) symlinkSync(process.execPath, join(bin, 'node'))
+		if ([gatewayTildaScope, identityApiScope].includes(scope)) symlinkSync(process.execPath, join(bin, 'node'))
 		const identity = join(directory, 'synthetic-key')
 		const knownHosts = join(directory, 'synthetic-known-hosts')
 		writeFileSync(identity, 'synthetic fixture, not a private key\n', { mode: 0o600 })
@@ -3152,6 +3179,21 @@ test('Tilda Gateway transport carries only its bounded helper envelope and rejec
 	assert.equal(sha256(bytes), parameters[12]); validateGatewayTildaPayload(bytes)
 	for (const scenario of ['missing-payload', 'untracked-payload', 'oversized-payload', 'forbidden-frontend']) {
 		const rejected = runTransport(scenario, gatewayTildaScope); assert.notEqual(rejected.status, 0, scenario); assert.deepEqual(rejected.calls, [])
+	}
+})
+
+test('Identity API transport ships its isolated helper envelope and rejects missing, untracked or oversized code before SSH', () => {
+	const result = runTransport('success', identityApiScope)
+	assert.equal(result.status, 0, result.stderr); assert.equal(result.calls.length, 1)
+	const encoded = result.calls[0].args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
+	assert.ok(encoded)
+	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
+	assert.equal(parameters[5], identityApiScope)
+	const bytes = gunzipSync(Buffer.from(parameters[13], 'base64'))
+	assert.equal(sha256(bytes), parameters[12]); assert.deepEqual(validateIdentityApiPayload(bytes).map(row => row.name), IDENTITY_API_PAYLOAD_FILES)
+	assert.ok(parameters[11].length + parameters[13].length <= 90000)
+	for (const scenario of ['missing-payload', 'untracked-payload', 'oversized-payload', 'empty-payload', 'forbidden-frontend']) {
+		const rejected = runTransport(scenario, identityApiScope); assert.notEqual(rejected.status, 0, scenario); assert.deepEqual(rejected.calls, [])
 	}
 })
 
@@ -3354,7 +3396,7 @@ source "$scoped_payload_directory/controller.sh"
 })
 
 test('shared verifier decoder accepts 144 KiB in every matching existing scope without widening other files', () => {
-	const scopes = ['all', identityScope, identityApiScope, 'operations-runtime', backupRuntimeScope, 'operations-backlog-backup', 'operations-backlog-finalize', 'gateway-remove-notes', 'workers-bootstrap-recovery', 'operations-federation-config', apiScope, 'platform-marketing-runtime']
+	const scopes = ['all', identityScope, 'operations-runtime', backupRuntimeScope, 'operations-backlog-backup', 'operations-backlog-finalize', 'gateway-remove-notes', 'workers-bootstrap-recovery', 'operations-federation-config', apiScope, 'platform-marketing-runtime']
 	for (const scope of scopes) privateFixture(directory => {
 		const shell = Buffer.from('# bounded harmless controller\n'), verifier = Buffer.alloc(147456, 35)
 		const result = spawnSync('/bin/bash', ['-c', `
