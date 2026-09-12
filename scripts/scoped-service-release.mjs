@@ -1120,6 +1120,10 @@ export async function verifyDatabaseState(client, files, action, owner, context 
 				assert.equal(files.at(-1)?.checksum, EMAIL_MIGRATION_SHA256);
 				const applied = assertMigrationLedger(files, ledger, EMAIL_MIGRATION, action !== 'email-pre');
 				if (action === 'email-post') assert.equal(applied, true);
+				if (action === 'email-pre') {
+					const [acl] = await client.$queryRawUnsafe("WITH p AS (SELECT x.grantee,x.privilege_type FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) x WHERE d.defaclrole='winwidget_identity_migration'::regrole AND d.defaclobjtype='r' AND d.defaclnamespace IN (0,'identity'::regnamespace)) SELECT count(DISTINCT privilege_type) FILTER (WHERE grantee='winwidget_identity_runtime'::regrole AND privilege_type IN ('SELECT','INSERT','UPDATE','DELETE'))=4 AS runtime, COALESCE(bool_or(grantee='winwidget_identity_runtime'::regrole AND privilege_type='TRUNCATE'),false) AS truncate, COALESCE(bool_or(grantee='winwidget_identity_backup'::regrole AND privilege_type='SELECT'),false) AS backup, COALESCE(bool_or(grantee=0),false) AS public_access FROM p");
+					same(acl, { runtime: true, truncate: false, backup: true, public_access: false });
+				}
 				const tables = await client.$queryRawUnsafe("SELECT to_regclass('identity.verification_email_attempts')::text AS attempts, to_regclass('identity.email_password_recoveries')::text AS recoveries");
 				assert.equal(Boolean(tables[0].attempts && tables[0].recoveries), applied);
 				if (!applied) same(tables, [{ attempts: null, recoveries: null }]);

@@ -1177,8 +1177,11 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   побайтово совпадают. Проверяются оба старых per-role images и оба candidate
   images; schema/generated schema и неперечисленные Identity compiled modules
   не могут расходиться. Новые env или secrets не требуются.
-  До DDL выполняются три quiet samples PostgreSQL/RabbitMQ, проверка idle
-  restore и неизменности всех активных Docker projects, затем мягкий TERM всех
+  До остановки read-only gate проверяет совместно global и schema table
+  defaults роли Identity migration: runtime CRUD без TRUNCATE, backup SELECT,
+  без PUBLIC grants; отсутствие нужных default ACL запрещает выпуск до DDL.
+  Затем выполняются три quiet samples PostgreSQL/RabbitMQ, проверка idle
+  restore и неизменности всех активных Docker projects, мягкий TERM всех
   семи процессов с ограниченным ожиданием, `Running=false`, `Pid=0`, отсутствие
   runtime DB sessions. SIGKILL не используется; queues не очищаются. Применяется
   только `identity-migrate`; owner/database identity, прежний ledger, владельцы

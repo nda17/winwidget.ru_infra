@@ -149,12 +149,18 @@ test('email release PostgreSQL guard rejects foreign ledgers, absent post-DDL ta
 			if (sql.includes('current_database()')) return [{ database: 'winwidget_identity', username: 'winwidget_identity_migration', schema: 'identity', recovery: false }]
 			if (sql.includes('service_identity')) return [{ id: 'singleton', service_name: 'identity-service', database_id: '11111111-1111-4111-8111-111111111111' }]
 			if (sql.includes('_prisma_migrations')) return options.ledger || rows(applied)
+			if (sql.includes('pg_default_acl')) {
+				assert.ok(sql.includes("d.defaclnamespace IN (0,'identity'::regnamespace)"))
+				assert.ok(sql.includes("d.defaclrole='winwidget_identity_migration'::regrole"))
+				return [{ runtime: true, truncate: false, backup: true, public_access: false, ...options.defaults }]
+			}
 			if (sql.includes('to_regclass')) return [{ attempts: applied && !options.absent ? 'identity.verification_email_attempts' : null, recoveries: applied && !options.absent ? 'identity.email_password_recoveries' : null }]
 			if (sql.includes('has_table_privilege')) return [{ owner: 'winwidget_identity_migration', runtime: true, truncate: options.truncate ?? false, backup: true }]
 			throw new Error(`Unexpected query: ${sql}`)
 		}
 	})
 	await verifyDatabaseState(make(false), emailFiles, 'email-pre', 'identity')
+	for (const defaults of [{ runtime: false }, { truncate: true }, { backup: false }, { public_access: true }]) await assert.rejects(verifyDatabaseState(make(false, { defaults }), emailFiles, 'email-pre', 'identity'))
 	await verifyDatabaseState(make(true), emailFiles, 'email-post', 'identity')
 	await assert.rejects(verifyDatabaseState(make(false), emailFiles, 'email-post', 'identity'))
 	await assert.rejects(verifyDatabaseState(make(true, { absent: true }), emailFiles, 'email-post', 'identity'))
