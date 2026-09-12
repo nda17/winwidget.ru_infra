@@ -97,6 +97,7 @@ jobs:
           bash -n scripts/deploy-identity-operations-scoped.sh
           shellcheck -x scripts/deploy-identity-operations-scoped.sh
           node --check scripts/scoped-service-release.mjs
+          node --check scripts/identity-email-release.mjs
           bash -n scripts/deploy-support-chat-scoped.sh
           shellcheck -x scripts/deploy-support-chat-scoped.sh
           node --check scripts/support-chat-release.mjs

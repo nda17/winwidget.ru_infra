@@ -1165,7 +1165,9 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   Operations workers, при отличии API — `expected_operations_api_revision`,
   а также неизменные `expected_service_env_sha256` Identity и
   `expected_operations_env_sha256`. Все семь live images и per-role revisions
-  проверяются до остановки; source diff от API baseline допускает только
+  проверяются до остановки; email helper поставляется отдельным checksum-bound
+  модулем `identity-email-release.mjs` в прежних двух SSH payload slots. CRM/SMS
+  envelopes и их size limits сохраняются. Source diff от API baseline допускает только
   перечисленные в verifier email modules/tests, CI, документацию, schema и SQL.
   Единственная новая миграция — `20260913000000_email_delivery_attempts`,
   SHA-256 `df3b21a77b51a0d3a5d8636729caded47927514c2ef6931d1f45f3707784c021`.
@@ -1175,8 +1177,12 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   `restore-manifests/database-restore-migrations.json`: точный additive Identity
   ledger; все остальные targets, compiled Operations source, deps и keyring
   побайтово совпадают. Проверяются оба старых per-role images и оба candidate
-  images; schema/generated schema и неперечисленные Identity compiled modules
-  не могут расходиться. Новые env или secrets не требуются.
+  images. Candidate сравнивается с текущим API image. Более старые Identity
+  workers допускают только закреплённый переход `774db649…` → `eb19be43…`, уже
+  выпущенный в API: exact package hashes, nodemailer 9.0.3 → 9.1.1 и multer
+  2.2.0 → 2.3.0, пять ранее изменённых API/config modules. Worker modules,
+  RabbitMQ, schema/migrations и assets должны совпадать; новый candidate не
+  может добавлять к этому другой dependency delta. Новые env или secrets не требуются.
   До остановки read-only gate проверяет совместно global и schema table
   defaults роли Identity migration: runtime CRUD без TRUNCATE, backup SELECT,
   без PUBLIC grants; отсутствие нужных default ACL запрещает выпуск до DDL.

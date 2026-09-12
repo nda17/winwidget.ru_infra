@@ -8,8 +8,6 @@ import { fileURLToPath } from 'node:url';
 
 export const NOTES_MIGRATION = '20260910110000_remove_admin_backlog';
 export const OTP_MIGRATION = '20260910010000_add_login_otp';
-export const EMAIL_MIGRATION = '20260913000000_email_delivery_attempts';
-export const EMAIL_MIGRATION_SHA256 = 'df3b21a77b51a0d3a5d8636729caded47927514c2ef6931d1f45f3707784c021';
 export const SCOPED_SERVICES = Object.freeze({
 	'identity-api-runtime': ['identity-api'],
 	'identity-email-delivery': ['identity-api', 'identity-worker', 'identity-outbox-publisher', 'operations-api', 'operations-worker', 'operations-outbox-publisher', 'operations-restore-worker'],
@@ -591,75 +589,6 @@ export function assertIdentityManifestCompanion(before, after, identityFiles) {
 	}
 }
 
-export const EMAIL_SOURCE_PATHS = Object.freeze(['auth/auth.service.ts', 'runtime/identity-housekeeping.service.ts', 'auth/email-verification.service.ts', 'auth/email-password-recovery.service.ts', 'users/users.service.ts', 'identity.module.ts', 'common/http-exception.filter.ts', 'transports/verification-transport.service.ts', 'transports/email-templates.ts']);
-export function assertIdentityEmailSource(paths) {
-	assert.ok(Array.isArray(paths) && paths.length > 0);
-	for (const path of paths) assert.ok(EMAIL_SOURCE_PATHS.map(name => `apps/identity/src/${name}`).includes(path) ||
-		/^apps\/identity\/(src\/[a-z0-9./-]+\.spec\.ts|test\/[a-z0-9./-]+\.(ts|mjs)|README\.md)$/.test(path) ||
-		['apps/identity/prisma/schema.prisma', `apps/identity/prisma/migrations/${EMAIL_MIGRATION}/migration.sql`, '.github/workflows/ci.yml', '.github/scripts/static-check-services-lifecycle.sh', 'docs/backlog.md',
-		'apps/operations/restore-manifests/database-restore-migrations.json', 'apps/operations/backup-manifests/database-backup-migrations.json'].includes(path), `Unapproved email release path: ${path}`);
-}
-export function assertIdentityEmailManifest(before, after, files) {
-	assert.equal(files.at(-1)?.name, EMAIL_MIGRATION); assert.equal(files.at(-1)?.checksum, EMAIL_MIGRATION_SHA256);
-	assert.ok(files.some(file => file.name === OTP_MIGRATION));
-	assert.equal(before.schemaVersion, 1); assert.equal(after.schemaVersion, 1);
-	same(Object.keys(before.targets).sort(), Object.keys(after.targets).sort());
-	assert.ok(before.targets.identity);
-	for (const key of Object.keys(before.targets)) if (key !== 'identity') same(before.targets[key], after.targets[key]);
-	for (const [entry, migrations] of [[before.targets.identity, files.slice(0, -1)], [after.targets.identity, files]]) {
-		same(entry.migrations, migrations); assert.equal(entry.manifestSha256, sha256(JSON.stringify({ schemaVersion: 1, target: 'identity', migrations })));
-	}
-}
-export function assertIdentityEmailImages(before, after, owner, identityFiles) {
-	assert.ok(['identity', 'operations'].includes(owner));
-	for (const value of [before, after]) {
-		assert.equal(value.owner, owner); assert.equal(value.schemaSha256, value.generatedSchemaSha256);
-		assert.ok(value.compiled.length > 20); assert.ok(value.packages.length > 30);
-	}
-	for (const key of ['packages', 'packageSha256', 'assets']) same(before[key], after[key]);
-	if (owner === 'operations') {
-		for (const key of ['compiled', 'migrations', 'schemaSha256', 'keyringSha256']) same(before[key], after[key]);
-		for (const key of ['backup', 'restore']) assertIdentityEmailManifest(before[key], after[key], identityFiles);
-	} else {
-		assert.equal(after.migrations.at(-1)?.name, EMAIL_MIGRATION); assert.equal(after.migrations.at(-1)?.checksum, EMAIL_MIGRATION_SHA256);
-		same(before.migrations, after.migrations.slice(0, -1));
-		const changed = path => EMAIL_SOURCE_PATHS.some(name => path === `src/${name.slice(0, -3)}.js` || path === `src/${name.slice(0, -3)}.js.map` || path === `src/${name.slice(0, -3)}.d.ts`);
-		same(before.compiled.filter(row => !changed(row.path)), after.compiled.filter(row => !changed(row.path)));
-	}
-}
-function identityEmailImageInventory(owner) {
-	assert.equal(process.getuid(), 1001); assert.ok(['identity', 'operations'].includes(owner));
-	const files = root => {
-		const rows = []; const visit = directory => {
-			for (const entry of readdirSync(directory, { withFileTypes: true })) {
-				assert.ok(!entry.isSymbolicLink()); const path = join(directory, entry.name);
-				if (entry.isDirectory()) visit(path); else { assert.ok(entry.isFile()); rows.push({ path: path.slice(root.length + 1), sha256: sha256(readFileSync(path)) }); }
-			}
-		}; visit(root); return rows.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
-	};
-	const require = createRequire('/app/package.json');
-	const value = { owner, compiled: files('/app/dist'), migrations: migrationFiles('/app/prisma/migrations'),
-		schemaSha256: sha256(readFileSync('/app/prisma/schema.prisma')), generatedSchemaSha256: sha256(readFileSync(require.resolve(`@prisma/${owner}-client/schema.prisma`))),
-		packageSha256: sha256(readFileSync('/app/package.json')), packages: readdirSync('/app/node_modules/.pnpm', { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== 'node_modules').map(entry => entry.name).sort(),
-		assets: owner === 'identity' ? files('/app/assets') : [] };
-	if (owner === 'operations') {
-		value.backup = JSON.parse(readFileSync('/app/backup-manifests/database-backup-migrations.json'));
-		value.restore = JSON.parse(readFileSync('/app/restore-manifests/database-restore-migrations.json'));
-		value.keyringSha256 = sha256(readFileSync('/app/restore-manifests/database-backup-provenance-public-keys.json'));
-	}
-	process.stdout.write(JSON.stringify(value));
-}
-export function identityEmailNeighbors(live) {
-	assert.ok(live.length >= 7 && live.length < 200); assert.equal(new Set(live.map(item => item.Id)).size, live.length);
-	const target = item => item.Config.Labels['com.docker.compose.project'] === 'winwidget' && SCOPED_SERVICES['identity-email-delivery'].includes(item.Config.Labels['com.docker.compose.service']);
-	for (const item of live) {
-		assert.match(item.Id, /^[a-f0-9]{64}$/); assert.match(item.Image, /^sha256:[a-f0-9]{64}$/);
-		if (target(item)) continue;
-		assert.equal(item.State.Running, true); assert.equal(item.State.Restarting, false); assert.equal(item.State.OOMKilled, false);
-		if (item.Config.Healthcheck) assert.equal(item.State.Health?.Status, 'healthy');
-	}
-	return sha256(JSON.stringify(live.filter(item => !target(item)).map(item => ({ id: item.Id, image: item.Image, config: item.Config, host: item.HostConfig, mounts: orderedMountInventory(item.Mounts), startedAt: item.State.StartedAt, restartCount: item.RestartCount })).sort((a, b) => a.id < b.id ? -1 : 1)));
-}
 
 const BACKUP_LIMIT = 1024 ** 3;
 const instant = value => {
@@ -891,7 +820,7 @@ export function assertOperationsApiSource(before, after) {
 	assert.equal(after, before.replace(oldOpen, newOpen).replace(oldClosed, newClosed));
 }
 
-function rootFileBytes(filename, maximum = 1048576) {
+export function rootFileBytes(filename, maximum = 1048576) {
 	const metadata = lstatSync(filename);
 	assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1 && metadata.uid === 0 && metadata.gid === 0 && (metadata.mode & 0o7777) === 0o600 && metadata.size > 0 && metadata.size <= maximum);
 	assert.equal(realpathSync(filename), filename);
@@ -1023,7 +952,7 @@ export async function verifyOperationsApiHttp(revision, fetcher = fetch) {
 	}
 }
 
-function orderedMountInventory(mounts) {
+export function orderedMountInventory(mounts) {
 	assert.ok(Array.isArray(mounts));
 	// Docker may enumerate Mounts in a different order on successive inspections.
 	// Preserve every field and every entry; only this unordered inventory is sorted.
@@ -1113,36 +1042,7 @@ export async function verifyDatabaseState(client, files, action, owner, context 
 			assert.ok(!lease || Object.values(lease).every(value => value === null));
 		};
 		if (action.startsWith('email-')) {
-			assert.ok(['email-pre', 'email-post', 'email-quiet', 'email-drain'].includes(action));
-			assert.equal((await client.$queryRawUnsafe('SHOW transaction_read_only'))[0]?.transaction_read_only, 'on');
-			assert.match((await client.$queryRawUnsafe('SHOW server_version_num'))[0]?.server_version_num ?? '', /^18\d{4}$/);
-			if (owner === 'identity') {
-				assert.equal(files.at(-1)?.checksum, EMAIL_MIGRATION_SHA256);
-				const applied = assertMigrationLedger(files, ledger, EMAIL_MIGRATION, action !== 'email-pre');
-				if (action === 'email-post') assert.equal(applied, true);
-				if (action === 'email-pre') {
-					const [acl] = await client.$queryRawUnsafe("WITH p AS (SELECT x.grantee,x.privilege_type FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) x WHERE d.defaclrole='winwidget_identity_migration'::regrole AND d.defaclobjtype='r' AND d.defaclnamespace IN (0,'identity'::regnamespace)) SELECT count(DISTINCT privilege_type) FILTER (WHERE grantee='winwidget_identity_runtime'::regrole AND privilege_type IN ('SELECT','INSERT','UPDATE','DELETE'))=4 AS runtime, COALESCE(bool_or(grantee='winwidget_identity_runtime'::regrole AND privilege_type='TRUNCATE'),false) AS truncate, COALESCE(bool_or(grantee='winwidget_identity_backup'::regrole AND privilege_type='SELECT'),false) AS backup, COALESCE(bool_or(grantee=0),false) AS public_access FROM p");
-					same(acl, { runtime: true, truncate: false, backup: true, public_access: false });
-				}
-				const tables = await client.$queryRawUnsafe("SELECT to_regclass('identity.verification_email_attempts')::text AS attempts, to_regclass('identity.email_password_recoveries')::text AS recoveries");
-				assert.equal(Boolean(tables[0].attempts && tables[0].recoveries), applied);
-				if (!applied) same(tables, [{ attempts: null, recoveries: null }]);
-				if (applied) for (const table of ['verification_email_attempts', 'email_password_recoveries']) {
-					const [acl] = await client.$queryRawUnsafe(`SELECT pg_get_userbyid(relowner) AS owner, (has_table_privilege('winwidget_identity_runtime', oid, 'SELECT') AND has_table_privilege('winwidget_identity_runtime', oid, 'INSERT') AND has_table_privilege('winwidget_identity_runtime', oid, 'UPDATE') AND has_table_privilege('winwidget_identity_runtime', oid, 'DELETE')) AS runtime, has_table_privilege('winwidget_identity_runtime', oid, 'TRUNCATE') AS truncate, has_table_privilege('winwidget_identity_backup', oid, 'SELECT') AS backup FROM pg_class WHERE oid='identity.${table}'::regclass`);
-					same(acl, { owner: 'winwidget_identity_migration', runtime: true, truncate: false, backup: true });
-				}
-				if (['email-quiet', 'email-drain'].includes(action)) for (const model of ['outboxEvent', 'consumerReceipt', 'telegramUpdateReceipt']) assert.equal(await client[model].count({ where: { status: 'PROCESSING' } }), 0);
-			} else {
-				assert.equal(owner, 'operations'); assertMigrationLedger(files, ledger, NOTES_MIGRATION, true); await assertOperationsIdle(client);
-				if (action !== 'email-post') for (const model of ['scheduledJobRun', 'outboxEvent', 'auditEventReceipt', 'integrationDeliveryReceipt']) assert.equal(await client[model].count({ where: { status: 'PROCESSING' } }), 0);
-			}
-			if (action === 'email-drain') {
-				const [sessions] = await client.$queryRawUnsafe(`SELECT count(*)::int AS count FROM pg_stat_activity WHERE datname='winwidget_${owner}' AND usename='winwidget_${owner}_runtime'`);
-				assert.equal(sessions.count, 0);
-			}
-			const migrations = owner === 'identity' ? files.slice(0, -1) : ledger.map(row => ({ name: row.migration_name, checksum: row.checksum }));
-			process.stdout.write(`DATABASE_ID=${serviceIdentity[0].database_id}\nMIGRATION_MANIFEST_SHA256=${sha256(JSON.stringify({ schemaVersion: 1, target: owner, migrations }))}\n`);
-			return;
+			return (await import('./identity-email-release.mjs')).verifyIdentityEmailDatabase(client, files, action, owner, { serviceIdentity, ledger, assertOperationsIdle });
 		}
 		if (action === 'operations-api-pre-finalize') {
 			assert.equal(files.length, 14);
@@ -1822,24 +1722,8 @@ async function main() {
 		};
 		const result = prepareScopedCompose(input);
 		for (const key of ['desired', 'rollback']) writeFileSync(`/run/scoped/${key}.json`, `${JSON.stringify(result[key])}\n`, { mode: 0o600, flag: 'wx' });
-	} else if (action === 'email-source') {
-		assertIdentityEmailSource(readFileSync(0, 'utf8').trim().split('\n'));
-	} else if (action === 'email-image') {
-		identityEmailImageInventory(process.argv[3]);
-	} else if (action === 'email-images') {
-		const after = JSON.parse(rootFileBytes('/run/scoped/email-identity-after.json', 4 * 1024 * 1024));
-		for (const name of SCOPED_SERVICES['identity-email-delivery']) {
-			const owner = name.startsWith('identity-') ? 'identity' : 'operations';
-			assertIdentityEmailImages(JSON.parse(rootFileBytes(`/run/scoped/email-${name}-before.json`, 4 * 1024 * 1024)), owner === 'identity' ? after : JSON.parse(rootFileBytes('/run/scoped/email-operations-after.json', 4 * 1024 * 1024)), owner, after.migrations);
-		}
-	} else if (action === 'email-neighbors') {
-		process.stdout.write(identityEmailNeighbors(JSON.parse(readFileSync(0, 'utf8'))));
-	} else if (action === 'email-http') {
-		assert.match(process.env.SCOPED_REVISION ?? '', /^[a-f0-9]{40}$/);
-		for (const name of ['live', 'ready', 'revision']) {
-			const response = await fetch(`http://127.0.0.1:4900/health/${name}`, { redirect: 'error', signal: AbortSignal.timeout(5000) });
-			assert.equal(response.status, 200); const data = await response.json(); assert.equal(data.service, 'identity'); assert.equal(data.revision, process.env.SCOPED_REVISION);
-		}
+	} else if (action.startsWith('email-')) {
+		await (await import('./identity-email-release.mjs')).runIdentityEmailAction(action);
 	} else if (action === 'identity-migration-inventory') {
 		assert.equal(process.getuid(), 1001);
 		assert.equal(process.getgid(), 1001);

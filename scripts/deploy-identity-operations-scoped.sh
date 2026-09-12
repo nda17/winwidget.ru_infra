@@ -102,6 +102,7 @@ scoped_compose() {
 scoped_verifier() {
 	local verification_revision="${operations_runtime_revision:-$services_revision}"
 	local -a verifier_mounts=(--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro")
+	if [[ "$release_scope" == identity-email-delivery ]]; then verifier_mounts=("${scoped_email_verifier_mounts[@]}"); fi
 	if [[ "$release_scope" == gateway-tilda-upgrade ]]; then
 		verifier_mounts=(--volume "$scoped_payload_directory/gateway-tilda-release.mjs:/run/scoped-verifier.mjs:ro"
 			--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro")
@@ -241,8 +242,10 @@ scoped_backup_acquire() {
 
 scoped_database() {
 	local action="$1" owner="${2:-$scoped_owner}" output key value
+	local -a verifier_mounts=(--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro")
+	if [[ "$release_scope" == identity-email-delivery ]]; then verifier_mounts=("${scoped_email_verifier_mounts[@]}"); fi
 	output="$(scoped_source_compose run --rm --no-deps --interactive \
-		--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		"${verifier_mounts[@]}" \
 		--entrypoint node "$owner-migrate" /run/scoped-verifier.mjs database "$action" "$owner")" ||
 		die 'Scoped database migration/identity/fence preflight failed.'
 	scoped_database_id=''
@@ -669,7 +672,7 @@ scoped_email_image() {
 	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$owner" =~ ^(identity|operations)$ && "$output" =~ ^email-[a-z-]+\.json$ ]] || return 1
 	(umask 077; set -o noclobber
 		docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user 1001:1001 \
-			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			"${scoped_email_verifier_mounts[@]}" \
 			--entrypoint timeout "$image" --signal=TERM --kill-after=5s 30s node /run/scoped-verifier.mjs email-image "$owner" \
 			>"$scoped_work_directory/$output")
 }
@@ -757,7 +760,7 @@ scoped_deploy_identity_email() {
 	scoped_wait_healthy || die 'Email runtimes did not become healthy.'
 	scoped_verify_target_images || die 'Email runtimes do not match their exact immutable images.'
 	docker run --rm --network host --read-only --cap-drop ALL --security-opt no-new-privileges --user 1001:1001 \
-		--env "SCOPED_REVISION=$services_revision" --volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--env "SCOPED_REVISION=$services_revision" "${scoped_email_verifier_mounts[@]}" \
 		--entrypoint node "$scoped_image_id" /run/scoped-verifier.mjs email-http || die 'Identity email health/revision smoke failed.'
 	scoped_database email-post operations
 	before_receipt="$(<"$scoped_work_directory/email-operations-ledger-before")"
@@ -768,8 +771,8 @@ scoped_deploy_identity_email() {
 
 scoped_workers_quiet() {
 	local owner broker action=worker-quiet
-	local -a owners=(billing operations support)
-	if [[ "$release_scope" == identity-email-delivery ]]; then owners=(identity operations); action=email-quiet; fi
+	local -a owners=(billing operations support) verifier_mounts=(--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro")
+	if [[ "$release_scope" == identity-email-delivery ]]; then owners=(identity operations); action=email-quiet; verifier_mounts=("${scoped_email_verifier_mounts[@]}"); fi
 	if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == operations-runtime ]]; then owners=(operations); action=operations-quiet; fi
 	broker="$(scoped_container_id rabbitmq)" || return 1
 	[[ "$(docker inspect --format '{{.State.Health.Status}}' "$broker")" == healthy ]] || return 1
@@ -779,7 +782,7 @@ scoped_workers_quiet() {
 		scoped_verifier broker-quiet >/dev/null 2>&1 || return 1
 	for owner in "${owners[@]}"; do
 		scoped_source_compose run --rm --no-deps --interactive \
-			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			"${verifier_mounts[@]}" \
 			--entrypoint node "$owner-migrate" /run/scoped-verifier.mjs database "$action" "$owner" >/dev/null 2>&1 || return 1
 	done
 }
@@ -787,13 +790,13 @@ scoped_workers_quiet() {
 scoped_identity_unpack() {
 	docker run --rm --interactive --network none --read-only --log-driver none --cap-drop ALL \
 		--security-opt no-new-privileges --user 0:0 --memory 128m --cpus 0.5 --pids-limit 32 \
-		--volume "$scoped_payload_directory:/run/payload:rw" --entrypoint node "$scoped_image_id" --input-type=module <<'IDENTITY_API_UNPACK'
+		--env "SCOPED_SCOPE=$release_scope" --volume "$scoped_payload_directory:/run/payload:rw" --entrypoint node "$scoped_image_id" --input-type=module <<'IDENTITY_API_UNPACK'
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {readFileSync,writeFileSync} from 'node:fs';
 try {
  const bytes=readFileSync('/run/payload/verifier.mjs'); assert.ok(bytes.length>0&&bytes.length<=262144);
- const value=JSON.parse(bytes), names=['scoped-service-release.mjs','identity-api-release.mjs'];
+ const value=JSON.parse(bytes), names=['scoped-service-release.mjs',process.env.SCOPED_SCOPE==='identity-email-delivery'?'identity-email-release.mjs':'identity-api-release.mjs'];
  const exact=(item,keys)=>{assert.ok(item&&typeof item==='object'&&!Array.isArray(item));assert.deepEqual(Object.keys(item).sort(),keys.sort());};
  exact(value,['schemaVersion','files']);assert.equal(value.schemaVersion,1);assert.ok(Array.isArray(value.files));
  assert.deepEqual(value.files.map(item=>item.name).sort(),names.sort());
@@ -1488,6 +1491,10 @@ scoped_deploy_main() {
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
 	if [[ "$release_scope" == identity-email-delivery ]]; then
+		scoped_identity_unpack || die 'Email helper envelope is invalid.'
+		scoped_email_verifier_mounts=(--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-verifier.mjs:ro"
+			--volume "$scoped_payload_directory/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro"
+			--volume "$scoped_payload_directory/identity-email-release.mjs:/run/identity-email-release.mjs:ro")
 		scoped_deploy_identity_email
 		return
 	fi

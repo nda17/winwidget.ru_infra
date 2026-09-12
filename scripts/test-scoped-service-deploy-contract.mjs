@@ -10,12 +10,6 @@ import { gzipSync, gunzipSync } from 'node:zlib'
 import {
 	NOTES_MIGRATION,
 	OTP_MIGRATION,
-	EMAIL_MIGRATION,
-	EMAIL_MIGRATION_SHA256,
-	assertIdentityEmailSource,
-	assertIdentityEmailManifest,
-	assertIdentityEmailImages,
-	identityEmailNeighbors,
 	SCOPED_SERVICES,
 	OPERATIONS_CRM_BACKUP_TARGETS,
 	operationsBackupFingerprint,
@@ -54,6 +48,7 @@ import {
 	verifyOperationsApiHttp,
 	verifyDatabaseState
 } from './scoped-service-release.mjs'
+import { EMAIL_WORKER_SYNC, assertIdentityEmailWorkerBaseline, EMAIL_MIGRATION, EMAIL_MIGRATION_SHA256, assertIdentityEmailSource, assertIdentityEmailManifest, assertIdentityEmailImages, identityEmailNeighbors, validateIdentityEmailPayload } from './identity-email-release.mjs'
 import { IDENTITY_SMS_SOURCE, assertIdentitySmsSource, assertIdentitySmsCompiled, validateIdentityApiInventory,
 	assertIdentityApiImages, assertIdentityApiRuntime, identityApiNeighborFingerprint, verifyIdentityApiHttp,
 	IDENTITY_API_PAYLOAD_FILES, validateIdentityApiPayload } from './identity-api-release.mjs'
@@ -138,6 +133,18 @@ test('email release compiled image guard protects unrelated modules, packages an
 		value => { value.migrations[0].checksum = 'd'.repeat(64) },
 		value => { value.migrations.at(-1).checksum = envHash }
 	]) { const changed = structuredClone(after); mutate(changed); assert.throws(() => assertIdentityEmailImages(before, changed, 'identity')) }
+})
+
+test('email release accepts only the exact prior API dependency and module sync for older workers', () => {
+	const before = { owner: 'identity', packageSha256: EMAIL_WORKER_SYNC.beforePackage, packages: ['multer@2.2.0', 'nodemailer@9.0.3', 'unchanged'], migrations: emailFiles.slice(0, -1), assets: [], schemaSha256: envHash, generatedSchemaSha256: envHash, compiled: [{ path: 'src/runtime/worker.module.js', sha256: envHash }, { path: 'src/internal/internal.service.js', sha256: envHash }] }
+	const api = structuredClone(before); api.packageSha256 = EMAIL_WORKER_SYNC.afterPackage; api.packages = ['multer@2.3.0', 'nodemailer@9.1.1', 'unchanged']; api.compiled[1].sha256 = 'd'.repeat(64)
+	const verify = value => assertIdentityEmailWorkerBaseline(before, value, EMAIL_WORKER_SYNC.worker, EMAIL_WORKER_SYNC.api)
+	verify(api)
+	for (const mutate of [value => { value.packages.push('new-dependency') }, value => { value.packageSha256 = envHash }, value => { value.compiled[0].sha256 = 'd'.repeat(64) }, value => { value.migrations.push(emailFiles.at(-1)) }, value => { value.assets.push('changed') }]) { const changed = structuredClone(api); mutate(changed); assert.throws(() => verify(changed)) }
+	assert.throws(() => assertIdentityEmailWorkerBaseline(before, api, oldRevision, EMAIL_WORKER_SYNC.api))
+	assert.throws(() => assertIdentityEmailWorkerBaseline(before, api, EMAIL_WORKER_SYNC.worker, revision))
+	assert.throws(() => assertIdentityEmailWorkerBaseline(before, api, revision, revision))
+	assertIdentityEmailWorkerBaseline(api, api, revision, revision)
 })
 
 test('email release PostgreSQL guard rejects foreign ledgers, absent post-DDL tables and widened runtime ACL', async () => {
@@ -1192,11 +1199,11 @@ test('Identity SMS source and compiled admission permit exactly the two reviewed
 	// to admit synthetic source bytes in this standalone infrastructure fixture.
 })
 
-test('Identity dedicated envelope fits the unchanged SSH budget and unpacks only its two checksum-verified public modules', () => {
-	const packed = spawnSync(process.execPath, [join(scriptsRoot, 'identity-api-release.mjs'), 'pack'], { encoding: 'utf8' })
+for (const [scope, filename, validate, names] of [[identityApiScope, 'identity-api-release.mjs', validateIdentityApiPayload, IDENTITY_API_PAYLOAD_FILES], [emailScope, 'identity-email-release.mjs', validateIdentityEmailPayload, ['scoped-service-release.mjs', 'identity-email-release.mjs']]]) test(scope + ' dedicated envelope fits unchanged SSH budget and unpacks only checksum-verified modules', () => {
+	const packed = spawnSync(process.execPath, [join(scriptsRoot, filename), 'pack'], { encoding: 'utf8' })
 	assert.equal(packed.status, 0, packed.stderr)
-	assert.deepEqual(IDENTITY_API_PAYLOAD_FILES, ['scoped-service-release.mjs', 'identity-api-release.mjs'])
-	assert.deepEqual(validateIdentityApiPayload(packed.stdout).map(row => row.name), IDENTITY_API_PAYLOAD_FILES)
+	assert.deepEqual(names, ['scoped-service-release.mjs', filename])
+	assert.deepEqual(validate(packed.stdout).map(row => row.name), names)
 	assert.ok(gzipSync(packed.stdout).toString('base64').length + gzipSync(readFileSync(scopedControllerPath)).toString('base64').length <= 90000)
 	const unpack = readFileSync(scopedControllerPath, 'utf8').split("<<'IDENTITY_API_UNPACK'\n")[1].split('\nIDENTITY_API_UNPACK')[0]
 	for (const mutate of [
@@ -1208,16 +1215,16 @@ test('Identity dedicated envelope fits the unchanged SSH budget and unpacks only
 		value => { value.files[0].content = 'x'.repeat(147457); value.files[0].sha256 = sha256(value.files[0].content) }
 	]) {
 		const envelope = JSON.parse(packed.stdout); mutate?.(envelope); const bytes = JSON.stringify(envelope)
-		if (mutate) assert.throws(() => validateIdentityApiPayload(bytes))
+		if (mutate) assert.throws(() => validate(bytes))
 		privateFixture(directory => {
 			writeFileSync(join(directory, 'verifier.mjs'), bytes, { mode: 0o444 })
-			const result = spawnSync(process.execPath, ['--input-type=module', '-e', unpack.replaceAll('/run/payload/', directory + '/')], { encoding: 'utf8' })
+			const result = spawnSync(process.execPath, ['--input-type=module', '-e', unpack.replaceAll('/run/payload/', directory + '/')], { encoding: 'utf8', env: { ...process.env, SCOPED_SCOPE: scope } })
 			assert.equal(result.status, mutate ? 1 : 0, result.stderr)
 			if (mutate) assert.deepEqual(readdirSync(directory), ['verifier.mjs'])
 			else for (const file of envelope.files) { assert.equal(readFileSync(join(directory, file.name), 'utf8'), file.content); assert.equal(statSync(join(directory, file.name)).mode & 0o777, 0o444) }
 		})
 	}
-	for (const bytes of ['', '{', '{}', 'x'.repeat(262145)]) assert.throws(() => validateIdentityApiPayload(bytes))
+	for (const bytes of ['', '{', '{}', 'x'.repeat(262145)]) assert.throws(() => validate(bytes))
 })
 
 test('Identity source coordinator admits only its four reviewed release paths and one owner transport path', () => {
@@ -2122,6 +2129,7 @@ if [[ "$release_scope" == identity-api-runtime ]]; then
   scoped_identity_source() { printf 'IDENTITY_SOURCE\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != source-drift ]]; }
 fi
 if [[ "$release_scope" == identity-email-delivery ]]; then
+  scoped_identity_unpack() { printf 'EMAIL_UNPACK\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != payload-failed ]]; }
   scoped_email_neighbors() {
     printf 'EMAIL_ALL_PROJECTS\n' >>"$SCOPED_CALLS"
     if [[ "$TEST_SCENARIO" == crm-neighbor-drift && "$(<"$SCOPED_PHASE")" == desired ]]; then printf '%064d' 2; else printf '%064d' 1; fi
@@ -3250,7 +3258,7 @@ test('successful or unknown Identity DDL never restores any old Operations manif
 function runTransport(scenario = 'success', scope = identityScope) {
 	return privateFixture(directory => {
 		const shellPayload = crmScopes.includes(scope) ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
-		const nodePayload = scope === identityApiScope ? 'identity-api-release.mjs' : scope === gatewayTildaScope ? 'gateway-tilda-release.mjs' : crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
+		const nodePayload = scope === emailScope ? 'identity-email-release.mjs' : scope === identityApiScope ? 'identity-api-release.mjs' : scope === gatewayTildaScope ? 'gateway-tilda-release.mjs' : crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
 		const checkout = join(directory, 'infra')
 		const bin = join(directory, 'bin')
 		const trace = join(directory, 'transport.jsonl')
@@ -3259,7 +3267,7 @@ function runTransport(scenario = 'success', scope = identityScope) {
 		for (const relative of [
 			'scripts/deploy-services-production.sh', 'scripts/deploy-identity-operations-scoped.sh',
 			'scripts/scoped-service-release.mjs', 'scripts/deploy-crm-scoped.sh', 'scripts/crm-release.mjs',
-			'scripts/gateway-tilda-release.mjs', 'scripts/identity-api-release.mjs',
+			'scripts/gateway-tilda-release.mjs', 'scripts/identity-api-release.mjs', 'scripts/identity-email-release.mjs',
 			'nginx/backend-api.conf', 'nginx/frontend.conf'
 		]) {
 			if (scenario === 'missing-payload' && relative === 'scripts/' + nodePayload) continue
@@ -3294,7 +3302,7 @@ if (name === 'git') {
 } else process.exit(82);
 `
 		for (const name of ['git', 'sha256sum', 'ssh-keygen', 'ssh']) writeFileSync(join(bin, name), shim, { mode: 0o700 })
-		if ([gatewayTildaScope, identityApiScope].includes(scope)) symlinkSync(process.execPath, join(bin, 'node'))
+		if ([gatewayTildaScope, identityApiScope, emailScope].includes(scope)) symlinkSync(process.execPath, join(bin, 'node'))
 		const identity = join(directory, 'synthetic-key')
 		const knownHosts = join(directory, 'synthetic-known-hosts')
 		writeFileSync(identity, 'synthetic fixture, not a private key\n', { mode: 0o600 })
@@ -3339,11 +3347,11 @@ test('email release transport carries exact per-role baselines in the unchanged 
 	assert.equal(parameters.length, 25)
 	assert.equal(parameters[5], emailScope)
 	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, '', 'd'.repeat(40), '', '', '', '', '', '', 'c'.repeat(40)])
-	for (const [hash, payload, name] of [[10, 11, 'deploy-identity-operations-scoped.sh'], [12, 13, 'scoped-service-release.mjs']]) {
-		const file = readFileSync(join(scriptsRoot, name))
-		assert.equal(parameters[hash], sha256(file))
-		assert.deepEqual(gunzipSync(Buffer.from(parameters[payload], 'base64')), file)
-	}
+	const shell = readFileSync(join(scriptsRoot, 'deploy-identity-operations-scoped.sh'))
+	assert.equal(parameters[10], sha256(shell)); assert.deepEqual(gunzipSync(Buffer.from(parameters[11], 'base64')), shell)
+	const bytes = gunzipSync(Buffer.from(parameters[13], 'base64'))
+	assert.equal(parameters[12], sha256(bytes))
+	for (const file of validateIdentityEmailPayload(bytes)) assert.equal(file.content, readFileSync(join(scriptsRoot, file.name), 'utf8'))
 	assert.ok(parameters[11].length + parameters[13].length <= 90000)
 })
 
