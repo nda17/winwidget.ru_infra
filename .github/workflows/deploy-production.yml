@@ -43,6 +43,10 @@ on:
         description: Fresh approved Customers API, neighbors and full prepared env baseline hash (crm-customers-provider-config only)
         default: ''
         type: string
+      expected_identity_workers_revision:
+        description: Optional exact Identity worker and publisher baseline (email release only)
+        default: ''
+        type: string
       expected_operations_revision:
         description: Approved live Operations companion revision (same baseline for worker recovery)
         default: ''
@@ -145,6 +149,7 @@ jobs:
           EXPECTED_CRM_REMINDERS_BASELINE_SHA256: ${{ inputs.expected_crm_reminders_baseline_sha256 }}
           EXPECTED_CRM_CUSTOMERS_PROVIDER_BASELINE_SHA256: ${{ inputs.expected_crm_customers_provider_baseline_sha256 }}
           EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256: ${{ inputs.expected_operations_backup_baseline_sha256 }}
+          EXPECTED_IDENTITY_WORKERS_REVISION: ${{ inputs.expected_identity_workers_revision }}
           EXPECTED_OPERATIONS_REVISION: ${{ inputs.expected_operations_revision }}
           EXPECTED_OPERATIONS_API_REVISION: ${{ inputs.expected_operations_api_revision }}
           EXPECTED_OPERATIONS_ENV_SHA256: ${{ inputs.expected_operations_env_sha256 }}

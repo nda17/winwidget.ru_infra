@@ -127,6 +127,7 @@ scoped_verifier() {
 		--env "SCOPED_OPERATIONS_BACKUP_BASELINE_SHA256=${expected_operations_backup_baseline_sha256:-}" \
 		--env "SCOPED_OPERATIONS_PREVIOUS_REVISION=${expected_operations_revision:-}" \
 		--env "SCOPED_OPERATIONS_API_PREVIOUS_REVISION=${expected_operations_api_revision:-}" \
+		--env "SCOPED_IDENTITY_WORKERS_PREVIOUS_REVISION=${expected_identity_workers_revision:-}" \
 		--env "SCOPED_DATABASE_ID=${scoped_database_id:-}" \
 		--env "SCOPED_MIGRATION_MANIFEST_SHA256=${scoped_migration_manifest_sha256:-}" \
 		--env "SCOPED_APPLICATION_TREE=${scoped_application_tree:-}" \
@@ -299,7 +300,7 @@ scoped_verify_target_images() {
 		id="$(scoped_container_id "$name")" || return 1
 		read -r image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
 		expected_image="$scoped_image_id"
-		if [[ "$release_scope" == identity-with-operations-manifest && "$name" == operations-* ]]; then expected_image="$scoped_operations_image_id"; fi
+		if [[ ( "$release_scope" == identity-with-operations-manifest || "$release_scope" == identity-email-delivery ) && "$name" == operations-* ]]; then expected_image="$scoped_operations_image_id"; fi
 		if [[ "$release_scope" == workers-bootstrap-recovery ]]; then
 			case "$name" in operations-*) expected_image="$scoped_operations_image_id" ;; support-*) expected_image="$scoped_support_image_id" ;; esac
 		fi
@@ -663,9 +664,112 @@ scoped_deploy_operations_api() {
 	printf 'Operations API-only release completed without DDL or worker replacement: infra=%s services=%s\n' "$infra_revision" "$services_revision"
 }
 
+scoped_email_image() {
+	local image="$1" owner="$2" output="$3"
+	[[ "$image" =~ ^sha256:[a-f0-9]{64}$ && "$owner" =~ ^(identity|operations)$ && "$output" =~ ^email-[a-z-]+\.json$ ]] || return 1
+	(umask 077; set -o noclobber
+		docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user 1001:1001 \
+			--volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+			--entrypoint timeout "$image" --signal=TERM --kill-after=5s 30s node /run/scoped-verifier.mjs email-image "$owner" \
+			>"$scoped_work_directory/$output")
+}
+
+scoped_email_neighbors() {
+	local ids id
+	local -a all_ids=()
+	ids="$(docker ps --no-trunc --format '{{.ID}}')" || return 1
+	while IFS= read -r id; do [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1; all_ids+=("$id"); done <<<"$ids"
+	docker inspect "${all_ids[@]}" | scoped_verifier email-neighbors
+}
+
+scoped_email_assert_neighbors() {
+	scoped_assert_unchanged_neighbors
+	[[ "$(scoped_email_neighbors)" == "$scoped_email_neighbors_before" ]] || die 'An unrelated Docker project or runtime configuration changed during email release.'
+}
+
+scoped_deploy_identity_email() {
+	local name owner id old_image revision role_revision image_tag image_revision changed before_receipt
+	# Admission is tied to reviewed source paths and exact additive SQL, never
+	# a broad all-services rollout or a mutable local source tree.
+	git -C "$release_root" diff --name-only "$expected_live_revision" "$services_revision" | scoped_verifier email-source || die 'Email candidate exceeds the reviewed source scope.'
+	for revision in "$expected_operations_revision" "${expected_operations_api_revision:-$expected_operations_revision}"; do
+		changed="$(git -C "$release_root" diff --name-only "$revision" "$services_revision" -- apps/operations)" || die 'Cannot compare the Operations companion source.'
+		[[ "$changed" == $'apps/operations/backup-manifests/database-backup-migrations.json\napps/operations/restore-manifests/database-restore-migrations.json' ]] || die 'Operations may change only its two Identity migration registries.'
+	done
+	scoped_target_ids=()
+	for name in "${scoped_targets[@]}"; do
+		id="$(scoped_container_id "$name")" || die 'An email release target is not uniquely running.'
+		read -r old_image revision < <(docker inspect --format '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$id")
+		owner=identity; role_revision="$expected_live_revision"
+		if [[ "$name" == identity-worker || "$name" == identity-outbox-publisher ]]; then role_revision="${expected_identity_workers_revision:-$expected_live_revision}"; fi
+		if [[ "$name" == operations-* ]]; then owner=operations; role_revision="$expected_operations_revision"; fi
+		if [[ "$name" == operations-api ]]; then role_revision="${expected_operations_api_revision:-$expected_operations_revision}"; fi
+		[[ "$revision" == "$role_revision" ]] || die 'An email release target differs from its approved live baseline.'
+		scoped_target_ids+=("$id")
+		scoped_email_image "$old_image" "$owner" "email-$name-before.json" || die 'Cannot verify a preserved email release image.'
+	done
+	for owner in identity operations; do
+		image_tag="winwidget-$owner:git-$services_revision"
+		docker build --build-arg "APP_REVISION=$services_revision" --tag "$image_tag" "$release_root/apps/$owner" >/dev/null 2>&1 || die 'Email release immutable image build failed.'
+		read -r old_image image_revision < <(docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_tag")
+		[[ "$old_image" =~ ^sha256:[a-f0-9]{64}$ && "$image_revision" == "$services_revision" ]] || die 'Email candidate image differs from the exact green revision.'
+		if [[ "$owner" == identity ]]; then scoped_image_id="$old_image"; export IDENTITY_IMAGE="$old_image" IDENTITY_REVISION="$services_revision"
+		else scoped_operations_image_id="$old_image"; export OPERATIONS_IMAGE="$old_image" OPERATIONS_REVISION="$services_revision"; fi
+		scoped_email_image "$old_image" "$owner" "email-$owner-after.json" || die 'Cannot inventory the immutable email candidate.'
+	done
+	scoped_verifier email-images || die 'Email candidate changes an unrelated compiled module, dependency, prior migration or backup/restore target.'
+	scoped_source_compose config --format json >"$scoped_work_directory/compose.json"
+	docker inspect "${scoped_target_ids[@]}" >"$scoped_work_directory/live.json"
+	docker image inspect "$scoped_image_id" >"$scoped_work_directory/image.json"
+	docker image inspect "$scoped_operations_image_id" >"$scoped_work_directory/operations-image.json"
+	chmod 600 "$scoped_work_directory/compose.json" "$scoped_work_directory/live.json" "$scoped_work_directory/image.json" "$scoped_work_directory/operations-image.json"
+	scoped_verifier prepare || die 'Email release would change runtime configuration, secrets or resource boundaries.'
+	scoped_email_neighbors_before="$(scoped_email_neighbors)" || die 'Cannot capture all unrelated production Docker projects.'
+	for owner in identity operations; do
+		scoped_database email-pre "$owner"
+		printf '%s %s\n' "$scoped_database_id" "$scoped_migration_manifest_sha256" >"$scoped_work_directory/email-$owner-ledger-before"
+	done
+	scoped_workers_quiet || die 'Email release requires quiet Identity and Operations.'
+	sleep 2
+	scoped_workers_quiet || die 'New work appeared before email release.'
+	for name in "${!scoped_targets[@]}"; do [[ "$(scoped_container_id "${scoped_targets[$name]}")" == "${scoped_target_ids[$name]}" ]] || die 'An email target changed before graceful stop.'; done
+	scoped_email_assert_neighbors
+	scoped_workers_quiet || die 'New work appeared immediately before email target stop.'
+	scoped_workers_stop_started=true
+	scoped_workers_graceful_stop "${scoped_target_ids[@]}" || die 'Email target graceful exit is unproven; no forced replacement.'
+	for id in "${scoped_target_ids[@]}"; do [[ "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$id")" == 'false 0' ]] || die 'An email target remains running.'; done
+	scoped_email_stopped=true
+	for owner in identity operations; do
+		scoped_database email-drain "$owner"
+		before_receipt="$(<"$scoped_work_directory/email-$owner-ledger-before")"
+		[[ "$before_receipt" == "$scoped_database_id $scoped_migration_manifest_sha256" ]] || die 'Email owner identity or ledger changed during drain.'
+	done
+	scoped_email_assert_neighbors
+	# From this point old Operations signing manifests must never resume, even
+	# when the migration process reports an error with an unknown commit result.
+	scoped_identity_ddl_started=true
+	scoped_source_compose run --rm --no-deps identity-migrate >/dev/null 2>&1 || die 'Email additive migration failed; retain the physical Operations fence.'
+	scoped_database email-post identity
+	before_receipt="$(<"$scoped_work_directory/email-identity-ledger-before")"
+	[[ "$before_receipt" == "$scoped_database_id $scoped_migration_manifest_sha256" ]] || die 'Identity database changed during email migration.'
+	scoped_cutover_started=true
+	scoped_compose desired up -d --no-build --no-deps --force-recreate "${scoped_targets[@]}" >/dev/null 2>&1 || die 'Email runtime replacement failed.'
+	scoped_wait_healthy || die 'Email runtimes did not become healthy.'
+	scoped_verify_target_images || die 'Email runtimes do not match their exact immutable images.'
+	docker run --rm --network host --read-only --cap-drop ALL --security-opt no-new-privileges --user 1001:1001 \
+		--env "SCOPED_REVISION=$services_revision" --volume "$scoped_payload_directory/verifier.mjs:/run/scoped-verifier.mjs:ro" \
+		--entrypoint node "$scoped_image_id" /run/scoped-verifier.mjs email-http || die 'Identity email health/revision smoke failed.'
+	scoped_database email-post operations
+	before_receipt="$(<"$scoped_work_directory/email-operations-ledger-before")"
+	[[ "$before_receipt" == "$scoped_database_id $scoped_migration_manifest_sha256" ]] || die 'Operations ledger changed during the email release.'
+	scoped_email_assert_neighbors
+	printf 'Email release completed: infra=%s services=%s; recipient delivery remains a separate check.\n' "$infra_revision" "$services_revision"
+}
+
 scoped_workers_quiet() {
 	local owner broker action=worker-quiet
 	local -a owners=(billing operations support)
+	if [[ "$release_scope" == identity-email-delivery ]]; then owners=(identity operations); action=email-quiet; fi
 	if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == operations-runtime ]]; then owners=(operations); action=operations-quiet; fi
 	broker="$(scoped_container_id rabbitmq)" || return 1
 	[[ "$(docker inspect --format '{{.State.Health.Status}}' "$broker")" == healthy ]] || return 1
@@ -1213,7 +1317,9 @@ scoped_cleanup() {
 	elif [[ "$exit_code" != 0 && "${scoped_identity_ddl_started:-false}" == true ]]; then
 		# A failed migration process does not prove PostgreSQL rolled back. Never
 		# let an old manifest sign a backup after a successful/unknown Identity DDL.
-		for name in operations-api operations-worker operations-outbox-publisher operations-restore-worker; do
+		local -a fence_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker)
+		if [[ "$release_scope" == identity-email-delivery ]]; then fence_targets=("${scoped_targets[@]}"); fi
+		for name in "${fence_targets[@]}"; do
 			id="$(docker ps --no-trunc --filter label=com.docker.compose.project=winwidget --filter "label=com.docker.compose.service=$name" --format '{{.ID}}')" || { fence_confirmed=false; continue; }
 			[[ -n "$id" ]] || continue
 			if [[ ! "$id" =~ ^[a-f0-9]{64}$ ]] || ! scoped_workers_graceful_stop "$id" ||
@@ -1224,6 +1330,10 @@ scoped_cleanup() {
 		else
 			printf '%s\n' 'RECOVERY_REQUIRED: Operations stop could not be proven; urgently verify its physical fence and Identity ledger/manifest. No old manifest was resumed.' >&2
 		fi
+	elif [[ "$exit_code" != 0 && "$release_scope" == identity-email-delivery && "${scoped_email_stopped:-false}" == true ]]; then
+		if scoped_email_assert_neighbors && docker start "${scoped_target_ids[@]}" >/dev/null 2>&1 && scoped_wait_healthy; then
+			printf '%s\n' 'Pre-DDL email failure: exact original Identity and Operations containers resumed.' >&2
+		else printf '%s\n' 'RECOVERY_REQUIRED: pre-DDL email recovery is unproven; original snapshots retained.' >&2; fi
 	elif [[ "$exit_code" != 0 && "${scoped_operations_stopped:-false}" == true && "${scoped_cutover_started:-false}" == false ]]; then
 		if scoped_workers_quiet && docker start "${scoped_operations_ids[@]}" >/dev/null 2>&1 && scoped_wait_healthy; then
 			printf '%s\n' 'Pre-DDL drain failed; unchanged Operations containers were resumed on their original manifests.' >&2
@@ -1299,7 +1409,7 @@ scoped_deploy_main() {
 	local id name prefix image_revision old_image revision image_tag companion_files receipt_staging receipt_destination owner before_receipt role_revision
 	[[ "${scoped_diagnostic_fd:-}" =~ ^[0-9]+$ && "$scoped_diagnostic_fd" -gt 2 && "$scoped_diagnostic_fd" != "$deploy_lock_fd" ]] ||
 		die 'Scoped recovery diagnostic descriptor is invalid.'
-	[[ "$release_scope" =~ ^(identity-api-runtime|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|gateway-tilda-upgrade|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
+	[[ "$release_scope" =~ ^(identity-api-runtime|identity-email-delivery|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|gateway-tilda-upgrade|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime)$ &&
 		"$services_revision" =~ ^[a-f0-9]{40}$ && "$expected_live_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Invalid scoped release authorization.'
 	[[ "$(stat -Lc '%d:%i' "/proc/self/fd/$deploy_lock_fd")" == "$(stat -c '%d:%i' "$deploy_lock")" ]] ||
@@ -1310,7 +1420,7 @@ scoped_deploy_main() {
 		platform-marketing-runtime) scoped_owner=platform; scoped_targets=(platform-api) ;;
 		operations-federation-config | operations-api-runtime) scoped_owner=operations; scoped_targets=(operations-api) ;;
 		workers-bootstrap-recovery) scoped_owner=billing; scoped_targets=(billing-api billing-worker billing-outbox-publisher operations-worker operations-outbox-publisher operations-restore-worker support-worker support-outbox-publisher) ;;
-		identity-with-operations-manifest) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
+		identity-with-operations-manifest | identity-email-delivery) scoped_owner=identity; scoped_targets=(identity-api identity-worker identity-outbox-publisher operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-runtime | operations-backup-runtime) scoped_owner=operations; scoped_targets=(operations-api operations-worker operations-outbox-publisher operations-restore-worker) ;;
 		operations-backlog-backup | operations-backlog-finalize) scoped_owner=operations; scoped_targets=() ;;
 		gateway-remove-notes | gateway-tilda-upgrade) scoped_owner=api-gateway; scoped_targets=(api-gateway) ;;
@@ -1330,6 +1440,10 @@ scoped_deploy_main() {
 		scoped_assert_hash "$services_repository/apps/support/.env.production" "$expected_support_env_sha256"
 		scoped_env_arguments+=(--env-file "$services_repository/apps/operations/.env.production" --env-file "$services_repository/apps/support/.env.production")
 		scoped_assert_worker_source || die 'Worker recovery source exceeds the exact bootstrap and qs-only allowlist.'
+	fi
+	if [[ "$release_scope" == identity-email-delivery ]]; then
+		scoped_assert_hash "$services_repository/apps/operations/.env.production" "$expected_operations_env_sha256"
+		scoped_env_arguments+=(--env-file "$services_repository/apps/operations/.env.production")
 	fi
 	if [[ "$release_scope" == identity-with-operations-manifest ]]; then
 		scoped_assert_hash "$services_repository/apps/operations/.env.production" "$expected_operations_env_sha256"
@@ -1373,6 +1487,10 @@ scoped_deploy_main() {
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
+	if [[ "$release_scope" == identity-email-delivery ]]; then
+		scoped_deploy_identity_email
+		return
+	fi
 	if [[ "$release_scope" == identity-api-runtime ]]; then
 		scoped_identity_unpack || die 'Identity helper envelope is invalid.'
 		scoped_deploy_identity_api "$old_image" "$id"

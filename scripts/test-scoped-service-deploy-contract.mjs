@@ -10,6 +10,12 @@ import { gzipSync, gunzipSync } from 'node:zlib'
 import {
 	NOTES_MIGRATION,
 	OTP_MIGRATION,
+	EMAIL_MIGRATION,
+	EMAIL_MIGRATION_SHA256,
+	assertIdentityEmailSource,
+	assertIdentityEmailManifest,
+	assertIdentityEmailImages,
+	identityEmailNeighbors,
 	SCOPED_SERVICES,
 	OPERATIONS_CRM_BACKUP_TARGETS,
 	operationsBackupFingerprint,
@@ -62,12 +68,116 @@ const oldRevision = 'b'.repeat(40)
 const envHash = 'c'.repeat(64)
 const crmScopes = ['crm-prepare', 'crm-databases', 'crm-runtime', 'crm-upgrade']
 const identityScope = 'identity-with-operations-manifest'
+const emailScope = 'identity-email-delivery'
 const workerScope = 'workers-bootstrap-recovery'
 const apiScope = 'operations-api-runtime'
 const platformScope = 'platform-marketing-runtime'
 const identityApiScope = 'identity-api-runtime'
 const backupRuntimeScope = 'operations-backup-runtime'
 const gatewayTildaScope = 'gateway-tilda-upgrade'
+
+test('email release admits only exact owner source and one immutable migration', () => {
+	assertIdentityEmailSource(['apps/identity/src/auth/email-verification.service.ts', `apps/identity/prisma/migrations/${EMAIL_MIGRATION}/migration.sql`])
+	for (const path of ['apps/billing/src/billing.service.ts', 'apps/identity/.env.production', 'apps/identity/pnpm-lock.yaml', 'apps/identity/Dockerfile', 'apps/operations/src/main.ts', `apps/identity/prisma/migrations/${OTP_MIGRATION}/migration.sql`]) assert.throws(() => assertIdentityEmailSource([path]))
+})
+
+const emailFiles = [
+	{ name: '20260902080000_add_workspaces_and_refresh_rotation', checksum: envHash },
+	{ name: OTP_MIGRATION, checksum: envHash },
+	{ name: EMAIL_MIGRATION, checksum: EMAIL_MIGRATION_SHA256 }
+]
+const emailManifest = files => ({ schemaVersion: 1, targets: {
+	identity: { migrations: files, manifestSha256: sha256(JSON.stringify({ schemaVersion: 1, target: 'identity', migrations: files })) },
+	widgets: { unchanged: true }
+} })
+test('email release preserves CRM migrations and every other backup/restore target', () => {
+	const before = emailManifest(emailFiles.slice(0, -1)), after = emailManifest(emailFiles)
+	assertIdentityEmailManifest(before, after, emailFiles)
+	assert.throws(() => assertIdentityManifestCompanion(before, after, emailFiles), 'old OTP-only scope remains closed')
+	for (const mutate of [
+		value => { value.targets.widgets.unchanged = false },
+		value => { value.targets.identity.migrations[0].checksum = 'f'.repeat(64) },
+		value => { value.targets.identity.manifestSha256 = envHash },
+		value => { value.targets.identity.migrations.push({ name: '20990101000000_extra', checksum: envHash }) }
+	]) { const changed = structuredClone(after); mutate(changed); assert.throws(() => assertIdentityEmailManifest(before, changed, emailFiles)) }
+})
+
+test('email release requires explicit mixed worker baselines and unchanged full runtime configuration', () => {
+	const input = composeFixture('identity-email-delivery')
+	for (const name of ['operations-api', 'operations-restore-worker']) {
+		input.compose.services[name].environment.DATABASE_RESTORE_ENABLED = 'false'
+		input.live.find(item => item.Config.Labels['com.docker.compose.service'] === name).Config.Env.push('DATABASE_RESTORE_ENABLED=false')
+	}
+	input.identityWorkersPreviousRevision = 'c'.repeat(40)
+	for (const item of input.live.filter(item => ['identity-worker', 'identity-outbox-publisher'].includes(item.Config.Labels['com.docker.compose.service']))) {
+		item.Config.Labels['org.opencontainers.image.revision'] = input.identityWorkersPreviousRevision
+		item.Config.Env = item.Config.Env.map(value => value.startsWith('APP_REVISION=') ? `APP_REVISION=${input.identityWorkersPreviousRevision}` : value)
+	}
+	const { desired, rollback } = prepareScopedCompose(input)
+	assert.equal(Object.keys(desired.services).length, 7)
+	assert.equal(rollback.services['identity-worker'].environment.APP_REVISION, input.identityWorkersPreviousRevision)
+	for (const mutate of [
+		value => { delete value.identityWorkersPreviousRevision },
+		value => { value.compose.services['identity-api'].environment.IDENTITY_LOGIN_OTP_ENABLED = 'false' },
+		value => { value.compose.services['operations-worker'].environment.EXTRA = 'unexpected' },
+		value => { value.compose.services['identity-worker'].mem_limit = 1234 },
+		value => { value.compose.services['operations-api'].environment.DATABASE_RESTORE_ENABLED = 'true' }
+	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareScopedCompose(changed)) }
+	const oldScope = composeFixture(identityScope); oldScope.identityWorkersPreviousRevision = oldRevision
+	assert.throws(() => prepareScopedCompose(oldScope))
+})
+
+test('email release compiled image guard protects unrelated modules, packages and migration history', () => {
+	const before = { owner: 'identity', schemaSha256: envHash, generatedSchemaSha256: envHash, packageSha256: envHash, assets: [], packages: Array.from({ length: 40 }, (_, index) => `package-${index}`), compiled: Array.from({ length: 30 }, (_, index) => ({ path: `src/unchanged-${index}.js`, sha256: envHash })), migrations: emailFiles.slice(0, -1) }
+	const after = structuredClone(before); after.migrations = emailFiles; after.compiled.push({ path: 'src/auth/email-verification.service.js', sha256: envHash })
+	assertIdentityEmailImages(before, after, 'identity')
+	for (const mutate of [
+		value => { value.compiled[0].sha256 = 'd'.repeat(64) },
+		value => { value.packages.push('new-dependency') },
+		value => { value.generatedSchemaSha256 = 'd'.repeat(64) },
+		value => { value.migrations[0].checksum = 'd'.repeat(64) },
+		value => { value.migrations.at(-1).checksum = envHash }
+	]) { const changed = structuredClone(after); mutate(changed); assert.throws(() => assertIdentityEmailImages(before, changed, 'identity')) }
+})
+
+test('email release PostgreSQL guard rejects foreign ledgers, absent post-DDL tables and widened runtime ACL', async () => {
+	const rows = applied => emailFiles.slice(0, applied ? undefined : -1).map(file => ({ migration_name: file.name, checksum: file.checksum, finished_at: 'done', rolled_back_at: null }))
+	const make = (applied, options = {}) => ({
+		$queryRawUnsafe: async sql => {
+			if (sql.startsWith('SHOW transaction')) return [{ transaction_read_only: 'on' }]
+			if (sql.startsWith('SHOW server')) return [{ server_version_num: '180002' }]
+			if (sql.includes('current_database()')) return [{ database: 'winwidget_identity', username: 'winwidget_identity_migration', schema: 'identity', recovery: false }]
+			if (sql.includes('service_identity')) return [{ id: 'singleton', service_name: 'identity-service', database_id: '11111111-1111-4111-8111-111111111111' }]
+			if (sql.includes('_prisma_migrations')) return options.ledger || rows(applied)
+			if (sql.includes('to_regclass')) return [{ attempts: applied && !options.absent ? 'identity.verification_email_attempts' : null, recoveries: applied && !options.absent ? 'identity.email_password_recoveries' : null }]
+			if (sql.includes('has_table_privilege')) return [{ owner: 'winwidget_identity_migration', runtime: true, truncate: options.truncate ?? false, backup: true }]
+			throw new Error(`Unexpected query: ${sql}`)
+		}
+	})
+	await verifyDatabaseState(make(false), emailFiles, 'email-pre', 'identity')
+	await verifyDatabaseState(make(true), emailFiles, 'email-post', 'identity')
+	await assert.rejects(verifyDatabaseState(make(false), emailFiles, 'email-post', 'identity'))
+	await assert.rejects(verifyDatabaseState(make(true, { absent: true }), emailFiles, 'email-post', 'identity'))
+	await assert.rejects(verifyDatabaseState(make(true, { truncate: true }), emailFiles, 'email-post', 'identity'))
+	await assert.rejects(verifyDatabaseState(make(false, { ledger: [...rows(false), { migration_name: '20260912000000_unreviewed', checksum: envHash, finished_at: 'done', rolled_back_at: null }] }), emailFiles, 'email-pre', 'identity'))
+})
+
+test('email release fingerprint protects active containers in unrelated Docker projects', () => {
+	const live = composeFixture('identity-email-delivery').live
+	const neighbor = structuredClone(live[0]); neighbor.Id = '9'.repeat(64)
+	neighbor.Config.Labels['com.docker.compose.project'] = 'other-project'
+	neighbor.State.Running = true; neighbor.State.Restarting = false; neighbor.State.OOMKilled = false
+	live.push(neighbor)
+	const hash = identityEmailNeighbors(live)
+	for (const mutate of [
+		row => { row.Image = `sha256:${'f'.repeat(64)}` },
+		row => { row.Config.Env.push('CONFIG_DRIFT=true') },
+		row => { row.RestartCount = 1 },
+		row => { row.Mounts.push({ Type: 'volume', Source: 'new', Destination: '/data', RW: true }) }
+	]) { const changed = structuredClone(live); mutate(changed.at(-1)); assert.notEqual(identityEmailNeighbors(changed), hash) }
+	const unhealthy = structuredClone(live); unhealthy.at(-1).State.Health.Status = 'unhealthy'
+	assert.throws(() => identityEmailNeighbors(unhealthy))
+})
 
 function platformInventoryFixture() {
 	return {
@@ -376,7 +486,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', 'operations-runtime', 'gateway-remove-notes', gatewayTildaScope, workerScope, apiScope, platformScope, identityApiScope, ...crmScopes]) {
+	for (const scope of ['identity-with-operations-manifest', emailScope, 'operations-runtime', 'gateway-remove-notes', gatewayTildaScope, workerScope, apiScope, platformScope, identityApiScope, ...crmScopes]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -432,6 +542,13 @@ test('distinct Operations API baseline cannot enter another scope or be mutable'
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...(scope === workerScope ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}), EXPECTED_OPERATIONS_API_REVISION: oldRevision }, /Operations API baseline/)
 	}
 	rejectBeforeTransport([revision], { RELEASE_SCOPE: identityScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash, EXPECTED_OPERATIONS_API_REVISION: 'prod' }, /Operations API baseline/)
+})
+
+test('email release controller admits no mutable workers or foreign destructive authority', () => {
+	const authorized = { RELEASE_SCOPE: emailScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash }
+	rejectBeforeTransport([revision], { ...authorized, EXPECTED_IDENTITY_WORKERS_REVISION: 'prod' }, /Identity worker baseline/)
+	rejectBeforeTransport([revision], { ...authorized, OPERATIONS_RUNTIME_REVISION: oldRevision }, /Destructive authorization/)
+	for (const scope of ['all', identityApiScope, identityScope]) rejectBeforeTransport([revision], { ...(scope === 'all' ? {} : authorized), RELEASE_SCOPE: scope, ...(scope === identityApiScope ? { EXPECTED_OPERATIONS_REVISION: '', EXPECTED_OPERATIONS_ENV_SHA256: '' } : {}), EXPECTED_IDENTITY_WORKERS_REVISION: oldRevision }, /Identity worker baseline/)
 })
 
 test('all-services mode cannot inherit scoped or destructive authorization', () => {
@@ -1998,6 +2115,12 @@ if [[ "$release_scope" == identity-api-runtime ]]; then
   scoped_identity_unpack() { printf 'IDENTITY_UNPACK\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != payload-failed ]]; }
   scoped_identity_source() { printf 'IDENTITY_SOURCE\n' >>"$SCOPED_CALLS"; [[ "$TEST_SCENARIO" != source-drift ]]; }
 fi
+if [[ "$release_scope" == identity-email-delivery ]]; then
+  scoped_email_neighbors() {
+    printf 'EMAIL_ALL_PROJECTS\n' >>"$SCOPED_CALLS"
+    if [[ "$TEST_SCENARIO" == crm-neighbor-drift && "$(<"$SCOPED_PHASE")" == desired ]]; then printf '%064d' 2; else printf '%064d' 1; fi
+  }
+fi
 if [[ "$release_scope" == platform-marketing-runtime ]]; then
   expected_operations_revision=''; expected_operations_env_sha256=''; expected_support_env_sha256=''
   if [[ "$TEST_SCENARIO" == foreign-authority ]]; then operations_runtime_revision="$TEST_PREVIOUS_REVISION"; fi
@@ -2047,6 +2170,9 @@ git() {
     elif [[ "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
       for owner in billing operations support; do printf 'apps/%s/src/main.ts\napps/%s/src/runtime/bootstrap-failure.ts\n' "$owner" "$owner"; done
       if [[ "$TEST_SCENARIO" == source-drift ]]; then printf 'apps/operations/prisma/migrations/20260910110000_remove_admin_backlog/migration.sql\n'; fi
+    elif [[ "$TEST_SCOPE" == identity-email-delivery ]]; then
+      printf '%s\n' 'apps/operations/backup-manifests/database-backup-migrations.json' 'apps/operations/restore-manifests/database-restore-migrations.json'
+      if [[ "$TEST_SCENARIO" == companion-drift ]]; then printf 'apps/operations/src/unsafe-change.ts\n'; fi
     elif [[ "$TEST_SCENARIO" == companion-drift ]]; then printf 'apps/operations/src/unsafe-change.ts\n';
     else printf 'apps/operations/restore-manifests/database-restore-migrations.json\n'; fi
   else printf '%s\n' "$TEST_REVISION"; fi
@@ -2071,7 +2197,7 @@ docker() {
     if [[ "$TEST_SCENARIO" == mixed-worker-wrong && "$last" =~ ^0+2$ ]]; then rev="$TEST_API_PREVIOUS_REVISION"; fi
   fi
   if [[ "$current" == desired && "$TEST_SCOPE" != gateway-remove-notes && "$TEST_SCOPE" != operations-federation-config ]]; then image="$TEST_NEW_IMAGE"; rev="$TEST_REVISION"; fi
-  if [[ "$current" == desired && "$TEST_SCOPE" == identity-with-operations-manifest && "$last" =~ ^0+[1-4]$ ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
+  if [[ "$current" == desired && ( "$TEST_SCOPE" == identity-with-operations-manifest || "$TEST_SCOPE" == identity-email-delivery ) && "$last" =~ ^0+[1-4]$ ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
   if [[ "$current" == desired && "$TEST_SCOPE" == workers-bootstrap-recovery ]]; then
     if [[ "$last" =~ ^0+[1-4]$ ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
     if [[ "$last" =~ ^0+(10|11|12)$ ]]; then image="$TEST_SUPPORT_IMAGE"; fi
@@ -2136,7 +2262,7 @@ docker() {
     image)
       if [[ "${'${'}3:-}" == --format ]]; then
         image="$TEST_NEW_IMAGE"
-        if [[ "$TEST_SCOPE" == identity-with-operations-manifest && "$last" == winwidget-operations:* ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
+        if [[ ( "$TEST_SCOPE" == identity-with-operations-manifest || "$TEST_SCOPE" == identity-email-delivery ) && "$last" == winwidget-operations:* ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
         if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$last" == winwidget-operations:* ]]; then image="$TEST_OPERATIONS_IMAGE"; fi
         if [[ "$TEST_SCOPE" == workers-bootstrap-recovery && "$last" == winwidget-support:* ]]; then image="$TEST_SUPPORT_IMAGE"; fi
         printf '%s %s\n' "$image" "$TEST_REVISION"
@@ -2183,6 +2309,7 @@ docker() {
       if [[ "$action" == up ]]; then
         case "$snapshot" in */desired.json) printf desired >"$SCOPED_PHASE" ;; */rollback.json) printf rollback >"$SCOPED_PHASE" ;; *) return 83 ;; esac
         for number in 1 2 3 4 8 9 11 12 13; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done
+        if [[ "$TEST_SCOPE" == identity-email-delivery ]]; then for number in 5 6 7; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done; fi
         if [[ "$TEST_SCOPE" == identity-api-runtime ]]; then for number in 5 15; do printf -v cid '%064d' "$number"; rm -f -- "$SCOPED_FIXTURE/stopped-$cid"; done; fi
         if [[ "$snapshot" == */desired.json ]]; then
           if [[ "$TEST_SCENARIO" == term || "$TEST_SCENARIO" == repeated-term ]]; then kill -TERM "$$"; fi
@@ -2194,6 +2321,14 @@ docker() {
         return 0
       fi
       if [[ "$action" == run && " $* " == *' database '* ]]; then
+        if [[ "$TEST_SCOPE" == identity-email-delivery ]]; then
+          case "$TEST_SCENARIO" in
+            ledger-failed) [[ " $* " != *' email-pre '* ]] || return 1 ;;
+            database-busy) [[ " $* " != *' email-quiet '* ]] || return 1 ;;
+            drain-failed) [[ " $* " != *' email-drain '* ]] || return 1 ;;
+            post-migration-failed) [[ " $* " != *' email-post '* ]] || return 1 ;;
+          esac
+        fi
         if [[ "$TEST_SCOPE" == operations-api-runtime ]]; then
           [[ " $* " == *' database operations-api-pre-finalize operations '* && " $* " != *' prisma '* ]] || return 1
           local db_calls=0 notes_state="$TEST_ENV_HASH"
@@ -2229,6 +2364,11 @@ docker() {
       fi
       return 84 ;;
     run)
+      if [[ "$TEST_SCOPE" == identity-email-delivery && " $* " == *' email-image '* ]]; then
+        [[ " $* " == *' --network none '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* ]] || return 1
+        [[ " $* " == *' --signal=TERM --kill-after=5s 30s node '* && "$TEST_SCENARIO" != inventory-failed ]] || return 1
+        printf '{}\n'; return 0
+      fi
       if [[ "$TEST_SCOPE" == identity-api-runtime ]]; then
         [[ " $* " == *' --env SCOPED_SCOPE=identity-api-runtime '* ]] || return 1
         [[ " $* " == *'/identity-api-release.mjs:/run/scoped-verifier.mjs:ro '* && " $* " == *'/scoped-service-release.mjs:/run/scoped-service-release.mjs:ro '* ]] || return 1
@@ -2322,6 +2462,10 @@ docker() {
           [[ "$TEST_SCENARIO" != prepare-failed ]] || return 1
           printf '{}\n' >"$scoped_work_directory/desired.json"
           printf '{}\n' >"$scoped_work_directory/rollback.json" ;;
+        email-source) cat >/dev/null; [[ "$TEST_SCENARIO" != source-drift ]] ;;
+        email-images) [[ "$TEST_SCENARIO" != compiled-drift && "$TEST_SCENARIO" != manifest-failed ]] ;;
+        email-http)
+          [[ " $* " == *' --network host '* && " $* " == *' --user 1001:1001 '* && " $* " != *' --env-file '* && "$TEST_SCENARIO" != http-failed ]] ;;
         gateway-tilda-image) printf '{}\n' ;;
         gateway-tilda-images) [[ "$TEST_SCENARIO" != image-drift ]] ;;
         phase-a) printf '{}\n' >"$scoped_work_directory/phase-a.json" ;;
@@ -2414,6 +2558,55 @@ function assertOnlyScopedUp(result, names, rollback = false) {
 	assert.ok(updates[0].includes('/desired.json>'), updates[0])
 	if (rollback) assert.ok(updates[1].includes('/rollback.json>'), updates[1])
 }
+
+test('email release Bash proves both images, drains seven exact runtimes and applies only Identity DDL', () => {
+	const result = runRuntime(emailScope)
+	assert.equal(result.status, 0, result.stderr)
+	assertOnlyScopedUp(result, SCOPED_SERVICES[emailScope])
+	const lines = result.calls.split('\n')
+	assert.equal(lines.filter(line => line.startsWith('DOCKER <build>')).length, 2)
+	assert.equal(lines.filter(line => line.includes('<email-image>')).length, 9)
+	assert.deepEqual(lines.filter(line => line.startsWith('MIGRATE ')), ['MIGRATE identity-migrate'])
+	const stop = result.calls.indexOf('DOCKER <kill>')
+	for (const check of ['<email-images>', '<prepare>', '<email-pre>']) assert.ok(result.calls.indexOf(check) < stop, check)
+	assert.ok(result.calls.indexOf('<email-drain>') > stop)
+	assert.ok(result.calls.indexOf('MIGRATE identity-migrate') > result.calls.lastIndexOf('<email-drain>'))
+	assert.ok(result.calls.indexOf('<up>') > result.calls.indexOf('<email-post> <identity>'))
+	assert.ok(result.calls.indexOf('<email-http>') > result.calls.indexOf('<up>'))
+	assert.equal(lines.filter(line => line.startsWith('DOCKER <kill>')).length, 7)
+	assert.deepEqual(result.stopped, [])
+})
+
+test('email release Bash rejects unsafe admission before any live process stops', () => {
+	for (const scenario of ['source-drift', 'companion-drift', 'inventory-failed', 'compiled-drift', 'manifest-failed', 'prepare-failed', 'ledger-failed', 'broker-busy', 'database-busy']) {
+		const result = runRuntime(emailScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		for (const forbidden of ['DOCKER <kill>', 'DOCKER <stop>', '<up>', 'MIGRATE ']) assert.ok(!result.calls.includes(forbidden), scenario + ': ' + forbidden)
+	}
+})
+
+test('email release Bash resumes exact original runtimes only before DDL and never force-kills a slow process', () => {
+	const result = runRuntime(emailScope, 'drain-failed')
+	assert.notEqual(result.status, 0)
+	assert.deepEqual(result.stopped, [])
+	assert.equal(result.calls.split('\n').filter(line => line.startsWith('DOCKER <start>')).length, 1)
+	assert.ok(!result.calls.includes('MIGRATE ') && !result.calls.includes('<up>'))
+	for (const scenario of ['stop-timeout', 'still-running']) {
+		const slow = runRuntime(emailScope, scenario)
+		assert.notEqual(slow.status, 0, scenario)
+		for (const forbidden of ['DOCKER <stop>', '<up>', 'MIGRATE ', '<--signal=KILL>']) assert.ok(!slow.calls.includes(forbidden), scenario + ': ' + forbidden)
+	}
+})
+
+test('email release Bash fences all seven runtimes after uncertain DDL or failed postflight without stale manifest rollback', () => {
+	for (const scenario of ['migration-unknown', 'migration-term', 'post-migration-failed', 'replace-failed', 'http-failed', 'term', 'crm-neighbor-drift']) {
+		const result = runRuntime(emailScope, scenario)
+		assert.notEqual(result.status, 0, scenario)
+		assert.equal(result.stopped.length, 7, scenario + ': ' + result.stderr)
+		assert.ok(!result.calls.includes('/rollback.json>') && !result.calls.includes('DOCKER <start>'), scenario)
+		assert.deepEqual(result.calls.split('\n').filter(line => line.startsWith('MIGRATE ')), ['MIGRATE identity-migrate'], scenario)
+	}
+})
 
 test('Identity API Bash proves its SMS-only image before TERM and replaces exactly one API with read-only HTTP verification', () => {
 	const result = runRuntime(identityApiScope)
@@ -3115,7 +3308,8 @@ if (name === 'git') {
 				EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash,
 				...(scope === 'crm-upgrade' ? { EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash } : {}),
 				...(scope === backupRuntimeScope && scenario !== 'missing-backup-baseline' || scenario === 'foreign-backup-baseline' ? { EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256: envHash } : {}),
-				...(scope === identityScope ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}),
+				...([identityScope, emailScope].includes(scope) ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}),
+				...(scope === emailScope ? { EXPECTED_IDENTITY_WORKERS_REVISION: 'c'.repeat(40), EXPECTED_OPERATIONS_API_REVISION: 'd'.repeat(40) } : {}),
 				PRODUCTION_SSH_HOST: 'synthetic.invalid', PRODUCTION_SSH_PORT: '2222', PRODUCTION_SSH_USER: 'root',
 				PRODUCTION_SSH_IDENTITY_FILE: identity, PRODUCTION_SSH_KNOWN_HOSTS_FILE: knownHosts,
 				EXPECTED_PRODUCTION_ENV_SHA256: envHash,
@@ -3128,6 +3322,24 @@ if (name === 'git') {
 		return { ...result, calls, identity, knownHosts }
 	})
 }
+
+test('email release transport carries exact per-role baselines in the unchanged two-file envelope', () => {
+	const result = runTransport('success', emailScope)
+	assert.equal(result.status, 0, result.stderr)
+	assert.equal(result.calls.length, 1)
+	const encoded = result.calls[0].args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
+	assert.ok(encoded)
+	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
+	assert.equal(parameters.length, 25)
+	assert.equal(parameters[5], emailScope)
+	assert.deepEqual(parameters.slice(14), [oldRevision, envHash, '', 'd'.repeat(40), '', '', '', '', '', '', 'c'.repeat(40)])
+	for (const [hash, payload, name] of [[10, 11, 'deploy-identity-operations-scoped.sh'], [12, 13, 'scoped-service-release.mjs']]) {
+		const file = readFileSync(join(scriptsRoot, name))
+		assert.equal(parameters[hash], sha256(file))
+		assert.deepEqual(gunzipSync(Buffer.from(parameters[payload], 'base64')), file)
+	}
+	assert.ok(parameters[11].length + parameters[13].length <= 90000)
+})
 
 test('actual transport sends both exact tracked payloads through one pinned SSH and no frontend stage', () => {
 	const result = runTransport()

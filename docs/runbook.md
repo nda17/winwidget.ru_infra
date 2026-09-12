@@ -1157,6 +1157,48 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   сначала проверить/recover exact live baselines, затем переисполнить только
   неуспешную job. Частично обновлённые worker revisions нельзя скрывать заменой
   expected baseline или повторным общим rollout.
+- `identity-email-delivery`: три Identity и четыре Operations процесса,
+  без изменения их env, портов, ресурсов или соседних сервисов. Это отдельный
+  reviewed scope; ограничения прежних OTP и SMS scopes сохраняются. Caller
+  закрепляет `expected_live_revision` Identity API, при отличии workers —
+  `expected_identity_workers_revision`, `expected_operations_revision` трёх
+  Operations workers, при отличии API — `expected_operations_api_revision`,
+  а также неизменные `expected_service_env_sha256` Identity и
+  `expected_operations_env_sha256`. Все семь live images и per-role revisions
+  проверяются до остановки; source diff от API baseline допускает только
+  перечисленные в verifier email modules/tests, CI, документацию, schema и SQL.
+  Единственная новая миграция — `20260913000000_email_delivery_attempts`,
+  SHA-256 `df3b21a77b51a0d3a5d8636729caded47927514c2ef6931d1f45f3707784c021`.
+  Она добавляет две Identity таблицы и четыре поля challenge. Старые миграции,
+  включая CRM и OTP, не изменяются. Operations companion меняет только
+  `backup-manifests/database-backup-migrations.json` и
+  `restore-manifests/database-restore-migrations.json`: точный additive Identity
+  ledger; все остальные targets, compiled Operations source, deps и keyring
+  побайтово совпадают. Проверяются оба старых per-role images и оба candidate
+  images; schema/generated schema и неперечисленные Identity compiled modules
+  не могут расходиться. Новые env или secrets не требуются.
+  До DDL выполняются три quiet samples PostgreSQL/RabbitMQ, проверка idle
+  restore и неизменности всех активных Docker projects, затем мягкий TERM всех
+  семи процессов с ограниченным ожиданием, `Running=false`, `Pid=0`, отсутствие
+  runtime DB sessions. SIGKILL не используется; queues не очищаются. Применяется
+  только `identity-migrate`; owner/database identity, прежний ledger, владельцы
+  новых таблиц и точные CRUD/backup grants проверяются до и после. Operations
+  ledger не меняется. Затем запускаются только семь exact candidate images,
+  проверяются health/revision HTTP и прежние env/config/container fingerprints
+  всех соседей. Это короткая пауза входа и admin control plane; SMTP/получение
+  письма проверяется отдельно пользователем.
+  При ошибке до DDL полностью остановленные исходные container IDs можно
+  возобновить только при неизменных соседях. Неполный graceful stop оставляет
+  recovery evidence. С момента начала DDL автоматический rollback запрещён:
+  при неизвестном исходе или неуспешном postflight все семь процессов остаются
+  fenced; нужен ledger/manifest review и forward recovery. Успешно применённая
+  миграция намеренно не проходит повторный pre-DDL gate. При недоступном SSH
+  можно повторить failed CD job того же exact SHA после maintenance, если DDL
+  ещё не начат; не запускать старый SHA после новой правки и не заменять baseline
+  для обхода gate. Backend CI остаётся обязательным: owner unit/integration,
+  PostgreSQL 18 email failure/concurrency/recovery в release-shaped image и
+  Operations backup/restore checks. Запуск — push проверенного exact Services
+  SHA в `prod`; reusable infra workflow закреплён immutable green SHA в caller.
 - `identity-with-operations-manifest`: три Identity и четыре Operations
   runtime; дополнительно `expected_operations_revision` и
   `expected_operations_env_sha256`. Это не Identity-only rollout: Operations
@@ -1167,7 +1209,7 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   Для mixed baseline после worker recovery дополнительно закрепляется
   `expected_operations_api_revision`: точный live revision Operations API.
   `expected_operations_revision` остаётся точным revision трёх workers и базой
-  source diff. Этот optional input запрещён у других scopes; без него действует
+  source diff. Этот optional input также разрешён email scope выше; без него действует
   прежний homogeneous контракт. В mixed варианте все Billing/Support files
   побайтово совпадают с worker baseline, в Operations отличается только restore
   JSON; наличие baseline bootstrap helpers обязательно. Проверяются реальные

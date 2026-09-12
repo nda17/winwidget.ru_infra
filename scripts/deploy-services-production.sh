@@ -61,6 +61,7 @@ expected_support_chat_baseline_sha256="${EXPECTED_SUPPORT_CHAT_BASELINE_SHA256:-
 expected_operations_backup_baseline_sha256="${EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256:-}"
 expected_operations_revision="${EXPECTED_OPERATIONS_REVISION:-}"
 expected_operations_api_revision="${EXPECTED_OPERATIONS_API_REVISION:-}"
+expected_identity_workers_revision="${EXPECTED_IDENTITY_WORKERS_REVISION:-}"
 expected_operations_env_sha256="${EXPECTED_OPERATIONS_ENV_SHA256:-}"
 expected_support_env_sha256="${EXPECTED_SUPPORT_ENV_SHA256:-}"
 operations_runtime_revision="${OPERATIONS_RUNTIME_REVISION:-}"
@@ -69,7 +70,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-api-runtime | identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate | support-chat-repair)
+	identity-api-runtime | identity-email-delivery | identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate | support-chat-repair)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -117,7 +118,7 @@ if [[ "$release_scope" == crm-upgrade ]]; then
 else
 	[[ -z "$expected_crm_upgrade_baseline_sha256" ]] || die 'CRM upgrade baseline authorization cannot be reused by another scope.'
 fi
-if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == workers-bootstrap-recovery ]]; then
+if [[ "$release_scope" == identity-with-operations-manifest || "$release_scope" == identity-email-delivery || "$release_scope" == workers-bootstrap-recovery ]]; then
 	[[ "$expected_operations_revision" =~ ^[a-f0-9]{40}$ && "$expected_operations_env_sha256" =~ ^[a-f0-9]{64}$ ]] ||
 		die 'Coordinated Identity release requires the exact Operations companion identities.'
 else
@@ -125,8 +126,11 @@ else
 		die 'Operations companion authorization is only valid for the coordinated Identity release.'
 fi
 if [[ -n "$expected_operations_api_revision" ]]; then
-	[[ "$release_scope" == identity-with-operations-manifest && "$expected_operations_api_revision" =~ ^[a-f0-9]{40}$ ]] ||
+	[[ ( "$release_scope" == identity-with-operations-manifest || "$release_scope" == identity-email-delivery ) && "$expected_operations_api_revision" =~ ^[a-f0-9]{40}$ ]] ||
 		die 'Operations API baseline is only valid for coordinated Identity.'
+fi
+if [[ -n "$expected_identity_workers_revision" ]]; then
+	[[ "$release_scope" == identity-email-delivery && "$expected_identity_workers_revision" =~ ^[a-f0-9]{40}$ ]] || die 'Identity worker baseline belongs only to the email release.'
 fi
 if [[ "$release_scope" == workers-bootstrap-recovery ]]; then
 	[[ "$expected_support_env_sha256" =~ ^[a-f0-9]{64}$ && "$expected_operations_revision" == "$expected_live_revision" ]] ||
@@ -430,7 +434,9 @@ printf -v remote_controller_arguments ' %q' \
 	"$expected_operations_api_revision" \
 	"$expected_crm_upgrade_baseline_sha256" \
 	"$expected_operations_backup_baseline_sha256"
-if [[ "$release_scope" == crm-commerce-activate ]]; then
+if [[ "$release_scope" == identity-email-delivery ]]; then
+	printf -v remote_controller_arguments '%s %q %q %q %q %q' "$remote_controller_arguments" '' '' '' '' "$expected_identity_workers_revision"
+elif [[ "$release_scope" == crm-commerce-activate ]]; then
 	printf -v remote_controller_arguments '%s %q' "$remote_controller_arguments" "$expected_crm_commerce_baseline_sha256"
 elif [[ "$release_scope" == crm-reminders-activate || "$release_scope" == crm-intake-sla-activate ]]; then
 	printf -v remote_controller_arguments '%s %q %q' "$remote_controller_arguments" '' "$expected_crm_reminders_baseline_sha256"
@@ -494,6 +500,7 @@ export expected_crm_commerce_baseline_sha256="${21:-}"
 export expected_crm_reminders_baseline_sha256="${22:-}"
 export expected_crm_customers_provider_baseline_sha256="${23:-}"
 export expected_support_chat_baseline_sha256="${24:-}"
+export expected_identity_workers_revision="${25:-}"
 
 [[ "$infra_revision" =~ ^[0-9a-f]{40}$ ]] ||
 	die 'Remote infra revision is invalid.'
@@ -726,7 +733,7 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		# widen shell, private env, other Node payload or deployment authority.
 		if [[ "$destination" == "$scoped_payload_directory/verifier.mjs" ]]; then
 			case "${release_scope:-all}" in
-				all|identity-with-operations-manifest|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime) limit=147456 ;;
+				all|identity-with-operations-manifest|identity-email-delivery|operations-runtime|operations-backup-runtime|operations-backlog-backup|operations-backlog-finalize|gateway-remove-notes|workers-bootstrap-recovery|operations-federation-config|operations-api-runtime|platform-marketing-runtime) limit=147456 ;;
 			esac
 		fi
 		# The sentinel caps output even for a decompression bomb. pipefail also
