@@ -48,7 +48,7 @@ import {
 	verifyOperationsApiHttp,
 	verifyDatabaseState
 } from './scoped-service-release.mjs'
-import { EMAIL_WORKER_SYNC, assertIdentityEmailWorkerBaseline, EMAIL_MIGRATION, EMAIL_MIGRATION_SHA256, assertIdentityEmailSource, assertIdentityEmailManifest, assertIdentityEmailImages, identityEmailNeighbors, validateIdentityEmailPayload } from './identity-email-release.mjs'
+import { EMAIL_WORKER_SYNC, assertIdentityEmailWorkerBaseline, EMAIL_MIGRATION, EMAIL_MIGRATION_SHA256, assertIdentityEmailSource, assertIdentityEmailManifest, assertIdentityEmailImages, identityEmailNeighbors, validateIdentityEmailPayload, mergeIdentityEmailOwnerCompose } from './identity-email-release.mjs'
 import { IDENTITY_SMS_SOURCE, assertIdentitySmsSource, assertIdentitySmsCompiled, validateIdentityApiInventory,
 	assertIdentityApiImages, assertIdentityApiRuntime, identityApiNeighborFingerprint, verifyIdentityApiHttp,
 	IDENTITY_API_PAYLOAD_FILES, validateIdentityApiPayload } from './identity-api-release.mjs'
@@ -120,6 +120,38 @@ test('email release requires explicit mixed worker baselines and unchanged full 
 	]) { const changed = structuredClone(input); mutate(changed); assert.throws(() => prepareScopedCompose(changed)) }
 	const oldScope = composeFixture(identityScope); oldScope.identityWorkersPreviousRevision = oldRevision
 	assert.throws(() => prepareScopedCompose(oldScope))
+})
+
+test('email release selects each owner CORS without accepting real env or resource drift', () => {
+	const input = composeFixture(emailScope)
+	const origins = { 'identity-api': 'https://identity.example.invalid,https://widgets.example.invalid', 'operations-api': 'https://admin.example.invalid' }
+	for (const [name, value] of Object.entries(origins)) input.live.find(item => item.Config.Labels['com.docker.compose.service'] === name).Config.Env.push(`CORS_ALLOWED_ORIGINS=${value}`)
+	for (const name of ['operations-api', 'operations-restore-worker']) {
+		input.compose.services[name].environment.DATABASE_RESTORE_ENABLED = 'false'
+		input.live.find(item => item.Config.Labels['com.docker.compose.service'] === name).Config.Env.push('DATABASE_RESTORE_ENABLED=false')
+	}
+	const identity = structuredClone(input.compose), operations = structuredClone(input.compose)
+	for (const name of Object.keys(origins)) {
+		identity.services[name].environment.CORS_ALLOWED_ORIGINS = origins['identity-api']
+		operations.services[name].environment.CORS_ALLOWED_ORIGINS = origins['operations-api']
+	}
+	operations.services['unrelated-api'] = { image: 'unrelated' }
+	assert.throws(() => prepareScopedCompose({ ...input, compose: operations }), 'combined env interpolation reproduces the rejected Identity CORS override')
+	const compose = mergeIdentityEmailOwnerCompose(identity, operations)
+	assert.deepEqual(Object.keys(compose.services), SCOPED_SERVICES[emailScope])
+	const { desired } = prepareScopedCompose({ ...input, compose })
+	for (const [name, value] of Object.entries(origins)) assert.equal(desired.services[name].environment.CORS_ALLOWED_ORIGINS, value)
+	for (const name of Object.keys(origins)) {
+		const changed = structuredClone(name.startsWith('identity-') ? identity : operations)
+		changed.services[name].environment.CORS_ALLOWED_ORIGINS = 'https://changed.example.invalid'
+		assert.throws(() => prepareScopedCompose({ ...input, compose: name.startsWith('identity-') ? mergeIdentityEmailOwnerCompose(changed, operations) : mergeIdentityEmailOwnerCompose(identity, changed) }))
+	}
+	const drift = structuredClone(identity); drift.services['identity-worker'].mem_limit = 1234
+	assert.throws(() => prepareScopedCompose({ ...input, compose: mergeIdentityEmailOwnerCompose(drift, operations) }))
+	const missing = structuredClone(identity); delete missing.services['identity-worker']
+	assert.throws(() => mergeIdentityEmailOwnerCompose(missing, operations))
+	assert.equal(identity.services['identity-api'].environment.CORS_ALLOWED_ORIGINS, origins['identity-api'])
+	assert.equal(operations.services['identity-api'].environment.CORS_ALLOWED_ORIGINS, origins['operations-api'])
 })
 
 test('email release compiled image guard protects unrelated modules, packages and migration history', () => {
@@ -2476,6 +2508,9 @@ docker() {
           [[ "$TEST_SCENARIO" != prepare-failed ]] || return 1
           printf '{}\n' >"$scoped_work_directory/desired.json"
           printf '{}\n' >"$scoped_work_directory/rollback.json" ;;
+        email-compose)
+          [[ "$TEST_SCENARIO" != owner-compose-failed ]] || return 1
+          printf '{}\n' >"$scoped_work_directory/compose.json" ;;
         email-source) cat >/dev/null; [[ "$TEST_SCENARIO" != source-drift ]] ;;
         email-images) [[ "$TEST_SCENARIO" != compiled-drift && "$TEST_SCENARIO" != manifest-failed ]] ;;
         email-http)
@@ -2580,6 +2615,14 @@ test('email release Bash proves both images, drains seven exact runtimes and app
 	const lines = result.calls.split('\n')
 	assert.equal(lines.filter(line => line.startsWith('DOCKER <build>')).length, 2)
 	assert.equal(lines.filter(line => line.includes('<email-image>')).length, 9)
+	const configs = lines.filter(line => line.includes('<config> <--format> <json>'))
+	assert.equal(configs.length, 2)
+	for (const [index, owner] of ['identity', 'operations'].entries()) {
+		assert.ok(configs[index].includes(`/services/apps/${owner}/.env.production>`))
+		assert.equal((configs[index].match(/<--env-file>/g) ?? []).length, 2, 'canonical env and exactly one owner env')
+	}
+	assert.ok(result.calls.indexOf('<email-compose>') > result.calls.indexOf('<email-images>'))
+	assert.ok(result.calls.indexOf('<email-compose>') < result.calls.indexOf('<prepare>'))
 	assert.deepEqual(lines.filter(line => line.startsWith('MIGRATE ')), ['MIGRATE identity-migrate'])
 	const stop = result.calls.indexOf('DOCKER <kill>')
 	for (const check of ['<email-images>', '<prepare>', '<email-pre>']) assert.ok(result.calls.indexOf(check) < stop, check)
@@ -2592,7 +2635,7 @@ test('email release Bash proves both images, drains seven exact runtimes and app
 })
 
 test('email release Bash rejects unsafe admission before any live process stops', () => {
-	for (const scenario of ['source-drift', 'companion-drift', 'inventory-failed', 'compiled-drift', 'manifest-failed', 'prepare-failed', 'ledger-failed', 'broker-busy', 'database-busy']) {
+	for (const scenario of ['source-drift', 'companion-drift', 'inventory-failed', 'compiled-drift', 'manifest-failed', 'owner-compose-failed', 'prepare-failed', 'ledger-failed', 'broker-busy', 'database-busy']) {
 		const result = runRuntime(emailScope, scenario)
 		assert.notEqual(result.status, 0, scenario)
 		for (const forbidden of ['DOCKER <kill>', 'DOCKER <stop>', '<up>', 'MIGRATE ']) assert.ok(!result.calls.includes(forbidden), scenario + ': ' + forbidden)

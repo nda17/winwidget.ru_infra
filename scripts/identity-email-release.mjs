@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, lstatSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +7,15 @@ import { NOTES_MIGRATION, assertMigrationLedger, OTP_MIGRATION, SCOPED_SERVICES,
 export const EMAIL_MIGRATION = '20260913000000_email_delivery_attempts';
 export const EMAIL_MIGRATION_SHA256 = 'df3b21a77b51a0d3a5d8636729caded47927514c2ef6931d1f45f3707784c021';
 const same = (a, b) => assert.deepEqual(a, b);
+export function mergeIdentityEmailOwnerCompose(identity, operations) {
+	const compose = { ...structuredClone(operations), services: {} };
+	for (const name of SCOPED_SERVICES['identity-email-delivery']) {
+		const owner = name.startsWith('identity-') ? identity : operations;
+		assert.ok(owner.services?.[name]);
+		compose.services[name] = structuredClone(owner.services[name]);
+	}
+	return compose;
+}
 export const EMAIL_SOURCE_PATHS = Object.freeze(['auth/auth.service.ts', 'runtime/identity-housekeeping.service.ts', 'auth/email-verification.service.ts', 'auth/email-password-recovery.service.ts', 'users/users.service.ts', 'identity.module.ts', 'common/http-exception.filter.ts', 'transports/verification-transport.service.ts', 'transports/email-templates.ts']);
 export function assertIdentityEmailSource(paths) {
 	assert.ok(Array.isArray(paths) && paths.length > 0);
@@ -129,7 +138,11 @@ export async function verifyIdentityEmailDatabase(client, files, action, owner, 
 	return;
 }
 export async function runIdentityEmailAction(action) {
-	if (action === 'email-source') {
+	if (action === 'email-compose') {
+		const read = owner => JSON.parse(rootFileBytes(`/run/scoped/email-${owner}-compose.json`, 4 * 1024 * 1024));
+		const compose = mergeIdentityEmailOwnerCompose(read('identity'), read('operations'));
+		writeFileSync('/run/scoped/compose.json', JSON.stringify(compose), { mode: 0o600, flag: 'wx' });
+	} else if (action === 'email-source') {
 		assertIdentityEmailSource(readFileSync(0, 'utf8').trim().split('\n'));
 	} else if (action === 'email-image') {
 		identityEmailImageInventory(process.argv[3]);

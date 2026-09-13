@@ -1183,6 +1183,10 @@ immutable Identity image (`1001:1001`): `network none`, read-only rootfs,
   2.2.0 → 2.3.0, пять ранее изменённых API/config modules. Worker modules,
   RabbitMQ, schema/migrations и assets должны совпадать; новый candidate не
   может добавлять к этому другой dependency delta. Новые env или secrets не требуются.
+  Compose отдельно материализуется с canonical env и env каждого владельца;
+  объединяются только три Identity и четыре Operations service entries.
+  Общие имена вроде `CORS_ALLOWED_ORIGINS` не должны перекрываться файлом другого
+  владельца; итоговая конфигурация всех семи процессов сверяется с live побайтово.
   До остановки read-only gate проверяет совместно global и schema table
   defaults роли Identity migration: runtime CRUD без TRUNCATE, backup SELECT,
   без PUBLIC grants; отсутствие нужных default ACL запрещает выпуск до DDL.

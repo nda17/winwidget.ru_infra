@@ -721,7 +721,14 @@ scoped_deploy_identity_email() {
 		scoped_email_image "$old_image" "$owner" "email-$owner-after.json" || die 'Cannot inventory the immutable email candidate.'
 	done
 	scoped_verifier email-images || die 'Email candidate changes an unrelated compiled module, dependency, prior migration or backup/restore target.'
-	scoped_source_compose config --format json >"$scoped_work_directory/compose.json"
+	# Shared interpolation keys such as CORS_ALLOWED_ORIGINS belong to each
+	# owner. Rendering both env files together lets the last owner override them.
+	for owner in identity operations; do
+		(scoped_env_arguments=(--env-file "$services_repository/apps/$owner/.env.production")
+			scoped_source_compose config --format json) >"$scoped_work_directory/email-$owner-compose.json" || die 'Cannot materialize the email owner configuration.'
+		chmod 600 "$scoped_work_directory/email-$owner-compose.json"
+	done
+	scoped_verifier email-compose || die 'Cannot combine the seven email owner configurations.'
 	docker inspect "${scoped_target_ids[@]}" >"$scoped_work_directory/live.json"
 	docker image inspect "$scoped_image_id" >"$scoped_work_directory/image.json"
 	docker image inspect "$scoped_operations_image_id" >"$scoped_work_directory/operations-image.json"
