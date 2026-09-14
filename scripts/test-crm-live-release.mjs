@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { liveBaseline, prepareLiveCompose, verifyLiveImages, schemaTokens, LIVE_OWNERS, LIVE_TARGETS, LIVE_MIGRATION } from './crm-live-release.mjs';
+import { liveBaseline, liveNeighbors, prepareLiveCompose, verifyLiveImages, schemaTokens, LIVE_OWNERS, LIVE_TARGETS, LIVE_MIGRATION } from './crm-live-release.mjs';
 import { sha256 } from './scoped-service-release.mjs';
 const revision='a'.repeat(40),old='b'.repeat(40),digest='c'.repeat(64);
 test('generated schema formatting preserves tokens but cannot hide model or quoted-value changes',()=>{
@@ -30,6 +30,16 @@ test('updates precisely eight processes in their existing Compose projects and r
   assert.equal(project.desired.services[name].environment.APP_REVISION,revision);assert.equal(project.rollback.services[name].environment.APP_REVISION,old);
   assert.equal(project.desired.services[name].environment.SECRET,'synthetic-test-value');assert.equal(project.desired.services[name].build,undefined);assert.equal(project.desired.services[name].depends_on,undefined);
  }
+});
+test('Docker mount enumeration order cannot change the baseline or neighbor postflight',()=>{
+ const input=fixture();
+ input.live.at(-1).Mounts=[{Type:'bind',Source:'/first',Destination:'/one',RW:false},{Type:'volume',Name:'owned',Source:'/second',Destination:'/two',RW:true}];
+ const reordered=structuredClone(input.live);reordered.at(-1).Mounts.reverse();
+ assert.equal(liveBaseline(input.live,input.envHashes),liveBaseline(reordered,input.envHashes));
+ assert.deepEqual(liveNeighbors(input.live),liveNeighbors(reordered));
+ reordered.at(-1).Mounts[0].RW=false;
+ assert.notEqual(liveBaseline(input.live,input.envHashes),liveBaseline(reordered,input.envHashes));
+ assert.notDeepEqual(liveNeighbors(input.live),liveNeighbors(reordered));
 });
 test('fails closed on stale baseline, foreign env, resources, role or image changes',()=>{
  for(const mutate of [input=>input.envHashes.crm='f'.repeat(64),input=>input.live[10].Id='f'.repeat(64),input=>input.configs.support.services['support-api'].environment.SECRET='different',input=>input.configs.operations.services['operations-worker'].mem_limit=12345,input=>input.images.support.after.Config.Env.push('UNREVIEWED=1'),input=>input.images.support.after.Config.Labels['org.opencontainers.image.revision']=old]){

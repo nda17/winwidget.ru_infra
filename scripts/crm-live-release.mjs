@@ -23,9 +23,12 @@ export function liveBaseline(live, envHashes) {
  assert.equal(new Set(live.map(row => row.Id)).size, live.length);
  const containers = sorted(live.map(row => {
   assert.match(row.Id, /^[a-f0-9]{64}$/); assert.match(row.Image, /^sha256:[a-f0-9]{64}$/);
-  return { id: row.Id, image: row.Image, name: row.Name, config: sha256(JSON.stringify(row.Config)), host: sha256(JSON.stringify(row.HostConfig)), mounts: row.Mounts };
+  return { id: row.Id, image: row.Image, name: row.Name, config: sha256(JSON.stringify(row.Config)), host: sha256(JSON.stringify(row.HostConfig)), mounts: sorted(row.Mounts) };
  }));
  return sha256(JSON.stringify({ scope: 'crm-live-updates', containers, envHashes }));
+}
+export function liveNeighbors(rows) {
+ return sorted(rows.filter(row=>!LIVE_TARGETS.includes(serviceName(row))).map(row=>({Id:row.Id,Image:row.Image,Config:row.Config,HostConfig:row.HostConfig,Mounts:sorted(row.Mounts)})));
 }
 export function prepareLiveCompose(input) {
  assert.match(input.revision, /^[a-f0-9]{40}$/);
@@ -181,8 +184,7 @@ async function main(){
    const desired=read(projectOf(name)+'-desired.json');assertServiceConfiguration(desired.services[name],row,image,desired.secrets);
    assert.deepEqual(env(row.Config.Env),{...env(image.Config.Env),...desired.services[name].environment});
   }
-  const neighbors=rows=>sorted(rows.filter(row=>!LIVE_TARGETS.includes(serviceName(row))).map(row=>({Id:row.Id,Image:row.Image,Config:row.Config,HostConfig:row.HostConfig,Mounts:row.Mounts})));
-  assert.deepEqual(neighbors(input.live),neighbors(live));return;
+  assert.deepEqual(liveNeighbors(input.live),liveNeighbors(live));return;
  }
  throw new Error('Unsupported live release action');
 }
