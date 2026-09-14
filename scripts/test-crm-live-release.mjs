@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { liveBaseline, prepareLiveCompose, verifyLiveImages, LIVE_OWNERS, LIVE_TARGETS, LIVE_MIGRATION } from './crm-live-release.mjs';
+import { liveBaseline, prepareLiveCompose, verifyLiveImages, schemaTokens, LIVE_OWNERS, LIVE_TARGETS, LIVE_MIGRATION } from './crm-live-release.mjs';
 import { sha256 } from './scoped-service-release.mjs';
 const revision='a'.repeat(40),old='b'.repeat(40),digest='c'.repeat(64);
+test('generated schema formatting preserves tokens but cannot hide model or quoted-value changes',()=>{
+ const source='model Entry {\n id String @id\n title String @default("a b // c")\n @@unique([id,title])\n}';
+ const formatted='// generated copy\nmodel Entry {\n  id    String @id\n  title String @default("a b // c")\n\n  @@unique([id, title])\n}\n';
+ assert.deepEqual(schemaTokens(source),schemaTokens(formatted));
+ for(const changed of [source.replace('a b','ab'),source.replace('title String','title Int'),source.replace('model Entry','modelEntry'),source.replace('[id,title]','[title,id]')])assert.notDeepEqual(schemaTokens(source),schemaTokens(changed));
+});
 function fixture(){
  const input={revision,expectedLiveRevision:old,envHashes:{canonical:digest,crm:digest,support:digest,operations:digest},live:[],configs:{},images:{}};
  for(const owner of LIVE_OWNERS){

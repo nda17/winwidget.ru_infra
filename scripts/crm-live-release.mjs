@@ -66,6 +66,12 @@ export function prepareLiveCompose(input) {
  }
  return prepared;
 }
+// Prisma formats the generated schema. Compare lexical tokens while retaining
+// quoted values and token boundaries, so formatting cannot mask a model change.
+export function schemaTokens(source) {
+ return source.match(/"(?:\\.|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[A-Za-z_][A-Za-z_0-9]*|[0-9]+(?:\.[0-9]+)?|[^\s]/g)
+  ?.filter(token => !token.startsWith('//') && !token.startsWith('/*')) ?? [];
+}
 function imageInventory(owner) {
  assert.ok(LIVE_OWNERS.includes(owner));
  const walk = root => {
@@ -77,7 +83,7 @@ function imageInventory(owner) {
  };
  const require=createRequire('/app/package.json');
  const result={owner,compiled:walk('/app/dist'),migrations:migrationFiles('/app/prisma/migrations'),schema:sha256(readFileSync('/app/prisma/schema.prisma')),generated:sha256(readFileSync(require.resolve('@prisma/'+owner+'-client/schema.prisma'))),package:sha256(readFileSync('/app/package.json'))};
- assert.equal(result.schema,result.generated);
+ assert.deepEqual(schemaTokens(readFileSync('/app/prisma/schema.prisma','utf8')),schemaTokens(readFileSync(require.resolve('@prisma/'+owner+'-client/schema.prisma'),'utf8')));
  if(owner==='operations')for(const kind of ['backup','restore'])result[kind]=JSON.parse(readFileSync('/app/'+kind+'-manifests/database-'+kind+'-migrations.json'));
  return result;
 }
