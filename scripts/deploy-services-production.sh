@@ -70,7 +70,7 @@ case "$release_scope" in
 	all)
 		[[ -z "$expected_live_revision$expected_service_env_sha256$operations_runtime_revision$operations_evidence_sha256$expected_operations_revision$expected_operations_env_sha256$expected_support_env_sha256" ]] ||
 			die 'Scoped authorization cannot be attached to an all-services deployment.' ;;
-	identity-api-runtime | identity-email-delivery | identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate | support-chat-repair)
+	crm-live-updates | identity-api-runtime | identity-email-delivery | identity-with-operations-manifest | operations-runtime | operations-backup-runtime | operations-backlog-backup | operations-backlog-finalize | gateway-remove-notes | gateway-tilda-upgrade | workers-bootstrap-recovery | operations-federation-config | operations-api-runtime | platform-marketing-runtime | crm-prepare | crm-databases | crm-runtime | crm-upgrade | crm-commerce-activate | crm-reminders-activate | crm-intake-sla-activate | crm-customers-provider-config | billing-crm-commerce-acl | support-chat | support-chat-activate | support-chat-repair)
 		[[ "$expected_live_revision" =~ ^[0-9a-f]{40}$ &&
 			"$expected_service_env_sha256" =~ ^[0-9a-f]{64}$ ]] ||
 			die 'Scoped deployment requires the approved live revision and owner env SHA256.'
@@ -113,7 +113,7 @@ if [[ "$release_scope" == operations-backup-runtime ]]; then
 else
 	[[ -z "$expected_operations_backup_baseline_sha256" ]] || die 'Operations backup baseline authorization cannot be reused by another scope.'
 fi
-if [[ "$release_scope" == crm-upgrade ]]; then
+if [[ "$release_scope" == crm-upgrade || "$release_scope" == crm-live-updates ]]; then
 	[[ "$expected_crm_upgrade_baseline_sha256" =~ ^[a-f0-9]{64}$ ]] || die 'CRM upgrade requires a fresh approved runtime baseline hash.'
 else
 	[[ -z "$expected_crm_upgrade_baseline_sha256" ]] || die 'CRM upgrade baseline authorization cannot be reused by another scope.'
@@ -157,7 +157,10 @@ esac
 
 scoped_shell_file="$controller_root/scripts/deploy-identity-operations-scoped.sh"
 scoped_node_file="$controller_root/scripts/scoped-service-release.mjs"
-if [[ "$release_scope" == identity-email-delivery ]]; then
+if [[ "$release_scope" == crm-live-updates ]]; then
+	scoped_shell_file="$controller_root/scripts/deploy-crm-live-scoped.sh"
+	scoped_node_file="$controller_root/scripts/crm-live-release.mjs"
+elif [[ "$release_scope" == identity-email-delivery ]]; then
 	scoped_node_file="$controller_root/scripts/identity-email-release.mjs"
 elif [[ "$release_scope" == identity-api-runtime ]]; then
 	scoped_node_file="$controller_root/scripts/identity-api-release.mjs"
@@ -212,7 +215,7 @@ if [[ "$release_scope" =~ ^support-chat(-(activate|repair))?$ ]]; then
 	scoped_node_base64="$(printf '%s' "$scoped_envelope" | gzip -n -6 -c | base64 | tr -d '\n')"
 	unset scoped_envelope
 fi
-if [[ "$release_scope" == identity-api-runtime || "$release_scope" == identity-email-delivery ]]; then
+if [[ "$release_scope" == identity-api-runtime || "$release_scope" == identity-email-delivery || "$release_scope" == crm-live-updates ]]; then
 	command -v node >/dev/null || die 'Identity payload packaging requires Node.js.'
 	for scoped_name in scoped-service-release.mjs "${scoped_node_file##*/}"; do
 		git -C "$controller_root" ls-files --error-unmatch "scripts/$scoped_name" >/dev/null 2>&1 || die 'Identity module is not tracked by immutable Infra.'
@@ -707,6 +710,9 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		if [[ "${release_scope:-all}" == gateway-tilda-upgrade ]]; then
 			rm -f -- "$scoped_payload_directory/gateway-tilda-release.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
 		fi
+		if [[ "${release_scope:-all}" == crm-live-updates ]]; then
+			rm -f -- "$scoped_payload_directory/crm-live-release.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
+		fi
 		if [[ "${release_scope:-all}" == identity-email-delivery ]]; then
 			rm -f -- "$scoped_payload_directory/identity-email-release.mjs" "$scoped_payload_directory/scoped-service-release.mjs"
 		fi
@@ -756,7 +762,7 @@ if [[ "$release_scope" != all || -f "$release_root/apps/operations/prisma/migrat
 		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
 		[[ "$scoped_envelope_size" =~ ^[0-9]+$ ]] || die 'Support envelope size is invalid.'
 		(( scoped_envelope_size > 0 && scoped_envelope_size <= 393216 )) || die 'Support envelope exceeds decoded limit.'
-	elif [[ "${release_scope:-all}" == identity-api-runtime || "${release_scope:-all}" == identity-email-delivery ]]; then
+	elif [[ "${release_scope:-all}" == identity-api-runtime || "${release_scope:-all}" == identity-email-delivery || "${release_scope:-all}" == crm-live-updates ]]; then
 		printf '%s' "$scoped_node_base64" | base64 --decode | gzip -dc | head -c 262145 >"$scoped_payload_directory/verifier.mjs" || die 'Identity envelope decompression failed.'
 		scoped_envelope_size="$(wc -c <"$scoped_payload_directory/verifier.mjs" | tr -d '[:space:]')"
 		if [[ ! "$scoped_envelope_size" =~ ^[0-9]+$ ]] || (( scoped_envelope_size <= 0 || scoped_envelope_size > 262144 )); then
