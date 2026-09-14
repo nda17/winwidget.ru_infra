@@ -56,6 +56,7 @@ test('backup and restore companions accept only the four exact new migration inv
 });
 test('release never applies broker topology or destructive Operations migrations',()=>{
  const shell=readFileSync(new URL('./deploy-crm-live-scoped.sh',import.meta.url),'utf8');
+ assert.ok(shell.includes('[[ "$1" != image ]] || identity=()'));
  assert.doesNotMatch(shell,/rabbitmqctl|rabbitmqadmin|management\/|operations-migrate|pg_dump|docker (?:system|volume|image) prune/);
  assert.ok(shell.indexOf(' live_graceful_stop ||')<shell.indexOf('  live_database "$owner" migrate'));
  assert.ok(shell.indexOf(' live_database operations database quiet')<shell.indexOf(' live_graceful_stop ||'));

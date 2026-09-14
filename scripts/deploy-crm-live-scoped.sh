@@ -16,8 +16,12 @@ live_env() {
 }
 live_node() {
  local image="$1"; shift
+ local -a identity=(--user 0:0)
+ # Application files may be private to the image's runtime UID. Inventory
+ # needs that existing identity, while host-owned config checks use root.
+ [[ "$1" != image ]] || identity=()
  docker run --rm --interactive --network none --read-only --log-driver none --cap-drop ALL --security-opt no-new-privileges \
-  --user 0:0 --memory 256m --pids-limit 64 --ulimit core=0:0 \
+  "${identity[@]}" --memory 256m --pids-limit 64 --ulimit core=0:0 \
   --volume "$live_directory:/run/live-work:rw" --volume "$scoped_payload_directory/crm-live-release.mjs:/run/live-code/crm-live-release.mjs:ro" \
   --volume "$scoped_payload_directory/scoped-service-release.mjs:/run/live-code/scoped-service-release.mjs:ro" \
   --entrypoint node "$image" /run/live-code/crm-live-release.mjs "$@"
@@ -29,7 +33,7 @@ live_database() {
   --memory 512m --pids-limit 64 --ulimit core=0:0 --tmpfs /tmp:rw,nosuid,size=64m --env-file "$file" \
   --volume "$scoped_payload_directory/crm-live-release.mjs:/run/live-code/crm-live-release.mjs:ro" \
   --volume "$scoped_payload_directory/scoped-service-release.mjs:/run/live-code/scoped-service-release.mjs:ro" \
-  --volume "$release_root/deploy/crm/database-access.mjs:/run/live-code/database-access.mjs:ro" \
+  --volume "$live_directory/database-access.mjs:/run/live-code/database-access.mjs:ro" \
   --entrypoint node "winwidget-$owner:git-$services_revision" /run/live-code/crm-live-release.mjs "$action" "$owner" "${3:-}"
 }
 live_snapshot() {
@@ -114,6 +118,9 @@ scoped_deploy_main() {
  [[ "${live_env_hashes[0]}" == "$expected_env_sha256" && "${live_env_hashes[1]}" == "$expected_service_env_sha256" ]] || die 'CRM live env baseline mismatch.'
  live_directory="$(mktemp -d "$app_root/deploy/backend/.crm-live-release.XXXXXX")"; chmod 700 "$live_directory"
  trap live_finish EXIT
+ # The immutable checkout is private to root; expose only this reviewed public
+ # module to the existing unprivileged image UID, never the repository or env.
+ install -m 0444 "$release_root/deploy/crm/database-access.mjs" "$live_directory/database-access.mjs"
  live_probe_image="$(docker inspect --format '{{.Image}}' "$(live_id api-gateway)")"
  docker run --rm --interactive --network none --read-only --log-driver none --cap-drop ALL --security-opt no-new-privileges --user 0:0 \
   --volume "$scoped_payload_directory:/run/payload:rw" --entrypoint node "$live_probe_image" --input-type=module <<'UNPACK'
