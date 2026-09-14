@@ -70,6 +70,8 @@ const platformScope = 'platform-marketing-runtime'
 const identityApiScope = 'identity-api-runtime'
 const backupRuntimeScope = 'operations-backup-runtime'
 const gatewayTildaScope = 'gateway-tilda-upgrade'
+const salesRuntimeScope = 'crm-sales-runtime'
+const salesRuntimePayload = ['crm-sales-runtime.mjs', 'crm-live-release.mjs', 'scoped-service-release.mjs']
 
 test('email release admits only exact owner source and one immutable migration', () => {
 	assertIdentityEmailSource(['apps/identity/src/auth/email-verification.service.ts', `apps/identity/prisma/migrations/${EMAIL_MIGRATION}/migration.sql`])
@@ -531,7 +533,7 @@ test('real controller refuses unknown scope without contacting production', () =
 })
 
 test('real controller requires reviewed owner identity and exact env hash', () => {
-	for (const scope of ['identity-with-operations-manifest', emailScope, 'operations-runtime', 'gateway-remove-notes', gatewayTildaScope, workerScope, apiScope, platformScope, identityApiScope, ...crmScopes]) {
+	for (const scope of ['identity-with-operations-manifest', emailScope, 'operations-runtime', 'gateway-remove-notes', gatewayTildaScope, workerScope, apiScope, platformScope, identityApiScope, salesRuntimeScope, ...crmScopes]) {
 		rejectBeforeTransport([revision], { RELEASE_SCOPE: scope }, /approved live revision and owner env SHA256/)
 		rejectBeforeTransport([revision], {
 			RELEASE_SCOPE: scope,
@@ -564,6 +566,18 @@ for (const scope of crmScopes) test(scope + ' cannot receive destructive or fore
 		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_OPERATIONS_ENV_SHA256: envHash },
 		{ EXPECTED_OPERATIONS_API_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash }
 	]) rejectBeforeTransport([revision], { RELEASE_SCOPE: scope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash, ...(scope === 'crm-upgrade' ? { EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash } : {}), ...authority }, /authorization|baseline/i)
+})
+
+test('CRM Sales runtime requires its exact baseline and rejects foreign or destructive authority before transport', () => {
+	const authorized = { RELEASE_SCOPE: salesRuntimeScope, EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash }
+	for (const value of ['', 'mutable', 'A'.repeat(64)]) rejectBeforeTransport([revision], {
+		...authorized, EXPECTED_CRM_UPGRADE_BASELINE_SHA256: value
+	}, /fresh approved runtime baseline/)
+	for (const authority of [
+		{ OPERATIONS_RUNTIME_REVISION: oldRevision }, { OPERATIONS_EVIDENCE_SHA256: envHash },
+		{ EXPECTED_OPERATIONS_REVISION: oldRevision }, { EXPECTED_SUPPORT_ENV_SHA256: envHash },
+		{ EXPECTED_CRM_COMMERCE_BASELINE_SHA256: envHash }, { EXPECTED_SUPPORT_CHAT_BASELINE_SHA256: envHash }
+	]) rejectBeforeTransport([revision], { ...authorized, EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash, ...authority }, /authorization|baseline/i)
 })
 
 test('crm-upgrade requires fresh baseline authorization which cannot leak into another scope', () => {
@@ -3298,10 +3312,11 @@ test('successful or unknown Identity DDL never restores any old Operations manif
 	}
 })
 
-function runTransport(scenario = 'success', scope = identityScope) {
+function runTransport(scenario = 'success', scope = identityScope, testPayload) {
 	return privateFixture(directory => {
-		const shellPayload = crmScopes.includes(scope) ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
-		const nodePayload = scope === emailScope ? 'identity-email-release.mjs' : scope === identityApiScope ? 'identity-api-release.mjs' : scope === gatewayTildaScope ? 'gateway-tilda-release.mjs' : crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
+		const shellPayload = scope === salesRuntimeScope ? 'deploy-crm-sales-runtime-scoped.sh' : crmScopes.includes(scope) ? 'deploy-crm-scoped.sh' : 'deploy-identity-operations-scoped.sh'
+		const nodePayload = scope === salesRuntimeScope ? 'crm-sales-runtime.mjs' : scope === emailScope ? 'identity-email-release.mjs' : scope === identityApiScope ? 'identity-api-release.mjs' : scope === gatewayTildaScope ? 'gateway-tilda-release.mjs' : crmScopes.includes(scope) ? 'crm-release.mjs' : 'scoped-service-release.mjs'
+		testPayload ??= nodePayload
 		const checkout = join(directory, 'infra')
 		const bin = join(directory, 'bin')
 		const trace = join(directory, 'transport.jsonl')
@@ -3311,9 +3326,10 @@ function runTransport(scenario = 'success', scope = identityScope) {
 			'scripts/deploy-services-production.sh', 'scripts/deploy-identity-operations-scoped.sh',
 			'scripts/scoped-service-release.mjs', 'scripts/deploy-crm-scoped.sh', 'scripts/crm-release.mjs',
 			'scripts/gateway-tilda-release.mjs', 'scripts/identity-api-release.mjs', 'scripts/identity-email-release.mjs',
+			...(scope === salesRuntimeScope ? ['scripts/deploy-crm-sales-runtime-scoped.sh', 'scripts/crm-sales-runtime.mjs', 'scripts/crm-live-release.mjs'] : []),
 			'nginx/backend-api.conf', 'nginx/frontend.conf'
 		]) {
-			if (scenario === 'missing-payload' && relative === 'scripts/' + nodePayload) continue
+			if (scenario === 'missing-payload' && relative === 'scripts/' + testPayload) continue
 			writeFileSync(join(checkout, relative), readFileSync(join(scriptsRoot, '..', relative)))
 		}
 		if (scenario === 'oversized-payload') writeFileSync(join(checkout, 'scripts', nodePayload), Buffer.alloc(nodePayload === 'scoped-service-release.mjs' ? 147457 : 131073, 35))
@@ -3345,7 +3361,7 @@ if (name === 'git') {
 } else process.exit(82);
 `
 		for (const name of ['git', 'sha256sum', 'ssh-keygen', 'ssh']) writeFileSync(join(bin, name), shim, { mode: 0o700 })
-		if ([gatewayTildaScope, identityApiScope, emailScope].includes(scope)) symlinkSync(process.execPath, join(bin, 'node'))
+		if ([gatewayTildaScope, identityApiScope, emailScope, salesRuntimeScope].includes(scope)) symlinkSync(process.execPath, join(bin, 'node'))
 		const identity = join(directory, 'synthetic-key')
 		const knownHosts = join(directory, 'synthetic-known-hosts')
 		writeFileSync(identity, 'synthetic fixture, not a private key\n', { mode: 0o600 })
@@ -3361,9 +3377,9 @@ if (name === 'git') {
 				PATH: `${bin}:/usr/bin:/bin`, LANG: 'C',
 				TEST_SCENARIO: scenario, TEST_REVISION: revision, TEST_TRANSPORT_TRACE: trace,
 				INFRA_REVISION: revision, RELEASE_SCOPE: scope,
-				TEST_NODE_PAYLOAD: nodePayload, TEST_SHELL_PAYLOAD: shellPayload,
+				TEST_NODE_PAYLOAD: testPayload, TEST_SHELL_PAYLOAD: shellPayload,
 				EXPECTED_LIVE_REVISION: oldRevision, EXPECTED_SERVICE_ENV_SHA256: envHash,
-				...(scope === 'crm-upgrade' ? { EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash } : {}),
+				...(['crm-upgrade', salesRuntimeScope].includes(scope) ? { EXPECTED_CRM_UPGRADE_BASELINE_SHA256: envHash } : {}),
 				...(scope === backupRuntimeScope && scenario !== 'missing-backup-baseline' || scenario === 'foreign-backup-baseline' ? { EXPECTED_OPERATIONS_BACKUP_BASELINE_SHA256: envHash } : {}),
 				...([identityScope, emailScope].includes(scope) ? { EXPECTED_OPERATIONS_REVISION: oldRevision, EXPECTED_OPERATIONS_ENV_SHA256: envHash } : {}),
 				...(scope === emailScope ? { EXPECTED_IDENTITY_WORKERS_REVISION: 'c'.repeat(40), EXPECTED_OPERATIONS_API_REVISION: 'd'.repeat(40) } : {}),
@@ -3465,6 +3481,96 @@ test('Identity API transport ships its isolated helper envelope and rejects miss
 	for (const scenario of ['missing-payload', 'untracked-payload', 'oversized-payload', 'empty-payload', 'forbidden-frontend']) {
 		const rejected = runTransport(scenario, identityApiScope); assert.notEqual(rejected.status, 0, scenario); assert.deepEqual(rejected.calls, [])
 	}
+})
+
+test('CRM Sales runtime transport carries only the exact three hash-pinned modules and scoped baseline', () => {
+	const result = runTransport('success', salesRuntimeScope)
+	assert.equal(result.status, 0, result.stderr)
+	assert.equal(result.calls.length, 1)
+	const { args, stdin } = result.calls[0]
+	const encoded = args.at(-1).match(/bash "\$controller_file" (.+) <\/dev\/null/)
+	assert.ok(encoded)
+	const parameters = encoded[1].split(' ').map(value => value === "''" ? '' : value)
+	assert.equal(parameters.length, 20)
+	assert.deepEqual(parameters.slice(5, 10), [salesRuntimeScope, oldRevision, envHash, '', ''])
+	assert.deepEqual(parameters.slice(14), ['', '', '', '', envHash, ''])
+	const shell = readFileSync(join(scriptsRoot, 'deploy-crm-sales-runtime-scoped.sh'))
+	assert.equal(parameters[10], sha256(shell))
+	assert.deepEqual(gunzipSync(Buffer.from(parameters[11], 'base64')), shell)
+	const bytes = gunzipSync(Buffer.from(parameters[13], 'base64'))
+	assert.equal(parameters[12], sha256(bytes))
+	assert.ok(bytes.length <= 262144)
+	const envelope = JSON.parse(bytes)
+	assert.deepEqual(Object.keys(envelope).sort(), ['files', 'schemaVersion'])
+	assert.equal(envelope.schemaVersion, 1)
+	assert.deepEqual(envelope.files.map(row => row.name), salesRuntimePayload)
+	for (const file of envelope.files) {
+		assert.deepEqual(Object.keys(file).sort(), ['content', 'name', 'sha256'])
+		assert.equal(file.content, readFileSync(join(scriptsRoot, file.name), 'utf8'))
+		assert.equal(file.sha256, sha256(file.content))
+	}
+	assert.ok(parameters[11].length + parameters[13].length <= 90000)
+	assert.ok(args.includes('StrictHostKeyChecking=yes'))
+	assert.ok(!stdin.includes('FRONTEND_CONTROLLER'))
+})
+
+test('CRM Sales runtime rejects every missing or untracked envelope module and malformed payload before SSH', () => {
+	for (const filename of salesRuntimePayload) for (const scenario of ['missing-payload', 'untracked-payload']) {
+		const result = runTransport(scenario, salesRuntimeScope, filename)
+		assert.notEqual(result.status, 0, scenario + ': ' + filename)
+		assert.deepEqual(result.calls, [], scenario + ': ' + filename)
+	}
+	for (const scenario of ['invalid-payload-hash', 'oversized-payload', 'empty-payload', 'encoded-envelope', 'forbidden-frontend']) {
+		const result = runTransport(scenario, salesRuntimeScope)
+		assert.notEqual(result.status, 0, scenario)
+		assert.deepEqual(result.calls, [], scenario)
+	}
+})
+
+test('CRM Sales runtime receiver verifies the bounded envelope before unpacking and cleans only its payload files', () => {
+	const packed = spawnSync(process.execPath, [join(scriptsRoot, 'crm-sales-runtime.mjs'), 'pack', scriptsRoot], { encoding: 'utf8' })
+	assert.equal(packed.status, 0, packed.stderr)
+	const shell = readFileSync(join(scriptsRoot, 'deploy-crm-sales-runtime-scoped.sh'), 'utf8')
+	const unpack = shell.split("<<'UNPACK'\n")[1]?.split('\nUNPACK')[0]
+	assert.ok(unpack)
+	for (const scenario of ['valid', 'wrong-envelope-hash', 'truncated-gzip', 'oversized-envelope', 'wrong-module-hash', 'duplicate-module', 'foreign-module']) privateFixture(directory => {
+		const payload = join(directory, 'payload'), retained = join(directory, 'retained'), unpackFile = join(directory, 'unpack.mjs'), reportFile = join(directory, 'report.cjs')
+		mkdirSync(payload, { mode: 0o700 })
+		writeFileSync(retained, 'preserved synthetic neighbor')
+		writeFileSync(unpackFile, unpack.replaceAll('/run/payload/', payload + '/'))
+		writeFileSync(reportFile, 'const fs=require("fs"),path=require("path"); console.log(JSON.stringify(fs.readdirSync(process.env.scoped_payload_directory).sort().map(name=>({name,mode:fs.statSync(path.join(process.env.scoped_payload_directory,name)).mode&0o777}))))')
+		const envelope = JSON.parse(packed.stdout)
+		if (scenario === 'wrong-module-hash') envelope.files[0].sha256 = 'f'.repeat(64)
+		if (scenario === 'duplicate-module') envelope.files[1].name = envelope.files[0].name
+		if (scenario === 'foreign-module') envelope.files[0].name = '../retained'
+		const bytes = scenario === 'oversized-envelope' ? Buffer.alloc(262145, 32) : Buffer.from(JSON.stringify(envelope))
+		const compressed = gzipSync(bytes, { level: 6 })
+		const result = spawnSync('/bin/bash', ['-c', `
+set -euo pipefail
+umask 077
+die() { exit 73; }
+sha256sum() { "$TEST_NODE" -e 'const f=require("fs"),c=require("crypto"); console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$@"; }
+${payloadCleanup()}
+trap 'status=$?; "$TEST_NODE" "$TEST_REPORT"; cleanup_scoped_payload; exit "$status"' EXIT
+${payloadMaterialization()}
+"$TEST_NODE" "$TEST_UNPACK"
+`], { encoding: 'utf8', timeout: 10000, env: {
+			PATH: '/usr/bin:/bin', TEST_NODE: process.execPath, TEST_UNPACK: unpackFile, TEST_REPORT: reportFile,
+			release_scope: salesRuntimeScope, scoped_payload_directory: payload,
+			scoped_shell_base64: gzipSync(shell, { level: 6 }).toString('base64'), scoped_shell_sha256: sha256(shell),
+			scoped_node_base64: (scenario === 'truncated-gzip' ? compressed.subarray(0, -4) : compressed).toString('base64'),
+			scoped_node_sha256: scenario === 'wrong-envelope-hash' ? 'f'.repeat(64) : sha256(bytes)
+		} })
+		assert.equal(result.error, undefined, scenario)
+		assert.equal(result.status === 0, scenario === 'valid', `${scenario}: ${result.stderr}`)
+		assert.ok(result.stdout.trim(), `${scenario}: ${result.stderr}`)
+		const files = JSON.parse(result.stdout.trim())
+		const names = ['controller.sh', 'verifier.mjs', ...(scenario === 'valid' ? salesRuntimePayload : [])].sort()
+		assert.deepEqual(files.map(row => row.name), names, scenario + ': no module writes before complete validation')
+		if (scenario === 'valid') for (const file of files) assert.equal(file.mode, file.name === 'controller.sh' ? 0o600 : 0o444)
+		assert.equal(existsSync(payload), false, scenario + ': actual receiver cleanup removes its directory')
+		assert.equal(readFileSync(retained, 'utf8'), 'preserved synthetic neighbor')
+	})
 })
 
 test('actual transport rejects missing/untracked/malformed payload and optional frontend before SSH', () => {

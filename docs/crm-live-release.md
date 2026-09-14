@@ -44,3 +44,53 @@ across tabs; support replies and existing task notifications remain accessible.
 SSE carries scope-only invalidations, while normal authorized HTTP reads provide
 the data. A reconnect takes a fresh snapshot. Task deadlines also refresh from a
 server clock, because becoming due does not require a database write.
+
+## Sales UX: code-only steady-state release
+
+Use `crm-sales-runtime` for the Sales list filters and cohort analytics after the
+live-change migration is already deployed. Do not replay `crm-live-updates` or
+select the broader `crm-upgrade`: this scope replaces only `crm-sales-api` in the
+existing `winwidget-crm` project. It performs no DDL, env edit, grants, broker
+operation, worker restart or shared-image cleanup.
+
+Collect the baseline on the VPS with `salesRuntimeBaseline(live, envHashes)` from
+`scripts/crm-sales-runtime.mjs`. `live` is the full inspect of **all** Docker
+containers, including stopped containers; `envHashes` has exactly `canonical`
+and `crm`, the complete SHA-256 values of the respective production env files.
+Never transfer or print the raw inspect/config: it contains runtime credentials.
+Return only the scope-bound hash as `expected_crm_upgrade_baseline_sha256`.
+`expected_live_revision` is the current Sales API OCI revision;
+`expected_service_env_sha256` is the complete CRM env hash. The normal canonical
+env hash and backend-only SSH secrets remain required. No frontend secret group
+belongs in this scoped backend invocation.
+
+Commit and verify Infra first, then pin its exact green revision in the Services
+reusable-workflow call and lifecycle checks with `release_scope: crm-sales-runtime`
+and the freshly collected baseline values. Deploy through the normal green
+Services `prod` push. The controller still requires exact fetched `origin/prod`,
+an immutable release checkout and the shared production deploy lock.
+
+Preflight proves the live image, retained Compose configuration, full env bytes
+and all container IDs/configuration/start times/restart counts. The candidate may
+change only the Sales controller, DTO and service compiled modules; source paths
+are restricted to those modules, their tests/readme and the two CI pin files.
+Schemas, generated-schema tokens, migration names/checksums, package manifest and
+installed package inventory must remain identical. Only the Sales image is built,
+with 2.5 GiB available memory required before build and 2 GiB before replacement.
+
+A read-only repeatable-read transaction verifies the service-owned database
+identity and fully applied migration ledger. The same receipt must match after
+replacement. The final runtime fence precedes a bounded graceful stop; no forced
+kill is allowed. The single-service Compose snapshot uses the prior complete
+environment and runtime settings, changing only image and revision. Direct
+Sales live/ready/revision probes and exact neighbor checks complete postflight.
+
+Protected evidence and desired/rollback snapshots remain under
+`deploy/backend/.crm-sales-runtime.*`. A failed replacement restores the exact
+prior image/config if immutable source, lock, env and all neighbors still match;
+recovery also works when Compose removed the old API but could not create its
+replacement. Before replacement, recovery resumes the exact preserved API ID.
+Any failed health, ledger or neighbor verification keeps the release failed.
+Inspect the retained private receipts if recovery cannot be proven; never rerun
+blindly with a stale baseline. Finally, verify the authenticated CRM UX and its
+role-scoped deal drilldowns after the frontend deployment.

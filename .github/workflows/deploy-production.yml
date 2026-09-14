@@ -8,11 +8,11 @@ on:
         required: true
         type: string
       release_scope:
-        description: all, crm-live-updates, identity-api-runtime, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, gateway-tilda-upgrade, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, crm-intake-sla-activate, crm-customers-provider-config, billing-crm-commerce-acl, support-chat, support-chat-activate, or support-chat-repair
+        description: all, crm-sales-runtime, crm-live-updates, identity-api-runtime, identity-with-operations-manifest, operations-runtime, operations-backup-runtime, operations-backlog-backup, operations-backlog-finalize, gateway-remove-notes, gateway-tilda-upgrade, workers-bootstrap-recovery, operations-federation-config, operations-api-runtime, platform-marketing-runtime, crm-prepare, crm-databases, crm-runtime, crm-upgrade, crm-commerce-activate, crm-reminders-activate, crm-intake-sla-activate, crm-customers-provider-config, billing-crm-commerce-acl, support-chat, support-chat-activate, or support-chat-repair
         default: all
         type: string
       expected_live_revision:
-        description: Approved currently running owner revision (Gateway baseline for CRM scopes)
+        description: Approved currently running owner revision (Sales API for crm-sales-runtime; existing owner baseline for other scopes)
         default: ''
         type: string
       expected_service_env_sha256:
@@ -20,7 +20,7 @@ on:
         default: ''
         type: string
       expected_crm_upgrade_baseline_sha256:
-        description: Fresh approved exact runtime and owner-env baseline hash (crm-upgrade or crm-live-updates; bound to scope)
+        description: Fresh approved exact runtime and owner-env baseline hash (crm-upgrade, crm-live-updates or crm-sales-runtime; bound to scope)
         default: ''
         type: string
       expected_support_chat_baseline_sha256:

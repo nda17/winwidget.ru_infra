@@ -102,6 +102,10 @@ jobs:
           shellcheck -x scripts/deploy-crm-live-scoped.sh
           node --check scripts/crm-live-release.mjs
           node --test scripts/test-crm-live-release.mjs
+          bash -n scripts/deploy-crm-sales-runtime-scoped.sh
+          shellcheck -x scripts/deploy-crm-sales-runtime-scoped.sh
+          node --check scripts/crm-sales-runtime.mjs
+          node --test scripts/test-crm-sales-runtime.mjs
           bash -n scripts/deploy-support-chat-scoped.sh
           shellcheck -x scripts/deploy-support-chat-scoped.sh
           node --check scripts/support-chat-release.mjs
